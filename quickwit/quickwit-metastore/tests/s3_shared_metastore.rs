@@ -1,0 +1,209 @@
+// Copyright 2021-Present Datadog, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Integration tests for a file-backed metastore shared by several nodes on a real S3-compatible
+//! endpoint (MinIO, localstack, Cloudflare R2, AWS S3).
+//!
+//! They only run with `--features ci-test`, and they skip themselves when no endpoint is
+//! configured, so they never turn into a silent no-op without saying so.
+//!
+//! Against a local MinIO:
+//!
+//! ```sh
+//! export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+//! export QW_S3_ENDPOINT=http://127.0.0.1:9000 QW_S3_FORCE_PATH_STYLE_ACCESS=1
+//! cargo test -p quickwit-metastore --features ci-test --test s3_shared_metastore -- --nocapture
+//! ```
+
+#![cfg(feature = "ci-test")]
+
+use std::ops::RangeInclusive;
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use anyhow::Context;
+use quickwit_common::rand::append_random_suffix;
+use quickwit_common::uri::Uri;
+use quickwit_config::{IndexConfig, S3StorageConfig};
+use quickwit_metastore::{
+    CreateIndexRequestExt, FileBackedMetastore, ListSplitsQuery, ListSplitsRequestExt,
+    MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState, StageSplitsRequestExt,
+};
+use quickwit_proto::metastore::{
+    CreateIndexRequest, DeleteIndexRequest, ListSplitsRequest, MetastoreService,
+    PublishSplitsRequest, StageSplitsRequest,
+};
+use quickwit_proto::types::IndexUid;
+use quickwit_storage::{ObjectVersion, S3CompatibleObjectStorage, Storage, StorageErrorKind};
+
+const TEST_BUCKET_URI: &str = "s3://quickwit-integration-tests";
+
+fn endpoint_is_configured() -> bool {
+    std::env::var("QW_S3_ENDPOINT").is_ok()
+}
+
+async fn s3_storage(bucket_uri: &str) -> anyhow::Result<Arc<dyn Storage>> {
+    let storage_uri = Uri::from_str(bucket_uri)?;
+    let storage = S3CompatibleObjectStorage::from_uri(&S3StorageConfig::default(), &storage_uri)
+        .await
+        .context("failed to open the S3-compatible storage")?;
+    Ok(Arc::new(storage))
+}
+
+/// The conditional-write primitives the shared metastore is built on, against a real endpoint.
+#[tokio::test]
+async fn test_conditional_writes_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!("skipping test_conditional_writes_on_s3_endpoint: QW_S3_ENDPOINT is not set");
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{TEST_BUCKET_URI}/conditional-writes"));
+    let storage = s3_storage(&bucket_uri).await?;
+    let path = Path::new("lock.json");
+
+    let version = storage
+        .put_if_absent(path, Box::new(b"first".to_vec()))
+        .await?
+        .context("S3-compatible storage should report the version it wrote")?;
+
+    let error = storage
+        .put_if_absent(path, Box::new(b"second".to_vec()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::PreconditionFailed);
+
+    let (bytes, read_version) = storage.get_all_with_version(path).await?;
+    assert_eq!(&bytes, &b"first"[..]);
+    assert_eq!(read_version, Some(version.clone()));
+
+    let stale_version = ObjectVersion::new("not-the-current-version");
+    let error = storage
+        .put_if_version_matches(path, Box::new(b"third".to_vec()), &stale_version)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::PreconditionFailed);
+    assert_eq!(&storage.get_all(path).await?, &b"first"[..]);
+
+    storage
+        .put_if_version_matches(path, Box::new(b"second".to_vec()), &version)
+        .await?;
+    assert_eq!(&storage.get_all(path).await?, &b"second"[..]);
+    Ok(())
+}
+
+async fn stage_and_publish_split(
+    metastore: &FileBackedMetastore,
+    index_uid: &IndexUid,
+    split_id: &str,
+) -> anyhow::Result<()> {
+    let split_metadata = SplitMetadata {
+        footer_offsets: 0..10,
+        split_id: split_id.to_string().into(),
+        num_docs: 1,
+        time_range: Some(RangeInclusive::new(0, 99)),
+        ..Default::default()
+    };
+    let stage_splits_request =
+        StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)?;
+    metastore.stage_splits(stage_splits_request).await?;
+
+    let publish_splits_request = PublishSplitsRequest {
+        index_uid: Some(index_uid.clone()),
+        staged_split_ids: vec![split_id.to_string()],
+        ..Default::default()
+    };
+    metastore.publish_splits(publish_splits_request).await?;
+    Ok(())
+}
+
+async fn list_published_split_ids(
+    metastore: &FileBackedMetastore,
+    index_uid: &IndexUid,
+) -> anyhow::Result<Vec<String>> {
+    let list_splits_query =
+        ListSplitsQuery::for_index(index_uid.clone()).with_split_state(SplitState::Published);
+    let list_splits_request = ListSplitsRequest::try_from_list_splits_query(&list_splits_query)?;
+    let splits = metastore
+        .list_splits(list_splits_request)
+        .await?
+        .collect_splits()
+        .await?;
+    let mut split_ids: Vec<String> = splits
+        .iter()
+        .map(|split| split.split_id().to_string())
+        .collect();
+    split_ids.sort();
+    Ok(split_ids)
+}
+
+/// Two nodes sharing one S3 prefix keep each other's splits. A node that read before the other
+/// wrote must not overwrite that work, which is the whole point of the shared write path.
+#[tokio::test]
+async fn test_shared_metastore_on_s3_does_not_lose_updates() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!(
+            "skipping test_shared_metastore_on_s3_does_not_lose_updates: QW_S3_ENDPOINT is not set"
+        );
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{TEST_BUCKET_URI}/shared-metastore"));
+    let storage = s3_storage(&bucket_uri).await?;
+
+    let metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    let metastore_b = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    let metastore_c = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    assert!(
+        metastore_a.is_distributed(),
+        "an s3:// metastore must select the shared write path"
+    );
+
+    let index_id = append_random_suffix("shared-metastore-index");
+    let index_uri = format!("s3://quickwit-integration-tests/{index_id}");
+    let index_config = IndexConfig::for_test(&index_id, &index_uri);
+    let index_uid: IndexUid = metastore_a
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    // Both nodes look at the index before either of them writes.
+    assert!(
+        list_published_split_ids(&metastore_a, &index_uid)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        list_published_split_ids(&metastore_b, &index_uid)
+            .await?
+            .is_empty()
+    );
+
+    stage_and_publish_split(&metastore_a, &index_uid, "a-split-0").await?;
+    // B still holds the view it loaded above, where A's split does not exist.
+    stage_and_publish_split(&metastore_b, &index_uid, "b-split-0").await?;
+
+    assert_eq!(
+        list_published_split_ids(&metastore_c, &index_uid).await?,
+        vec!["a-split-0".to_string(), "b-split-0".to_string()],
+        "a shared metastore must keep every node's splits"
+    );
+
+    metastore_a
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    Ok(())
+}

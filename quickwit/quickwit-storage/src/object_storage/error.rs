@@ -211,17 +211,30 @@ mod tests {
     /// status we can read, so the conditional-write path has a second, separate mapping.
     #[test]
     fn test_precondition_failed_put_object_error_is_preserved() {
-        // `PutObjectError::Unhandled` is sealed, so the code the SDK parsed out of a 412 response
-        // is what the mapping sees; there is nothing else to construct here. The end-to-end
-        // behaviour (a real 412 from a real endpoint) is covered by the S3 integration
-        // tests.
+        // This is the shape the SDK produces for an error code it does not model: the code lives in
+        // the metadata, which is what `to_storage_error_kind` reads.
+        let error = PutObjectError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("PreconditionFailed")
+                .build(),
+        );
+        assert_eq!(error.code(), Some("PreconditionFailed"));
+        assert_eq!(
+            error.to_storage_error_kind(),
+            StorageErrorKind::PreconditionFailed
+        );
+
+        let unmodelled_error =
+            PutObjectError::generic(aws_smithy_types::error::ErrorMetadata::builder().build());
+        assert_eq!(
+            unmodelled_error.to_storage_error_kind(),
+            StorageErrorKind::Service
+        );
+
+        // The mapping stays reachable on its own as well, for codes that are not modelled either.
         assert_eq!(
             put_object_error_kind(Some("PreconditionFailed")),
             StorageErrorKind::PreconditionFailed
-        );
-        assert_eq!(
-            put_object_error_kind(Some("SlowDown")),
-            StorageErrorKind::Service
         );
         assert_eq!(put_object_error_kind(None), StorageErrorKind::Service);
     }

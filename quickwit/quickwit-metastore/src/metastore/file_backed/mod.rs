@@ -3222,6 +3222,73 @@ mod tests {
         Ok(())
     }
 
+    /// A compare-and-swap that never wins must stop after a bounded number of attempts and report
+    /// the conflict, rather than retrying forever or reporting success.
+    #[tokio::test]
+    async fn test_distributed_metastore_gives_up_after_bounded_conflicts() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ram_storage = Arc::new(RamStorage::default());
+        let mut mock_storage = MockStorage::default();
+        // An `s3://` URI makes the metastore take the shared write path.
+        mock_storage
+            .expect_uri()
+            .return_const(Uri::for_test("s3://test-bucket/indexes"));
+
+        let ram_storage_clone = ram_storage.clone();
+        mock_storage
+            .expect_put()
+            .returning(move |path, payload| block_on(ram_storage_clone.put(path, payload)));
+        let ram_storage_clone = ram_storage.clone();
+        mock_storage
+            .expect_exists()
+            .returning(move |path| block_on(ram_storage_clone.exists(path)));
+        let ram_storage_clone = ram_storage.clone();
+        mock_storage
+            .expect_put_if_absent()
+            .returning(move |path, payload| {
+                block_on(ram_storage_clone.put_if_absent(path, payload))
+            });
+        let ram_storage_clone = ram_storage.clone();
+        mock_storage
+            .expect_get_all_with_version()
+            .returning(move |path| block_on(ram_storage_clone.get_all_with_version(path)));
+
+        let conflicts = Arc::new(AtomicUsize::new(0));
+        let conflicts_clone = conflicts.clone();
+        mock_storage
+            .expect_put_if_version_matches()
+            .returning(move |_path, _payload, _version| {
+                conflicts_clone.fetch_add(1, Ordering::SeqCst);
+                Err(StorageErrorKind::PreconditionFailed
+                    .with_error(anyhow::anyhow!("injected conflict")))
+            });
+
+        let metastore = FileBackedMetastore::try_new(Arc::new(mock_storage), None).await?;
+        assert!(metastore.is_distributed());
+
+        let index_config = IndexConfig::for_test(
+            "test-injected-conflicts",
+            "s3://test-bucket/indexes/test-injected-conflicts",
+        );
+        let create_index_request = CreateIndexRequest::try_from_index_config(&index_config)?;
+        let error = metastore
+            .create_index(create_index_request)
+            .await
+            .expect_err("a compare-and-swap that never wins must not report success");
+
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "expected a precondition failure, got: {error}"
+        );
+        assert_eq!(
+            conflicts.load(Ordering::SeqCst),
+            DISTRIBUTED_MAX_ATTEMPTS,
+            "the retry loop must stop after a bounded number of attempts"
+        );
+        Ok(())
+    }
+
     /// A backend without conditional writes must fail loudly in distributed mode.
     ///
     /// Falling back to an unconditional write would "work" and silently lose updates, which is the
