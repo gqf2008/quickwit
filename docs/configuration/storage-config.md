@@ -48,7 +48,7 @@ This section contains one configuration subsection per storage provider. If a st
 
 | Property | Description | Default value |
 | --- | --- | --- |
-| `flavor` | The optional storage flavor to use. Available flavors are `digital_ocean`, `garage`, `gcs`, and `minio`. | |
+| `flavor` | The optional storage flavor to use. Available flavors are `digital_ocean`, `garage`, `gcs`, `minio`, and `r2` (alias `cloudflare`). | |
 | `access_key_id` | The AWS access key ID. | |
 | `secret_access_key` | The AWS secret access key. | |
 | `region` | The AWS region to send requests to. | `us-east-1` (SDK default) |
@@ -77,6 +77,7 @@ Storage flavors ensure that Quickwit works correctly with storage providers that
 - `garage`
 - `gcs`
 - `minio`
+- `r2`
 
 *Digital Ocean*
 
@@ -93,6 +94,13 @@ The Google Cloud Storage flavor (`gcs`) turns off multi-object delete requests, 
 *MinIO flavor*
 
 The MinIO flavor (`minio`) overrides the `region` parameter to `minio` and forces path-style access.
+
+*Cloudflare R2*
+
+The Cloudflare R2 flavor (`r2`, alias `cloudflare`) overrides the `region` parameter to `auto`, forces
+path-style access, and switches upload checksums to `md5`. R2 lists CRC-32C as a composite-only
+checksum, so the full-object CRC32C the AWS SDK sends by default on a single PUT is rejected;
+`Content-MD5` is supported instead.
 
 Example of a storage configuration for Google Cloud Storage in YAML format:
 
@@ -174,3 +182,22 @@ storage:
 ```
 
 Note: `default_index_root_uri` or index URIs do not include the endpoint, you should set it as a typical S3 path such as `s3://indexes`.
+
+### Cloudflare R2
+
+[Cloudflare R2](https://developers.cloudflare.com/r2/) speaks the S3 API. Point `endpoint` at your
+account's R2 endpoint; the `r2` flavor sets `region: auto`, path-style access and MD5 checksums.
+
+```yaml
+storage:
+  s3:
+    flavor: r2
+    endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+    access_key_id: ${R2_ACCESS_KEY_ID}
+    secret_access_key: ${R2_SECRET_ACCESS_KEY}
+
+metastore_uri: s3://my-bucket/quickwit-metastore
+```
+
+An S3-compatible metastore can be shared by several Quickwit nodes at the same time; see
+[metastore configuration](metastore-config.md#distributed-deployments).

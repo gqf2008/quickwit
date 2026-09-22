@@ -185,9 +185,10 @@ pub struct FileBackedMetastore {
     polling_interval_opt: Option<Duration>,
     /// Whether several nodes may write this metastore concurrently.
     ///
-    /// Object storage (S3/R2/GCS) is shared by construction, so the write path has to reload
-    /// before every mutation and write back with `If-Match`. Local files and RAM storage are
-    /// single-node: they cannot version an object, and pretending otherwise would turn a lost
+    /// Set for S3-compatible storage (AWS S3, Cloudflare R2, MinIO), which supports the
+    /// conditional writes this mode is built on: reload the file before every mutation and
+    /// write it back with `If-Match`. Local files, RAM, and the GCS/Azure backends stay
+    /// single-node, because claiming to share without conditional writes would turn a lost
     /// update into a silent one.
     distributed: bool,
 }

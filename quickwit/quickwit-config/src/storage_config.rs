@@ -72,6 +72,9 @@ pub enum StorageBackendFlavor {
     /// MinIO
     #[serde(rename = "minio")]
     MinIO,
+    /// Cloudflare R2
+    #[serde(alias = "cloudflare")]
+    R2,
 }
 
 /// Holds the storage configurations defined in the `storage` section of node config files.
@@ -422,6 +425,14 @@ impl S3StorageConfig {
                 self.region = Some("minio".to_string());
                 self.force_path_style_access = true;
             }
+            Some(StorageBackendFlavor::R2) => {
+                self.region = Some("auto".to_string());
+                // R2's S3 endpoint is the account endpoint, addressed path-style.
+                self.force_path_style_access = true;
+                // R2 lists CRC-32C as a composite-only checksum: the full-object CRC32C the SDK
+                // sends by default on a single PUT is not supported. Content-MD5 is.
+                self.checksum_algorithm = ChecksumAlgorithm::Md5;
+            }
             _ => {}
         }
         // Legacy: honor `disable_checksums: true` from older configs.
@@ -568,6 +579,11 @@ mod tests {
                 ..Default::default()
             }
             .into(),
+            S3StorageConfig {
+                flavor: Some(StorageBackendFlavor::R2),
+                ..Default::default()
+            }
+            .into(),
         ]);
         storage_configs.apply_flavors();
 
@@ -586,6 +602,12 @@ mod tests {
         let minio_storage_config = storage_configs[3].as_s3().unwrap();
         assert_eq!(minio_storage_config.region, Some("minio".to_string()));
         assert!(minio_storage_config.force_path_style_access);
+
+        let r2_storage_config = storage_configs[4].as_s3().unwrap();
+        assert_eq!(r2_storage_config.region, Some("auto".to_string()));
+        assert!(r2_storage_config.force_path_style_access);
+        // R2 rejects the full-object CRC32C the SDK sends by default; Content-MD5 is supported.
+        assert_eq!(r2_storage_config.checksum_algorithm, ChecksumAlgorithm::Md5);
     }
 
     #[test]
@@ -828,6 +850,25 @@ mod tests {
                 serde_yaml::from_str(s3_storage_config_yaml).unwrap();
 
             assert_eq!(s3_storage_config.flavor, Some(StorageBackendFlavor::MinIO));
+        }
+        {
+            let s3_storage_config_yaml = r#"
+                flavor: r2
+            "#;
+            let s3_storage_config: S3StorageConfig =
+                serde_yaml::from_str(s3_storage_config_yaml).unwrap();
+
+            assert_eq!(s3_storage_config.flavor, Some(StorageBackendFlavor::R2));
+        }
+        {
+            // The provider name is accepted as an alias, like `do` for Digital Ocean.
+            let s3_storage_config_yaml = r#"
+                flavor: cloudflare
+            "#;
+            let s3_storage_config: S3StorageConfig =
+                serde_yaml::from_str(s3_storage_config_yaml).unwrap();
+
+            assert_eq!(s3_storage_config.flavor, Some(StorageBackendFlavor::R2));
         }
     }
 }
