@@ -18,9 +18,11 @@ use std::path::Path;
 use itertools::Itertools;
 use quickwit_common::uri::Uri;
 use quickwit_config::{IndexTemplate, IndexTemplateId};
-use quickwit_proto::metastore::{MetastoreError, MetastoreResult, serde_utils};
+use quickwit_proto::metastore::{EntityKind, MetastoreError, MetastoreResult, serde_utils};
 use quickwit_proto::types::{DocMappingUid, IndexId};
-use quickwit_storage::{OwnedBytes, Storage, StorageError, StorageErrorKind, StorageResult};
+use quickwit_storage::{
+    ObjectVersion, OwnedBytes, Storage, StorageError, StorageErrorKind, StorageResult,
+};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 use uuid::Uuid;
@@ -201,6 +203,42 @@ pub(super) async fn save_manifest(
     Ok(())
 }
 
+/// Loads the manifest together with the version a conditional write has to match.
+///
+/// Returns `None` for the version on backends that cannot version an object; the caller must then
+/// refuse to compare-and-swap rather than write unconditionally.
+pub(super) async fn load_manifest_with_version(
+    storage: &dyn Storage,
+) -> MetastoreResult<(Manifest, Option<ObjectVersion>)> {
+    let path = Path::new(MANIFEST_FILE_NAME);
+    let (manifest_bytes, version) =
+        storage
+            .get_all_with_version(path)
+            .await
+            .map_err(|storage_error| {
+                into_metastore_error(storage_error, storage.uri(), path, "load")
+            })?;
+    let manifest: Manifest = serde_utils::from_json_bytes(&manifest_bytes)?;
+    Ok((manifest, version))
+}
+
+/// Saves the manifest, but only if it still has `version` (compare-and-swap).
+///
+/// Fails with [`MetastoreError::FailedPrecondition`] when another node changed the manifest in the
+/// meantime; the caller is expected to reload it and replay its change.
+pub(super) async fn save_manifest_if_version_matches(
+    storage: &dyn Storage,
+    manifest: &Manifest,
+    version: &ObjectVersion,
+) -> MetastoreResult<Option<ObjectVersion>> {
+    let path = Path::new(MANIFEST_FILE_NAME);
+    let manifest_json_bytes = serde_utils::to_json_bytes_pretty(manifest)?;
+    storage
+        .put_if_version_matches(path, Box::new(manifest_json_bytes), version)
+        .await
+        .map_err(|storage_error| into_metastore_error(storage_error, storage.uri(), path, "save"))
+}
+
 async fn delete_file(storage: &dyn Storage, path: &str) -> StorageResult<()> {
     storage.delete(Path::new(path)).await?;
     Ok(())
@@ -243,6 +281,17 @@ fn into_metastore_error(
         StorageErrorKind::Unauthorized => MetastoreError::Forbidden {
             message: format!(
                 "failed to access manifest file located at `{uri}/{}`: unauthorized",
+                path.display()
+            ),
+        },
+        // Losing a compare-and-swap race is expected under concurrency, and callers have to retry
+        // on it. Reporting it as an internal error would turn normal contention into a failure.
+        StorageErrorKind::PreconditionFailed => MetastoreError::FailedPrecondition {
+            entity: EntityKind::IndexTemplate {
+                template_id: "manifest".to_string(),
+            },
+            message: format!(
+                "the manifest file located at `{uri}/{}` was modified concurrently",
                 path.display()
             ),
         },

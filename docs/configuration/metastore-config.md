@@ -64,6 +64,21 @@ For the moment, Quickwit supports two types of storage types:
 - a local file system URI (e.g., `file:///opt/toto`). It is also valid to pass a file path directly (without file://). `/var/quickwit`. Relative paths will be resolved with respect to the current working directory.
 - S3-compatible storage URI (e.g., `s3://my-bucket/some-path`). See the [storage config](storage-config) documentation to configure S3 or S3-compatible storage providers.
 
+### Distributed deployments
+
+An object-storage metastore is shared: several nodes may write the same prefix at the same time.
+Before every metadata write, a node reloads the file it is about to change and writes the result back
+with a conditional write (`If-Match` on the version it read). If another node wrote first, the
+operation reloads the file and replays its change instead of overwriting it, so two nodes publishing
+splits concurrently both keep their work.
+
+This is automatic for object-storage URIs (`s3://`, `gs://`, `azure://`); there is nothing to
+configure. It requires a backend that supports conditional writes: Amazon S3 (since November 2024),
+Cloudflare R2 and MinIO do.
+
+A local-file (`file://`) metastore stays single-node: a local file has no version to compare against,
+so two Quickwit processes pointed at the same directory would overwrite each other's metadata.
+
 ### Polling configuration
 
 By default, the File-Backed Metastore is only read once when you start a Quickwit process (searcher, indexer, ...).
@@ -95,5 +110,8 @@ file:///local/indices#polling_interval=30s
 ```
 
 :::caution
-The file-backed metastore does not support multiple instances running at the same time because it does not implement any locking mechanism to prevent concurrent writes from overwriting each other. Ensure that only one file-backed metastore instance is running at all times.
+On object storage (S3, R2, GCS, Azure) multiple instances can share one metastore prefix safely, as
+described in [Distributed deployments](#distributed-deployments). A `file://` metastore is still
+limited to a single writer: keep only one file-backed metastore instance running at all times when
+the URI points at a local directory.
 :::

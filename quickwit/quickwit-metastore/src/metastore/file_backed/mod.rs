@@ -64,10 +64,10 @@ use quickwit_proto::metastore::{
     UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid};
-use quickwit_storage::Storage;
+use quickwit_storage::{ObjectVersion, Storage};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tracing::instrument;
+use tracing::{debug, info, instrument};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -75,9 +75,34 @@ use self::file_backed_index::FileBackedIndex;
 pub use self::file_backed_metastore_factory::FileBackedMetastoreFactory;
 use self::index_id_matcher::IndexIdMatcher;
 use self::lazy_file_backed_index::LazyFileBackedIndex;
-use self::manifest::{MANIFEST_FILE_NAME, load_or_create_manifest, save_manifest};
+use self::manifest::{
+    MANIFEST_FILE_NAME, load_manifest_with_version, load_or_create_manifest, save_manifest,
+    save_manifest_if_version_matches,
+};
 use self::state::MetastoreState;
-use self::store_operations::{delete_index, index_exists, load_index, put_index};
+use self::store_operations::{
+    delete_index, index_exists, load_index, load_index_with_version, put_index,
+    put_index_if_absent, put_index_if_version_matches,
+};
+
+/// Number of times a mutation is replayed before the metastore gives up on a compare-and-swap race.
+const DISTRIBUTED_MAX_ATTEMPTS: usize = 8;
+
+/// Delay before replaying a mutation that lost a compare-and-swap race.
+///
+/// Exponential with a cap, plus jitter so that two nodes that keep colliding do not stay in
+/// lockstep. The cap keeps a contended index from stalling a request for long.
+fn distributed_retry_backoff(attempt: usize) -> Duration {
+    let exponent = attempt.min(6) as u32;
+    let base_millis = 5u64 << exponent;
+    let jitter_millis = rand::random::<u64>() % 10;
+    Duration::from_millis(base_millis.min(500) + jitter_millis)
+}
+
+/// Returns whether `error` is a compare-and-swap conflict, i.e. another node wrote first.
+fn is_manifest_conflict(error: &MetastoreError) -> bool {
+    matches!(error, MetastoreError::FailedPrecondition { .. })
+}
 use super::{
     AddSourceRequestExt, CreateIndexRequestExt, IndexMetadataResponseExt,
     IndexesMetadataResponseExt, ListIndexesMetadataResponseExt, ListParquetSplitsRequestExt,
@@ -155,6 +180,13 @@ pub struct FileBackedMetastore {
     state: Arc<RwLock<MetastoreState>>,
     storage: Arc<dyn Storage>,
     polling_interval_opt: Option<Duration>,
+    /// Whether several nodes may write this metastore concurrently.
+    ///
+    /// Object storage (S3/R2/GCS) is shared by construction, so the write path has to reload
+    /// before every mutation and write back with `If-Match`. Local files and RAM storage are
+    /// single-node: they cannot version an object, and pretending otherwise would turn a lost
+    /// update into a silent one.
+    distributed: bool,
 }
 
 impl fmt::Debug for FileBackedMetastore {
@@ -174,7 +206,21 @@ impl FileBackedMetastore {
             state: Default::default(),
             storage,
             polling_interval_opt: None,
+            distributed: false,
         }
+    }
+
+    /// Returns whether this metastore is in distributed mode (see [`Self::distributed`]).
+    pub fn is_distributed(&self) -> bool {
+        self.distributed
+    }
+
+    /// Forces distributed mode on or off.
+    ///
+    /// Production code derives this from the metastore URI protocol; tests use it to exercise the
+    /// compare-and-swap path against in-memory storage.
+    pub fn set_distributed(&mut self, distributed: bool) {
+        self.distributed = distributed;
     }
 
     /// Sets the polling interval.
@@ -202,10 +248,25 @@ impl FileBackedMetastore {
         let manifest = load_or_create_manifest(&*storage).await?;
         let state =
             MetastoreState::try_from_manifest(storage.clone(), manifest, polling_interval_opt)?;
+        // Object storage is shared by definition; the other backends are single-node.
+        let distributed = storage.uri().protocol().is_object_storage();
+        if distributed {
+            info!(
+                metastore_uri = %storage.uri(),
+                "file-backed metastore is shared between nodes; metadata writes are \
+                 compare-and-swap and may be replayed when another node writes first"
+            );
+        } else {
+            debug!(
+                metastore_uri = %storage.uri(),
+                "file-backed metastore is single-node; metadata writes assume one writer"
+            );
+        }
         let metastore = Self {
             state: Arc::new(RwLock::new(state)),
             storage,
             polling_interval_opt,
+            distributed,
         };
         Ok(metastore)
     }
@@ -213,8 +274,11 @@ impl FileBackedMetastore {
     async fn mutate<T>(
         &self,
         index_uid: &IndexUid,
-        mutate_fn: impl FnOnce(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+        mutate_fn: impl Fn(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
     ) -> MetastoreResult<T> {
+        if self.distributed {
+            return self.mutate_distributed(index_uid, mutate_fn).await;
+        }
         let index_id = &index_uid.index_id;
         let mut locked_index = self.get_locked_index(index_id).await?;
         if locked_index.index_uid() != index_uid {
@@ -258,6 +322,238 @@ impl FileBackedMetastore {
                 locked_index.discarded = true;
                 Err(error)
             }
+        }
+    }
+
+    /// Compare-and-swap variant of [`Self::mutate`] for nodes that share one metastore prefix.
+    ///
+    /// The cached index is deliberately bypassed: another node may have published splits since we
+    /// last read, and a mutation applied to a stale snapshot would either drop that work or
+    /// resurrect splits it deleted. Every attempt therefore re-reads the index together with its
+    /// version and writes back with `If-Match`; losing that race means somebody else wrote first,
+    /// so we reload and replay instead of overwriting them.
+    async fn mutate_distributed<T>(
+        &self,
+        index_uid: &IndexUid,
+        mutate_fn: impl Fn(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+    ) -> MetastoreResult<T> {
+        let index_id = &index_uid.index_id;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (mut index, version_opt) =
+                load_index_with_version(&*self.storage, index_id).await?;
+            if index.index_uid() != index_uid {
+                return Err(MetastoreError::NotFound(EntityKind::Index {
+                    index_id: index_id.to_string(),
+                }));
+            }
+            let Some(version) = version_opt else {
+                return Err(MetastoreError::Internal {
+                    message: "distributed metastore requires a storage that versions objects"
+                        .to_string(),
+                    cause: format!(
+                        "storage `{}` returned no object version for `{index_id}`",
+                        self.storage.uri()
+                    ),
+                });
+            };
+            let value = match mutate_fn(&mut index)? {
+                MutationOccurred::Yes(value) => value,
+                MutationOccurred::No(value) => {
+                    // Nothing to write, but the read still refreshed our cached view.
+                    self.replace_cached_index(index_id, index).await;
+                    return Ok(value);
+                }
+            };
+            match put_index_if_version_matches(&*self.storage, &index, &version).await {
+                Ok(_) => {
+                    self.replace_cached_index(index_id, index).await;
+                    return Ok(value);
+                }
+                Err(MetastoreError::FailedPrecondition { .. })
+                    if attempt < DISTRIBUTED_MAX_ATTEMPTS =>
+                {
+                    debug!(
+                        index_id,
+                        attempt, "index metadata changed concurrently, replaying the mutation"
+                    );
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => {
+                    self.discard_cached_index(index_id).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Replaces the cached view of an index with the state that was just read or written.
+    async fn replace_cached_index(&self, index_id: &str, index: FileBackedIndex) {
+        let mut state_wlock_guard = self.state.write().await;
+        if matches!(
+            state_wlock_guard.indexes.get(index_id),
+            Some(LazyIndexStatus::Active(_))
+        ) {
+            state_wlock_guard.indexes.insert(
+                index_id.to_string(),
+                LazyIndexStatus::Active(LazyFileBackedIndex::new(
+                    self.storage.clone(),
+                    index_id.to_string(),
+                    self.polling_interval_opt,
+                    Some(index),
+                )),
+            );
+        }
+    }
+
+    /// Drops the cached view of an index, so that the next read reloads it from storage.
+    async fn discard_cached_index(&self, index_id: &str) {
+        let mut state_wlock_guard = self.state.write().await;
+        if matches!(
+            state_wlock_guard.indexes.get(index_id),
+            Some(LazyIndexStatus::Active(_))
+        ) {
+            state_wlock_guard.indexes.insert(
+                index_id.to_string(),
+                LazyIndexStatus::Active(LazyFileBackedIndex::new(
+                    self.storage.clone(),
+                    index_id.to_string(),
+                    self.polling_interval_opt,
+                    None,
+                )),
+            );
+        }
+    }
+
+    /// Reloads the manifest into `state_wlock_guard` when this metastore is shared with other
+    /// nodes.
+    ///
+    /// In single-node mode the cached state is authoritative and this is a no-op. In distributed
+    /// mode the cached view may already be behind another node's write, and a decision taken on it
+    /// would be written back as if it were current.
+    ///
+    /// On success `manifest_version_opt` holds the version the next write has to match.
+    async fn reload_manifest_if_distributed(
+        &self,
+        state_wlock_guard: &mut MetastoreState,
+        manifest_version_opt: &mut Option<ObjectVersion>,
+    ) -> MetastoreResult<()> {
+        if !self.distributed {
+            return Ok(());
+        }
+        let (manifest, loaded_version_opt) = load_manifest_with_version(&*self.storage).await?;
+        let Some(version) = loaded_version_opt else {
+            return Err(MetastoreError::Internal {
+                message: "distributed metastore requires a storage that versions objects"
+                    .to_string(),
+                cause: format!(
+                    "storage `{}` returned no version for the manifest",
+                    self.storage.uri()
+                ),
+            });
+        };
+        *state_wlock_guard = MetastoreState::try_from_manifest(
+            self.storage.clone(),
+            manifest,
+            self.polling_interval_opt,
+        )?;
+        *manifest_version_opt = Some(version);
+        Ok(())
+    }
+
+    /// Writes the manifest held by `state_wlock_guard`.
+    ///
+    /// In distributed mode the write is a compare-and-swap against the version recorded by
+    /// [`Self::reload_manifest_if_distributed`]; losing the race returns
+    /// [`MetastoreError::FailedPrecondition`] so the caller can reload and replay.
+    async fn save_manifest_cas(
+        &self,
+        state_wlock_guard: &MetastoreState,
+        manifest_version_opt: &mut Option<ObjectVersion>,
+    ) -> MetastoreResult<()> {
+        let manifest = state_wlock_guard.as_manifest();
+        if !self.distributed {
+            return save_manifest(&*self.storage, &manifest).await;
+        }
+        let version = manifest_version_opt
+            .take()
+            .ok_or_else(|| MetastoreError::Internal {
+                message: "distributed metastore requires a manifest version".to_string(),
+                cause: "the manifest was not reloaded before being written".to_string(),
+            })?;
+        *manifest_version_opt =
+            save_manifest_if_version_matches(&*self.storage, &manifest, &version).await?;
+        Ok(())
+    }
+
+    /// Compare-and-swap variant of `delete_index` for nodes that share one metastore prefix.
+    ///
+    /// Same two-step shape as the single-node version (mark the index `Deleting`, delete its file,
+    /// then drop it from the manifest), but every manifest write is a compare-and-swap against a
+    /// freshly loaded manifest, and a lost race replays the whole operation.
+    async fn delete_index_distributed(
+        &self,
+        request: &DeleteIndexRequest,
+    ) -> MetastoreResult<EmptyResponse> {
+        let index_id = request.index_uid().index_id.clone();
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut state_wlock_guard = self.state.write().await;
+            let mut manifest_version_opt = None;
+            self.reload_manifest_if_distributed(&mut state_wlock_guard, &mut manifest_version_opt)
+                .await?;
+
+            // If the index is neither in the manifest nor on the storage, it does not exist.
+            if !state_wlock_guard.indexes.contains_key(&index_id)
+                && !index_exists(&*self.storage, &index_id).await?
+            {
+                return Err(MetastoreError::NotFound(EntityKind::Index {
+                    index_id: index_id.clone(),
+                }));
+            }
+            state_wlock_guard
+                .indexes
+                .insert(index_id.clone(), LazyIndexStatus::Deleting);
+
+            if let Err(error) = self
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .await
+            {
+                state_wlock_guard.indexes.remove(&index_id);
+                if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    drop(state_wlock_guard);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+
+            let delete_result = delete_index(&*self.storage, &index_id).await;
+
+            if matches!(
+                &delete_result,
+                Ok(()) | Err(MetastoreError::NotFound(EntityKind::Index { .. }))
+            ) {
+                state_wlock_guard.indexes.remove(&index_id);
+                if let Err(error) = self
+                    .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                    .await
+                {
+                    state_wlock_guard
+                        .indexes
+                        .insert(index_id.clone(), LazyIndexStatus::Deleting);
+                    if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                        drop(state_wlock_guard);
+                        tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+            return delete_result.map(|_| EmptyResponse {});
         }
     }
 
@@ -503,66 +799,110 @@ impl MetastoreService for FileBackedMetastore {
         let index_metadata_json = serde_utils::to_json_str(&index_metadata)?;
         let index = FileBackedIndex::from(index_metadata);
 
-        let mut state_wlock_guard = self.state.write().await;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
 
-        // Checking if index already exists is a bit tedious:
-        // - first we check the index state: if it's `Active`, return `IndexAlreadyExists` error,
-        //   and if it's `Creating` or `Deleting`, it's ok to override them as these are
-        //   transitioning states.
-        // - if the index is not in the index states map, we still need to check the storage as we
-        //   don't want to override an existing metadata file.
-        if let Some(index_status) = state_wlock_guard.indexes.get(index_id) {
-            if let LazyIndexStatus::Active(_) = index_status {
-                return Err(MetastoreError::AlreadyExists(EntityKind::Index {
-                    index_id: index_id.to_string(),
-                }));
+            let mut state_wlock_guard = self.state.write().await;
+            let mut manifest_version_opt = None;
+            self.reload_manifest_if_distributed(&mut state_wlock_guard, &mut manifest_version_opt)
+                .await?;
+
+            // Checking if index already exists is a bit tedious:
+            // - first we check the index state: if it's `Active`, return `IndexAlreadyExists`
+            //   error, and if it's `Creating` or `Deleting`, it's ok to override them as these are
+            //   transitioning states.
+            // - if the index is not in the index states map, we still need to check the storage as
+            //   we don't want to override an existing metadata file.
+            if let Some(index_status) = state_wlock_guard.indexes.get(index_id) {
+                if let LazyIndexStatus::Active(_) = index_status {
+                    return Err(MetastoreError::AlreadyExists(EntityKind::Index {
+                        index_id: index_id.to_string(),
+                    }));
+                }
+            } else if index_exists(&*self.storage, index_id).await? {
+                return Err(MetastoreError::Internal {
+                    message: format!("index {index_id} cannot be created"),
+                    cause: format!(
+                        "index {index_id} is not present in the manifest file but its file \
+                         `{index_id}/metastore.json` is on the storage"
+                    ),
+                });
             }
-        } else if index_exists(&*self.storage, index_id).await? {
-            return Err(MetastoreError::Internal {
-                message: format!("index {index_id} cannot be created"),
-                cause: format!(
-                    "index {index_id} is not present in the manifest file but its file \
-                     `{index_id}/metastore.json` is on the storage"
-                ),
-            });
-        }
-        // Set state to `Creating` and rollback on metastore error.
-        state_wlock_guard
-            .indexes
-            .insert(index_id.clone(), LazyIndexStatus::Creating);
-
-        let manifest = state_wlock_guard.as_manifest();
-
-        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-            state_wlock_guard.indexes.remove(index_id);
-            return Err(error);
-        }
-        put_index(&*self.storage, &index).await?;
-
-        state_wlock_guard.indexes.insert(
-            index_id.clone(),
-            LazyIndexStatus::Active(LazyFileBackedIndex::new(
-                self.storage.clone(),
-                index_id.clone(),
-                self.polling_interval_opt,
-                Some(index),
-            )),
-        );
-        // Set state to `Active` and rollback on metastore error.
-        let manifest = state_wlock_guard.as_manifest();
-
-        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
+            // Set state to `Creating` and rollback on metastore error.
             state_wlock_guard
                 .indexes
                 .insert(index_id.clone(), LazyIndexStatus::Creating);
-            return Err(error);
-        }
 
-        let response = CreateIndexResponse {
-            index_uid: index_uid.into(),
-            index_metadata_json,
-        };
-        Ok(response)
+            if let Err(error) = self
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .await
+            {
+                state_wlock_guard.indexes.remove(index_id);
+                if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    drop(state_wlock_guard);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+
+            // The index file has to be created exactly once: two nodes racing on the same
+            // `create_index` must not be able to overwrite one another's metadata.
+            if self.distributed {
+                match put_index_if_absent(&*self.storage, &index).await {
+                    Ok(_) => {}
+                    Err(MetastoreError::AlreadyExists(_))
+                    | Err(MetastoreError::FailedPrecondition { .. }) => {
+                        state_wlock_guard.indexes.remove(index_id);
+                        if attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                            drop(state_wlock_guard);
+                            tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                            continue;
+                        }
+                        return Err(MetastoreError::AlreadyExists(EntityKind::Index {
+                            index_id: index_id.to_string(),
+                        }));
+                    }
+                    Err(error) => {
+                        state_wlock_guard.indexes.remove(index_id);
+                        return Err(error);
+                    }
+                }
+            } else {
+                put_index(&*self.storage, &index).await?;
+            }
+
+            state_wlock_guard.indexes.insert(
+                index_id.clone(),
+                LazyIndexStatus::Active(LazyFileBackedIndex::new(
+                    self.storage.clone(),
+                    index_id.clone(),
+                    self.polling_interval_opt,
+                    Some(index.clone()),
+                )),
+            );
+            // Set state to `Active` and rollback on metastore error.
+            if let Err(error) = self
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .await
+            {
+                state_wlock_guard
+                    .indexes
+                    .insert(index_id.clone(), LazyIndexStatus::Creating);
+                if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    drop(state_wlock_guard);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+
+            return Ok(CreateIndexResponse {
+                index_uid: index_uid.into(),
+                index_metadata_json,
+            });
+        }
     }
 
     #[instrument(name = "metastore.file_backed.update_index", skip_all, fields(index_uid = %request.index_uid()))]
@@ -580,11 +920,11 @@ impl MetastoreService for FileBackedMetastore {
         let index_metadata = self
             .mutate(index_uid, |index| {
                 let mutation_occurred = index.update_index_config(
-                    doc_mapping,
-                    indexing_settings,
-                    ingest_settings,
-                    search_settings,
-                    retention_policy_opt,
+                    doc_mapping.clone(),
+                    indexing_settings.clone(),
+                    ingest_settings.clone(),
+                    search_settings.clone(),
+                    retention_policy_opt.clone(),
                 )?;
                 let index_metadata = index.metadata().clone();
 
@@ -600,6 +940,9 @@ impl MetastoreService for FileBackedMetastore {
 
     #[instrument(name = "metastore.file_backed.delete_index", skip_all, fields(index_uid = %request.index_uid()))]
     async fn delete_index(&self, request: DeleteIndexRequest) -> MetastoreResult<EmptyResponse> {
+        if self.distributed {
+            return self.delete_index_distributed(&request).await;
+        }
         // We pick the outer lock here, so that we enter a critical section.
         let mut state_wlock_guard = self.state.write().await;
 
@@ -661,7 +1004,7 @@ impl MetastoreService for FileBackedMetastore {
         self.mutate(&index_uid, |index| {
             let mut failed_split_ids = Vec::new();
 
-            for split_metadata in splits_metadata {
+            for split_metadata in splits_metadata.clone() {
                 match index.stage_split(split_metadata) {
                     Ok(()) => {}
                     Err(MetastoreError::FailedPrecondition {
@@ -697,10 +1040,10 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid().clone();
         self.mutate(&index_uid, |index| {
             index.publish_splits(
-                request.staged_split_ids,
-                request.replaced_split_ids,
-                index_checkpoint_delta,
-                request.publish_token_opt.map(|token| token.into()),
+                request.staged_split_ids.clone(),
+                request.replaced_split_ids.clone(),
+                index_checkpoint_delta.clone(),
+                request.publish_token_opt.clone().map(|token| token.into()),
             )?;
             Ok(MutationOccurred::Yes(()))
         })
@@ -718,7 +1061,7 @@ impl MetastoreService for FileBackedMetastore {
         self.mutate(&index_uid, |index| {
             index
                 .mark_splits_for_deletion(
-                    request.split_ids,
+                    request.split_ids.clone(),
                     &[
                         SplitState::Staged,
                         SplitState::Published,
@@ -737,7 +1080,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid().clone();
 
         self.mutate(&index_uid, |index| {
-            index.delete_splits(request.split_ids)?;
+            index.delete_splits(request.split_ids.clone())?;
             Ok(MutationOccurred::Yes(EmptyResponse {}))
         })
         .await?;
@@ -750,7 +1093,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid();
 
         self.mutate(index_uid, |index| {
-            index.add_source(source_config)?;
+            index.add_source(source_config.clone())?;
             Ok(MutationOccurred::Yes(()))
         })
         .await?;
@@ -763,7 +1106,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid();
 
         self.mutate(index_uid, |index| {
-            let mutation_occurred = index.update_source(source_config)?;
+            let mutation_occurred = index.update_source(source_config.clone())?;
             Ok(MutationOccurred::from(mutation_occurred))
         })
         .await?;
@@ -1008,7 +1351,7 @@ impl MetastoreService for FileBackedMetastore {
 
         for (index_uid, subrequests) in per_index_uid_subrequests {
             let subresponses = self
-                .mutate(&index_uid, |index| index.open_shards(subrequests))
+                .mutate(&index_uid, |index| index.open_shards(subrequests.clone()))
                 .await?;
             response.subresponses.extend(subresponses);
         }
@@ -1022,7 +1365,7 @@ impl MetastoreService for FileBackedMetastore {
     ) -> MetastoreResult<AcquireShardsResponse> {
         let index_uid = request.index_uid().clone();
         let response = self
-            .mutate(&index_uid, |index| index.acquire_shards(request))
+            .mutate(&index_uid, |index| index.acquire_shards(request.clone()))
             .await?;
         Ok(response)
     }
@@ -1034,7 +1377,7 @@ impl MetastoreService for FileBackedMetastore {
     ) -> MetastoreResult<DeleteShardsResponse> {
         let index_uid = request.index_uid().clone();
         let response = self
-            .mutate(&index_uid, |index| index.delete_shards(request))
+            .mutate(&index_uid, |index| index.delete_shards(request.clone()))
             .await?;
         Ok(response)
     }
@@ -1042,7 +1385,7 @@ impl MetastoreService for FileBackedMetastore {
     #[instrument(name = "metastore.file_backed.prune_shards", skip_all, fields(index_uid = %request.index_uid()))]
     async fn prune_shards(&self, request: PruneShardsRequest) -> MetastoreResult<EmptyResponse> {
         let index_uid = request.index_uid().clone();
-        self.mutate(&index_uid, |index| index.prune_shards(request))
+        self.mutate(&index_uid, |index| index.prune_shards(request.clone()))
             .await?;
         Ok(EmptyResponse {})
     }
@@ -1082,7 +1425,7 @@ impl MetastoreService for FileBackedMetastore {
         let delete_task = self
             .mutate(&index_uid, |index| {
                 index
-                    .create_delete_task(delete_query)
+                    .create_delete_task(delete_query.clone())
                     .map(MutationOccurred::Yes)
             })
             .await?;
@@ -1137,53 +1480,67 @@ impl MetastoreService for FileBackedMetastore {
             serde_utils::from_json_str(&request.index_template_json)?;
         let template_id = index_template.template_id.clone();
 
-        let mut state_wlock_guard = self.state.write().await;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut state_wlock_guard = self.state.write().await;
+            let mut manifest_version_opt = None;
+            self.reload_manifest_if_distributed(&mut state_wlock_guard, &mut manifest_version_opt)
+                .await?;
 
-        let evicted_template_opt = match state_wlock_guard.templates.entry(template_id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(index_template.clone());
-                None
+            let evicted_template_opt = match state_wlock_guard.templates.entry(template_id.clone())
+            {
+                Entry::Vacant(entry) => {
+                    entry.insert(index_template.clone());
+                    None
+                }
+                Entry::Occupied(mut entry) if request.overwrite => {
+                    let evicted_template = entry.insert(index_template.clone());
+                    Some(evicted_template)
+                }
+                Entry::Occupied(_) => {
+                    return Err(MetastoreError::AlreadyExists(EntityKind::IndexTemplate {
+                        template_id: template_id.clone(),
+                    }));
+                }
+            };
+            if let Err(error) = state_wlock_guard.template_matcher.insert(&index_template) {
+                if let Some(evicted_template) = evicted_template_opt {
+                    state_wlock_guard
+                        .templates
+                        .insert(evicted_template.template_id.clone(), evicted_template);
+                } else {
+                    state_wlock_guard.templates.remove(&template_id);
+                }
+                return Err(error);
             }
-            Entry::Occupied(mut entry) if request.overwrite => {
-                let evicted_template = entry.insert(index_template.clone());
-                Some(evicted_template)
-            }
-            Entry::Occupied(_) => {
-                return Err(MetastoreError::AlreadyExists(EntityKind::IndexTemplate {
-                    template_id,
-                }));
-            }
-        };
-        if let Err(error) = state_wlock_guard.template_matcher.insert(&index_template) {
-            if let Some(evicted_template) = evicted_template_opt {
-                state_wlock_guard
-                    .templates
-                    .insert(evicted_template.template_id.clone(), evicted_template);
-            } else {
-                state_wlock_guard.templates.remove(&template_id);
-            }
-            return Err(error);
-        }
-        let manifest = state_wlock_guard.as_manifest();
-        let save_result = save_manifest(&*self.storage, &manifest).await;
 
-        // Rollback on error.
-        if let Err(error) = save_result {
-            if let Some(evicted_template) = evicted_template_opt {
-                state_wlock_guard
-                    .template_matcher
-                    .insert(&evicted_template)
-                    .expect("evicted template should be valid");
-                state_wlock_guard
-                    .templates
-                    .insert(evicted_template.template_id.clone(), evicted_template);
-            } else {
-                state_wlock_guard.templates.remove(&template_id);
-                state_wlock_guard.template_matcher.remove(&template_id);
+            if let Err(error) = self
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .await
+            {
+                if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    drop(state_wlock_guard);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                // Rollback on error.
+                if let Some(evicted_template) = evicted_template_opt {
+                    state_wlock_guard
+                        .template_matcher
+                        .insert(&evicted_template)
+                        .expect("evicted template should be valid");
+                    state_wlock_guard
+                        .templates
+                        .insert(evicted_template.template_id.clone(), evicted_template);
+                } else {
+                    state_wlock_guard.templates.remove(&template_id);
+                    state_wlock_guard.template_matcher.remove(&template_id);
+                }
+                return Err(error);
             }
-            return Err(error);
+            return Ok(EmptyResponse {});
         }
-        Ok(EmptyResponse {})
     }
 
     #[instrument(name = "metastore.file_backed.get_index_template", skip(self))]
@@ -1262,32 +1619,45 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         request: DeleteIndexTemplatesRequest,
     ) -> MetastoreResult<EmptyResponse> {
-        let mut evicted_templates = Vec::with_capacity(request.template_ids.len());
-        let mut state_wlock_guard = self.state.write().await;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut evicted_templates = Vec::with_capacity(request.template_ids.len());
+            let mut state_wlock_guard = self.state.write().await;
+            let mut manifest_version_opt = None;
+            self.reload_manifest_if_distributed(&mut state_wlock_guard, &mut manifest_version_opt)
+                .await?;
 
-        for template_id in &request.template_ids {
-            if let Some(evicted_template) = state_wlock_guard.templates.remove(template_id) {
-                evicted_templates.push(evicted_template);
-                state_wlock_guard.template_matcher.remove(template_id);
+            for template_id in &request.template_ids {
+                if let Some(evicted_template) = state_wlock_guard.templates.remove(template_id) {
+                    evicted_templates.push(evicted_template);
+                    state_wlock_guard.template_matcher.remove(template_id);
+                }
             }
-        }
-        let manifest = state_wlock_guard.as_manifest();
-        let save_result = save_manifest(&*self.storage, &manifest).await;
 
-        // Rollback on error.
-        if let Err(error) = save_result {
-            for evicted_template in evicted_templates {
-                state_wlock_guard
-                    .template_matcher
-                    .insert(&evicted_template)
-                    .expect("evicted template should be valid");
-                state_wlock_guard
-                    .templates
-                    .insert(evicted_template.template_id.clone(), evicted_template);
+            if let Err(error) = self
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .await
+            {
+                if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    drop(state_wlock_guard);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                // Rollback on error.
+                for evicted_template in evicted_templates {
+                    state_wlock_guard
+                        .template_matcher
+                        .insert(&evicted_template)
+                        .expect("evicted template should be valid");
+                    state_wlock_guard
+                        .templates
+                        .insert(evicted_template.template_id.clone(), evicted_template);
+                }
+                return Err(error);
             }
-            return Err(error);
+            return Ok(EmptyResponse {});
         }
-        Ok(EmptyResponse {})
     }
 
     // Get cluster identity api
@@ -1299,22 +1669,36 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         _: GetClusterIdentityRequest,
     ) -> MetastoreResult<GetClusterIdentityResponse> {
-        let mut state_wlock_guard = self.state.write().await;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut state_wlock_guard = self.state.write().await;
+            let mut manifest_version_opt = None;
+            self.reload_manifest_if_distributed(&mut state_wlock_guard, &mut manifest_version_opt)
+                .await?;
 
-        if state_wlock_guard.identity.is_nil() {
-            state_wlock_guard.identity = Uuid::new_v4();
+            if state_wlock_guard.identity.is_nil() {
+                state_wlock_guard.identity = Uuid::new_v4();
 
-            let manifest = state_wlock_guard.as_manifest();
-
-            if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-                state_wlock_guard.identity = Uuid::nil();
-                return Err(error);
+                if let Err(error) = self
+                    .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                    .await
+                {
+                    state_wlock_guard.identity = Uuid::nil();
+                    if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                        // Another node minted the identity first; reload and adopt theirs.
+                        drop(state_wlock_guard);
+                        tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
-        }
 
-        Ok(GetClusterIdentityResponse {
-            uuid: state_wlock_guard.identity.hyphenated().to_string(),
-        })
+            return Ok(GetClusterIdentityResponse {
+                uuid: state_wlock_guard.identity.hyphenated().to_string(),
+            });
+        }
     }
 
     // Metrics Splits API
@@ -1332,7 +1716,7 @@ impl MetastoreService for FileBackedMetastore {
         }
 
         self.mutate(&index_uid, |index| {
-            let mutated = index.stage_metrics_splits(splits_metadata)?;
+            let mutated = index.stage_metrics_splits(splits_metadata.clone())?;
             if mutated {
                 Ok(MutationOccurred::Yes(()))
             } else {
@@ -1360,8 +1744,8 @@ impl MetastoreService for FileBackedMetastore {
             let mutated = index.publish_metrics_splits(
                 &staged_split_ids,
                 &replaced_split_ids,
-                index_checkpoint_delta,
-                publish_token_opt.map(|token| token.into()),
+                index_checkpoint_delta.clone(),
+                publish_token_opt.clone().map(|token| token.into()),
             )?;
             if mutated {
                 Ok(MutationOccurred::Yes(()))
@@ -1463,7 +1847,7 @@ impl MetastoreService for FileBackedMetastore {
         }
 
         self.mutate(&index_uid, |index| {
-            let mutated = index.stage_sketch_splits(splits_metadata)?;
+            let mutated = index.stage_sketch_splits(splits_metadata.clone())?;
             if mutated {
                 Ok(MutationOccurred::Yes(()))
             } else {
@@ -1491,8 +1875,8 @@ impl MetastoreService for FileBackedMetastore {
             let mutated = index.publish_sketch_splits(
                 &staged_split_ids,
                 &replaced_split_ids,
-                index_checkpoint_delta,
-                publish_token_opt.map(|token| token.into()),
+                index_checkpoint_delta.clone(),
+                publish_token_opt.clone().map(|token| token.into()),
             )?;
             if mutated {
                 Ok(MutationOccurred::Yes(()))
@@ -1677,7 +2061,7 @@ mod tests {
             shards: Vec<Shard>,
         ) {
             self.mutate(index_uid, |index| {
-                index.insert_shards(source_id, shards);
+                index.insert_shards(source_id, shards.clone());
                 Ok(MutationOccurred::Yes(()))
             })
             .await
@@ -1708,6 +2092,10 @@ mod tests {
         let mut mock_storage = MockStorage::default();
         let ram_storage = RamStorage::default();
         let ram_storage_clone = ram_storage.clone();
+        // `try_new` asks the storage for its URI to decide whether several nodes may share it.
+        mock_storage
+            .expect_uri()
+            .return_const(Uri::for_test("ram:///indexes"));
         mock_storage // remove this if we end up changing the semantics of create.
             .expect_exists()
             .times(3)
@@ -2713,5 +3101,103 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    /// A node that read the index before another node published must not overwrite that work.
+    ///
+    /// This is exactly the state a shared metastore gets into: node A and node B both look at the
+    /// index, then A publishes, then B publishes from the view it loaded earlier. With the
+    /// single-node path (read the cached index, then overwrite the file) B's write erases A's
+    /// split; with the distributed path B's compare-and-swap fails, B reloads, and both splits
+    /// survive.
+    #[tokio::test]
+    async fn test_distributed_metastore_does_not_lose_updates_from_a_stale_cache()
+    -> anyhow::Result<()> {
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
+        metastore_a.set_distributed(true);
+        let mut metastore_b = FileBackedMetastore::try_new(storage.clone(), None).await?;
+        metastore_b.set_distributed(true);
+        assert!(metastore_a.is_distributed() && metastore_b.is_distributed());
+
+        let index_id = "test-distributed-stale-cache";
+        let index_uri = format!("ram:///indexes/{index_id}");
+        let index_config = IndexConfig::for_test(index_id, &index_uri);
+        let create_index_request = CreateIndexRequest::try_from_index_config(&index_config)?;
+        let index_uid: IndexUid = metastore_a
+            .create_index(create_index_request)
+            .await?
+            .index_uid()
+            .clone();
+
+        async fn stage_and_publish_split(
+            metastore: &FileBackedMetastore,
+            index_uid: &IndexUid,
+            split_id: &str,
+        ) -> anyhow::Result<()> {
+            let split_metadata = SplitMetadata {
+                footer_offsets: 0..10,
+                split_id: split_id.to_string().into(),
+                num_docs: 1,
+                time_range: Some(RangeInclusive::new(0, 99)),
+                ..Default::default()
+            };
+            let stage_splits_request =
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)?;
+            metastore.stage_splits(stage_splits_request).await?;
+            let publish_splits_request = PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![split_id.to_string()],
+                ..Default::default()
+            };
+            metastore.publish_splits(publish_splits_request).await?;
+            Ok(())
+        }
+
+        async fn list_published_split_ids(
+            metastore: &FileBackedMetastore,
+            index_uid: &IndexUid,
+        ) -> anyhow::Result<Vec<String>> {
+            let list_splits_query = ListSplitsQuery::for_index(index_uid.clone())
+                .with_split_state(SplitState::Published);
+            let list_splits_request =
+                ListSplitsRequest::try_from_list_splits_query(&list_splits_query)?;
+            let mut split_ids: Vec<String> = metastore
+                .list_splits(list_splits_request)
+                .await?
+                .collect_splits()
+                .await?
+                .iter()
+                .map(|split| split.split_id().to_string())
+                .collect();
+            split_ids.sort();
+            Ok(split_ids)
+        }
+
+        // Both nodes look at the index before either of them writes.
+        assert!(
+            list_published_split_ids(&metastore_a, &index_uid)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            list_published_split_ids(&metastore_b, &index_uid)
+                .await?
+                .is_empty()
+        );
+
+        stage_and_publish_split(&metastore_a, &index_uid, "a-split-0").await?;
+        // B still holds the view it loaded above, where A's split does not exist.
+        stage_and_publish_split(&metastore_b, &index_uid, "b-split-0").await?;
+
+        // A reader that never wrote must see both splits.
+        let mut metastore_c = FileBackedMetastore::try_new(storage.clone(), None).await?;
+        metastore_c.set_distributed(true);
+        assert_eq!(
+            list_published_split_ids(&metastore_c, &index_uid).await?,
+            vec!["a-split-0".to_string(), "b-split-0".to_string()],
+            "the second writer must not erase the first writer's split"
+        );
+        Ok(())
     }
 }
