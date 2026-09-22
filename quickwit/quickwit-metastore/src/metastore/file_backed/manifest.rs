@@ -295,6 +295,17 @@ fn into_metastore_error(
                 path.display()
             ),
         },
+        // A backend without conditional writes cannot serve a shared metastore. Name the capability
+        // gap instead of blaming the file.
+        StorageErrorKind::Unsupported => MetastoreError::Internal {
+            message: format!(
+                "failed to {operation_name} the manifest file located at `{uri}/{}`",
+                path.display()
+            ),
+            cause: "the storage backend does not support conditional writes; the metastore needs \
+                    a storage that versions objects (S3-compatible)"
+                .to_string(),
+        },
         _ => MetastoreError::Internal {
             message: format!(
                 "failed to {operation_name} manifest file located at `{uri}/{}`",

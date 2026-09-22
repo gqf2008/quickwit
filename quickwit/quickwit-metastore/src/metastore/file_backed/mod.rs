@@ -38,6 +38,7 @@ use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
 use itertools::Itertools;
 use quickwit_common::ServiceStream;
+use quickwit_common::uri::Protocol;
 use quickwit_config::IndexTemplate;
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
@@ -93,10 +94,12 @@ const DISTRIBUTED_MAX_ATTEMPTS: usize = 8;
 /// Exponential with a cap, plus jitter so that two nodes that keep colliding do not stay in
 /// lockstep. The cap keeps a contended index from stalling a request for long.
 fn distributed_retry_backoff(attempt: usize) -> Duration {
-    let exponent = attempt.min(6) as u32;
-    let base_millis = 5u64 << exponent;
+    // Double the delay per attempt, and cap it so a contended index cannot stall a request for
+    // long. Jitter keeps two nodes that keep colliding out of lockstep.
+    let exponent = attempt.min(7) as u32;
+    let base_millis = (5u64 << exponent).min(500);
     let jitter_millis = rand::random::<u64>() % 10;
-    Duration::from_millis(base_millis.min(500) + jitter_millis)
+    Duration::from_millis(base_millis + jitter_millis)
 }
 
 /// Returns whether `error` is a compare-and-swap conflict, i.e. another node wrote first.
@@ -248,8 +251,12 @@ impl FileBackedMetastore {
         let manifest = load_or_create_manifest(&*storage).await?;
         let state =
             MetastoreState::try_from_manifest(storage.clone(), manifest, polling_interval_opt)?;
-        // Object storage is shared by definition; the other backends are single-node.
-        let distributed = storage.uri().protocol().is_object_storage();
+        // Sharing a metastore safely needs conditional writes, and today only the S3-compatible
+        // backend implements them (which covers AWS S3, Cloudflare R2 and MinIO). Azure and GCS
+        // keep the single-node path: entering distributed mode without conditional writes would
+        // make every metadata write fail instead of merely being unsafe, and failing is not a
+        // better answer than not claiming a capability we do not have.
+        let distributed = storage.uri().protocol() == Protocol::S3;
         if distributed {
             info!(
                 metastore_uri = %storage.uri(),
@@ -821,6 +828,19 @@ impl MetastoreService for FileBackedMetastore {
                     }));
                 }
             } else if index_exists(&*self.storage, index_id).await? {
+                if self.distributed {
+                    // Another node may have created the index file after we read the manifest,
+                    // and its manifest write may not have landed yet. Reload instead of reporting
+                    // an inconsistency; if the file is still there afterwards, the index exists.
+                    if attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                        drop(state_wlock_guard);
+                        tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(MetastoreError::AlreadyExists(EntityKind::Index {
+                        index_id: index_id.to_string(),
+                    }));
+                }
                 return Err(MetastoreError::Internal {
                     message: format!("index {index_id} cannot be created"),
                     cause: format!(
@@ -2039,7 +2059,7 @@ mod tests {
     use quickwit_proto::metastore::{DeleteQuery, MetastoreError};
     use quickwit_proto::types::SourceId;
     use quickwit_query::query_ast::qast_helper;
-    use quickwit_storage::{MockStorage, RamStorage, Storage, StorageErrorKind};
+    use quickwit_storage::{LocalFileStorage, MockStorage, RamStorage, Storage, StorageErrorKind};
     use rand::RngExt;
     use tests::manifest::{IndexStatus, Manifest};
     use time::OffsetDateTime;
@@ -3197,6 +3217,43 @@ mod tests {
             list_published_split_ids(&metastore_c, &index_uid).await?,
             vec!["a-split-0".to_string(), "b-split-0".to_string()],
             "the second writer must not erase the first writer's split"
+        );
+        Ok(())
+    }
+
+    /// A backend without conditional writes must fail loudly in distributed mode.
+    ///
+    /// Falling back to an unconditional write would "work" and silently lose updates, which is the
+    /// one outcome a shared metastore must never produce.
+    #[tokio::test]
+    async fn test_distributed_metastore_rejects_storage_without_conditional_writes()
+    -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let uri: Uri = format!("file://{}", temp_dir.path().display())
+            .parse()
+            .unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalFileStorage::from_uri(&uri)?);
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await?;
+        assert!(
+            !metastore.is_distributed(),
+            "a local-file metastore must stay single-node"
+        );
+
+        // Force the shared mode onto a backend that cannot version an object.
+        metastore.set_distributed(true);
+        let index_config = IndexConfig::for_test(
+            "test-no-conditional-writes",
+            "file:///indexes/test-no-conditional-writes",
+        );
+        let create_index_request = CreateIndexRequest::try_from_index_config(&index_config)?;
+        let error = metastore
+            .create_index(create_index_request)
+            .await
+            .expect_err("a storage without conditional writes must not accept a shared write");
+        let message = error.to_string();
+        assert!(
+            message.contains("conditional writes"),
+            "the error must name the capability gap, got: {message}"
         );
         Ok(())
     }

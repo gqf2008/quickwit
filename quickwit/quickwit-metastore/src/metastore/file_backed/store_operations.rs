@@ -44,6 +44,15 @@ fn convert_error(index_id: &str, storage_error: StorageError) -> MetastoreError 
             },
             message: "the index metadata was modified concurrently".to_string(),
         },
+        // A backend that cannot version objects cannot take part in the compare-and-swap write
+        // path. Say so explicitly: "failed to get index files" would send an operator looking for a
+        // file problem instead of the capability gap that is actually there.
+        StorageErrorKind::Unsupported => MetastoreError::Internal {
+            message: format!("index `{index_id}` was written with a conditional write"),
+            cause: "the storage backend does not support conditional writes; the metastore needs \
+                    a storage that versions objects (S3-compatible)"
+                .to_string(),
+        },
         _ => MetastoreError::Internal {
             message: "failed to get index files".to_string(),
             cause: storage_error.to_string(),

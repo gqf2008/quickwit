@@ -72,12 +72,17 @@ with a conditional write (`If-Match` on the version it read). If another node wr
 operation reloads the file and replays its change instead of overwriting it, so two nodes publishing
 splits concurrently both keep their work.
 
-This is automatic for object-storage URIs (`s3://`, `gs://`, `azure://`); there is nothing to
-configure. It requires a backend that supports conditional writes: Amazon S3 (since November 2024),
-Cloudflare R2 and MinIO do.
+This is automatic for S3-compatible URIs (`s3://`); there is nothing to configure. It requires a
+backend that supports conditional writes — Amazon S3 (since November 2024), Cloudflare R2 and MinIO
+do.
 
-A local-file (`file://`) metastore stays single-node: a local file has no version to compare against,
-so two Quickwit processes pointed at the same directory would overwrite each other's metadata.
+Two cases remain single-node:
+
+- a `gs://` or `azure://` metastore: those backends do not implement conditional writes in Quickwit
+  yet, so a prefix shared by several processes would lose updates;
+- a local-file (`file://`) metastore: a local file has no version to compare against.
+
+The metastore logs which mode it started in.
 
 ### Polling configuration
 
@@ -110,8 +115,8 @@ file:///local/indices#polling_interval=30s
 ```
 
 :::caution
-On object storage (S3, R2, GCS, Azure) multiple instances can share one metastore prefix safely, as
-described in [Distributed deployments](#distributed-deployments). A `file://` metastore is still
-limited to a single writer: keep only one file-backed metastore instance running at all times when
-the URI points at a local directory.
+Multiple instances can share one **S3-compatible** metastore prefix safely, as described in
+[Distributed deployments](#distributed-deployments). A `file://`, `gs://` or `azure://` metastore is
+still limited to a single writer: keep only one file-backed metastore instance running at all times
+for those URIs.
 :::
