@@ -1,0 +1,50 @@
+# Quickwit work-unit board. Move cards by appending signed `status` entries,
+# never by editing this file.
+version = 1
+
+[sort]
+by = "ts"
+direction = "desc"
+
+[[column]]
+name = "merged"
+status = "merged"
+
+[[column]]
+name = "closed"
+status = "closed"
+
+# These are global alert lanes and deliberately precede active workflow lanes
+# (first-match-wins): a card that is merge-blocked/unverified is more actionable
+# there than in open/in-progress/needs-review. Terminal lanes still win first.
+[[column]]
+name = "merge-blocked"
+merge = "blocked"
+
+[[column]]
+name = "unverified"
+unverified = true
+
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "blocked"
+status = "blocked"
+
+[[column]]
+name = "needs-human"
+status = "needs-human"
+
+# Catch-all: never hide a thread with a status this board does not know yet.
+[[column]]
+name = "other"

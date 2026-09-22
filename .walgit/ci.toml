@@ -1,0 +1,38 @@
+# walgit decentralized CI task declaration for quickwit.
+#
+# The walgit runner checks the commit under test out and executes these commands
+# from the repository root (the directory holding this file), so every command
+# has to enter the `quickwit/` cargo workspace explicitly. Keep these tasks
+# cheap: the local gate (`cargo nextest`, `make test-all`) stays on the dev
+# machine, the remote matrix stays on GitHub Actions.
+version = 1
+
+claim_ttl = "90m"
+timeout = "60m"
+max_attempts = 1
+
+[[task]]
+name = "license-headers"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cd quickwit && bash scripts/check_license_headers.sh"
+timeout = "10m"
+
+[[task]]
+name = "fmt"
+refs = ["refs/heads/*"]
+command = "cargo fmt --manifest-path quickwit/Cargo.toml --all -- --check"
+timeout = "15m"
+env_allow = ["CARGO_HOME", "RUSTUP_HOME", "RUSTC_WRAPPER", "CARGO_TARGET_DIR"]
+
+[[task]]
+name = "check"
+refs = ["refs/heads/*"]
+command = "cargo check --manifest-path quickwit/Cargo.toml -p quickwit-storage -p quickwit-metastore -p quickwit-serve --all-features --tests"
+timeout = "60m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "RUSTFLAGS",
+  "RUSTC_WRAPPER",
+  "CARGO_TARGET_DIR",
+]
