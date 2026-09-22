@@ -9,11 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Azure Blob Storage: support custom endpoints via `endpoint` and `endpoint_suffix` configuration options for sovereign clouds (#6624)
+- Storage: conditional writes (`put_if_absent`, `put_if_version_matches`, `get_all_with_version`) with a
+  `PreconditionFailed` error kind, and a Cloudflare R2 storage flavor (`storage.s3.flavor: r2`, alias
+  `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums, because R2 only
+  supports CRC-32C as a composite checksum.
 
 ### Fixed
 - (Jaeger) Query resource attributes when Jaeger request carries tags
 
 ### Changed
+- **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the
+  file together with its version and write it back with `If-Match`; a lost race is replayed (bounded
+  retries) instead of overwriting the winner. The metastore probes the endpoint for conditional-write
+  support at startup and refuses to run in shared mode when the endpoint would silently ignore the
+  preconditions (`QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on such an
+  endpoint). `file://`, `gs://` and `azure://` metastores keep the single-writer behaviour, and the
+  startup log says which mode is in use.
 
 ### Deprecated
 

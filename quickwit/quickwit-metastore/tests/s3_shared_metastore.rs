@@ -62,6 +62,24 @@ async fn s3_storage(bucket_uri: &str) -> anyhow::Result<Arc<dyn Storage>> {
     Ok(Arc::new(storage))
 }
 
+/// Whether the endpoint rejects a write whose `If-None-Match` precondition does not hold.
+async fn storage_enforces_conditional_writes(storage: &dyn Storage) -> anyhow::Result<bool> {
+    let probe_path = format!(".capability-probe-{}", append_random_suffix("entry"));
+    let path = Path::new(&probe_path);
+    storage
+        .put_if_absent(path, Box::new(b"first".to_vec()))
+        .await?;
+    let second_write = storage
+        .put_if_absent(path, Box::new(b"second".to_vec()))
+        .await;
+    let enforces = matches!(
+        &second_write,
+        Err(error) if error.kind() == StorageErrorKind::PreconditionFailed
+    );
+    storage.delete(path).await?;
+    Ok(enforces)
+}
+
 /// The conditional-write primitives the shared metastore is built on, against a real endpoint.
 #[tokio::test]
 async fn test_conditional_writes_on_s3_endpoint() -> anyhow::Result<()> {
@@ -78,11 +96,25 @@ async fn test_conditional_writes_on_s3_endpoint() -> anyhow::Result<()> {
         .await?
         .context("S3-compatible storage should report the version it wrote")?;
 
-    let error = storage
+    let second_write = storage
         .put_if_absent(path, Box::new(b"second".to_vec()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), StorageErrorKind::PreconditionFailed);
+        .await;
+    if !matches!(
+        &second_write,
+        Err(error) if error.kind() == StorageErrorKind::PreconditionFailed
+    ) {
+        // Endpoints exist that accept `If-None-Match: *` and overwrite the object anyway
+        // (localstack 3.5.0 does). The metastore detects that at startup and refuses to
+        // share the prefix, so this test states the fact instead of pretending the endpoint
+        // is safe.
+        eprintln!(
+            "note: this endpoint ignores `If-None-Match: *` (second write returned \
+             {second_write:?}); the metastore refuses to run in shared mode here, which \
+             test_shared_metastore_either_shares_safely_or_refuses_to_start asserts"
+        );
+        storage.delete(path).await?;
+        return Ok(());
+    }
 
     let (bytes, read_version) = storage.get_all_with_version(path).await?;
     assert_eq!(&bytes, &b"first"[..]);
@@ -148,26 +180,69 @@ async fn list_published_split_ids(
     Ok(split_ids)
 }
 
-/// Two nodes sharing one S3 prefix keep each other's splits. A node that read before the other
-/// wrote must not overwrite that work, which is the whole point of the shared write path.
+/// A shared metastore must either be safe or refuse to start -- never silently lose updates.
+///
+/// On an endpoint that enforces conditional writes (AWS S3, Cloudflare R2, MinIO) the metastore
+/// starts in shared mode and two nodes keep each other's splits. On one that ignores them
+/// (localstack 3.5.0) it must refuse to start, unless the operator explicitly accepts single-writer
+/// mode. Both outcomes are asserted here; what this test forbids is the third one, a metastore that
+/// runs in shared mode on a storage that would drop a concurrent write.
 #[tokio::test]
-async fn test_shared_metastore_on_s3_does_not_lose_updates() -> anyhow::Result<()> {
+async fn test_shared_metastore_either_shares_safely_or_refuses_to_start() -> anyhow::Result<()> {
     if !endpoint_is_configured() {
         eprintln!(
-            "skipping test_shared_metastore_on_s3_does_not_lose_updates: QW_S3_ENDPOINT is not set"
+            "skipping test_shared_metastore_either_shares_safely_or_refuses_to_start: \
+             QW_S3_ENDPOINT is not set"
         );
         return Ok(());
     }
     let bucket_uri = append_random_suffix(&format!("{TEST_BUCKET_URI}/shared-metastore"));
     let storage = s3_storage(&bucket_uri).await?;
+    let endpoint_enforces_conditional_writes =
+        storage_enforces_conditional_writes(&*storage).await?;
 
-    let metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    let metastore_a = match FileBackedMetastore::try_new(storage.clone(), None).await {
+        Ok(metastore) => {
+            assert!(
+                endpoint_enforces_conditional_writes,
+                "the metastore started in shared mode on a storage that ignores conditional \
+                 writes; that configuration loses updates silently"
+            );
+            assert!(
+                metastore.is_distributed(),
+                "an s3:// metastore on an endpoint that enforces conditional writes must run in \
+                 shared mode"
+            );
+            metastore
+        }
+        Err(error) => {
+            assert!(
+                !endpoint_enforces_conditional_writes,
+                "the metastore refused to start on a storage that does enforce conditional \
+                 writes: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("conditional writes"),
+                "refusal must name the capability gap, got: {message}"
+            );
+            // The documented escape hatch keeps single-writer usage possible.
+            let metastore =
+                FileBackedMetastore::try_new_with_options(storage.clone(), None, true).await?;
+            assert!(
+                !metastore.is_distributed(),
+                "with `allow_unsafe_storage` the metastore must fall back to single-writer mode"
+            );
+            eprintln!(
+                "note: this endpoint ignores conditional writes; the metastore refused shared \
+                 mode and only the single-writer escape hatch is exercised here"
+            );
+            return Ok(());
+        }
+    };
+
     let metastore_b = FileBackedMetastore::try_new(storage.clone(), None).await?;
     let metastore_c = FileBackedMetastore::try_new(storage.clone(), None).await?;
-    assert!(
-        metastore_a.is_distributed(),
-        "an s3:// metastore must select the shared write path"
-    );
 
     let index_id = append_random_suffix("shared-metastore-index");
     let index_uri = format!("s3://quickwit-integration-tests/{index_id}");

@@ -65,10 +65,10 @@ use quickwit_proto::metastore::{
     UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid};
-use quickwit_storage::{ObjectVersion, Storage};
+use quickwit_storage::{ObjectVersion, Storage, StorageErrorKind};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -85,6 +85,10 @@ use self::store_operations::{
     delete_index, index_exists, load_index, load_index_with_version, put_index,
     put_index_if_absent, put_index_if_version_matches,
 };
+
+/// Environment variable that lets an operator run a metastore on a storage that ignores conditional
+/// writes. The metastore then falls back to single-writer mode instead of refusing to start.
+pub const ALLOW_UNSAFE_STORAGE_ENV_KEY: &str = "QW_METASTORE_ALLOW_UNSAFE_STORAGE";
 
 /// Number of times a mutation is replayed before the metastore gives up on a compare-and-swap race.
 const DISTRIBUTED_MAX_ATTEMPTS: usize = 8;
@@ -105,6 +109,20 @@ fn distributed_retry_backoff(attempt: usize) -> Duration {
 /// Returns whether `error` is a compare-and-swap conflict, i.e. another node wrote first.
 fn is_manifest_conflict(error: &MetastoreError) -> bool {
     matches!(error, MetastoreError::FailedPrecondition { .. })
+}
+
+/// Builds the error raised when the metastore storage cannot safely be shared.
+fn unsafe_storage_error(storage: &dyn Storage, reason: &str) -> MetastoreError {
+    MetastoreError::Internal {
+        message: "the metastore storage does not enforce conditional writes".to_string(),
+        cause: format!(
+            "`{}` cannot back a shared metastore because {reason}. Sharing a metastore prefix \
+             with such a storage would silently lose updates. Use a storage that enforces \
+             preconditions (AWS S3, Cloudflare R2, MinIO), or set \
+             {ALLOW_UNSAFE_STORAGE_ENV_KEY}=true to run this node in single-writer mode.",
+            storage.uri()
+        ),
+    }
 }
 use super::{
     AddSourceRequestExt, CreateIndexRequestExt, IndexMetadataResponseExt,
@@ -234,6 +252,58 @@ impl FileBackedMetastore {
         self.polling_interval_opt = polling_interval_opt;
     }
 
+    /// Verifies that the storage really enforces conditional writes.
+    ///
+    /// The shared write path is only safe when the endpoint rejects a write whose precondition does
+    /// not hold. Some S3-compatible implementations accept `If-None-Match: *` and overwrite the
+    /// object anyway (localstack 3.5.0 does), which turns compare-and-swap into an unconditional
+    /// write and loses updates silently -- the one outcome this mode must never produce. A normal
+    /// write cannot reveal that, so we check it once, with a throwaway object, before serving any
+    /// metadata.
+    async fn check_storage_enforces_conditional_writes(
+        storage: &dyn Storage,
+    ) -> MetastoreResult<()> {
+        let probe_path: std::path::PathBuf =
+            format!(".quickwit-conditional-write-probe-{}", Ulid::new()).into();
+        let check_result = match storage
+            .put_if_absent(&probe_path, Box::new(b"probe".to_vec()))
+            .await
+        {
+            Ok(_) => {
+                match storage
+                    .put_if_absent(&probe_path, Box::new(b"probe again".to_vec()))
+                    .await
+                {
+                    Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => Ok(()),
+                    Err(error) => Err(unsafe_storage_error(storage, &error.to_string())),
+                    Ok(_) => Err(unsafe_storage_error(
+                        storage,
+                        "it accepted a second write carrying `If-None-Match: *`",
+                    )),
+                }
+            }
+            Err(error) if error.kind() == StorageErrorKind::Unsupported => Err(
+                unsafe_storage_error(storage, "it does not implement conditional writes"),
+            ),
+            Err(error) => Err(MetastoreError::Internal {
+                message: format!(
+                    "failed to probe the metastore storage located at `{}`",
+                    storage.uri()
+                ),
+                cause: error.to_string(),
+            }),
+        };
+        // Best effort: never leave the probe object behind, and never fail startup over its
+        // cleanup.
+        if let Err(error) = storage.delete(&probe_path).await {
+            warn!(
+                path = %probe_path.display(),
+                "failed to delete the conditional-write probe object: {error}"
+            );
+        }
+        check_result
+    }
+
     /// Return the underlying storage.
     ///
     /// This is only build in tests to verify the metastore did indeed store what it should.
@@ -249,6 +319,22 @@ impl FileBackedMetastore {
         storage: Arc<dyn Storage>,
         polling_interval_opt: Option<Duration>,
     ) -> MetastoreResult<Self> {
+        let allow_unsafe_storage =
+            quickwit_common::get_bool_from_env(ALLOW_UNSAFE_STORAGE_ENV_KEY, false);
+        Self::try_new_with_options(storage, polling_interval_opt, allow_unsafe_storage).await
+    }
+
+    /// Same as [`Self::try_new`], with the conditional-write policy passed in instead of read from
+    /// the environment.
+    ///
+    /// `allow_unsafe_storage` lets the metastore run in single-writer mode on a storage that
+    /// ignores conditional writes; without it, such a storage is refused (see
+    /// [`Self::check_storage_enforces_conditional_writes`]).
+    pub async fn try_new_with_options(
+        storage: Arc<dyn Storage>,
+        polling_interval_opt: Option<Duration>,
+        allow_unsafe_storage: bool,
+    ) -> MetastoreResult<Self> {
         let manifest = load_or_create_manifest(&*storage).await?;
         let state =
             MetastoreState::try_from_manifest(storage.clone(), manifest, polling_interval_opt)?;
@@ -257,7 +343,22 @@ impl FileBackedMetastore {
         // keep the single-node path: entering distributed mode without conditional writes would
         // make every metadata write fail instead of merely being unsafe, and failing is not a
         // better answer than not claiming a capability we do not have.
-        let distributed = storage.uri().protocol() == Protocol::S3;
+        let mut distributed = storage.uri().protocol() == Protocol::S3;
+        if distributed {
+            match Self::check_storage_enforces_conditional_writes(&*storage).await {
+                Ok(()) => {}
+                Err(error) if allow_unsafe_storage => {
+                    warn!(
+                        metastore_uri = %storage.uri(),
+                        "the metastore storage does not enforce conditional writes; \
+                         {ALLOW_UNSAFE_STORAGE_ENV_KEY}=true, so this node runs in single-writer \
+                         mode and must not share its metastore prefix: {error}"
+                    );
+                    distributed = false;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if distributed {
             info!(
                 metastore_uri = %storage.uri(),
@@ -3249,6 +3350,8 @@ mod tests {
             .returning(move |path, payload| {
                 block_on(ram_storage_clone.put_if_absent(path, payload))
             });
+        // The startup conditional-write probe cleans up after itself.
+        mock_storage.expect_delete().returning(|_| Ok(()));
         let ram_storage_clone = ram_storage.clone();
         mock_storage
             .expect_get_all_with_version()

@@ -76,6 +76,12 @@ This is automatic for S3-compatible URIs (`s3://`); there is nothing to configur
 backend that supports conditional writes — Amazon S3 (since November 2024), Cloudflare R2 and MinIO
 do.
 
+Quickwit does not take that on faith: at startup it writes a throwaway object twice with
+`If-None-Match` and checks that the second write is rejected. If the endpoint accepts it anyway
+(localstack 3.5.0 does, which would make a shared prefix lose updates silently), the node refuses to
+start. To run such an endpoint in **single-writer** mode, set `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true`;
+the node then logs a warning and behaves like a `file://` metastore. Do not share its prefix.
+
 Two cases remain single-node:
 
 - a `gs://` or `azure://` metastore: those backends do not implement conditional writes in Quickwit
