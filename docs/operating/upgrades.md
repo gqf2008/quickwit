@@ -67,8 +67,9 @@ read back by the CAS node.
 Upgrade every node that writes to the metastore in the same maintenance window, or upgrade the nodes
 one by one while making sure **at most one** of them writes at a time (for example, leave the other
 nodes stopped). Rolling upgrades with mixed writers are safe only once every writer runs the CAS
-code. Indexers are writers, and so is the janitor, which rewrites the manifest when it garbage
-collects splits; a searcher-only node does not write and can keep running throughout.
+code. Indexers are writers, and so is the janitor, which rewrites the index metadata when it
+garbage-collects splits (and the manifest when it deletes indexes); a searcher-only node does not
+write and can keep running throughout.
 
 ### Rolling back
 
@@ -88,7 +89,7 @@ Two things to watch out for:
 
 Nothing in the metastore format forces CAS, so the feature can be turned off by moving the metastore:
 point `metastore_uri` at a `file://` path, or at a URI type that does not take the shared write path
-(`gs://`, `azure://`), and restart the nodes. Those metastores, and the one you fell back from, stay
-single-writer: only one node may write the prefix. A node can also be started on a storage that
-ignores conditional writes by setting `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` and running it as the
-only writer; on an endpoint that does enforce conditional writes the variable has no effect.
+(`gs://`, `azure://`), and restart the nodes. Those metastores, and the S3 prefix you rolled back
+from, stay single-writer: only one node may write the prefix. A node can also be started on a storage
+that ignores conditional writes by setting `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` and running it as
+the only writer; on an endpoint that does enforce conditional writes the variable has no effect.
