@@ -609,7 +609,8 @@ mod tests {
         let r2_storage_config = storage_configs[4].as_s3().unwrap();
         assert_eq!(r2_storage_config.region, Some("auto".to_string()));
         assert!(r2_storage_config.force_path_style_access);
-        // R2 rejects the full-object CRC32C the SDK sends by default; Content-MD5 is supported.
+        // Measured against R2: both the default CRC32C and Content-MD5 upload fine, so `md5` here
+        // is a conservative choice rather than a requirement (see the `apply_flavor` comment).
         assert_eq!(r2_storage_config.checksum_algorithm, ChecksumAlgorithm::Md5);
     }
 
