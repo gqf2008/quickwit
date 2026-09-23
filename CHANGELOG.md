@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off exponentially (1s doubling up to 10 minutes, reset after a minute of healthy operation) instead
   of restarting every second. The restart counter only covered failures to *spawn* the pipeline, so a
   pipeline dying at runtime restarted with a fixed one-second delay for the whole outage.
+- Metastore: a shared (S3-compatible) metastore no longer reports a spurious `index already exists`
+  when a create is replayed after losing a manifest race. The replay used to mistake the index file
+  written by the previous attempt for another node's index; two nodes creating indexes at the same
+  time hit that in about 5% of the creations, failing an operation that had actually succeeded.
 
 ### Changed
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the

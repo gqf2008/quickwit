@@ -621,6 +621,26 @@ impl FileBackedMetastore {
         }
     }
 
+    /// Returns whether the index file already on the storage was written by this very
+    /// [`FileBackedMetastore::create_index`] request.
+    ///
+    /// `create_index` replays its whole attempt when it loses a manifest compare-and-swap, and the
+    /// index file written during the previous attempt is still there on the replay. That file must
+    /// not be mistaken for another node's index: it carries the incarnation id generated for this
+    /// request, which is what tells the two apart.
+    async fn index_file_matches_request(
+        &self,
+        index_id: &str,
+        index_uid: &IndexUid,
+    ) -> MetastoreResult<bool> {
+        match load_index(&*self.storage, index_id).await {
+            Ok(stored_index) => Ok(*stored_index.index_uid() == *index_uid),
+            // The file vanished between the existence check and this read; the caller retries.
+            Err(MetastoreError::NotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Compare-and-swap variant of `delete_index` for nodes that share one metastore prefix.
     ///
     /// Same two-step shape as the single-node version (mark the index `Deleting`, delete its file,
@@ -947,6 +967,10 @@ impl MetastoreService for FileBackedMetastore {
             //   transitioning states.
             // - if the index is not in the index states map, we still need to check the storage as
             //   we don't want to override an existing metadata file.
+            // The file may also be the one this request wrote during a previous attempt: the create
+            // is replayed when the manifest compare-and-swap loses a race, and the file it already
+            // wrote must not turn that replay into an "already exists" error.
+            let mut index_file_needs_to_be_written = true;
             if let Some(index_status) = state_wlock_guard.indexes.get(index_id) {
                 if let LazyIndexStatus::Active(_) = index_status {
                     return Err(MetastoreError::AlreadyExists(EntityKind::Index {
@@ -955,25 +979,33 @@ impl MetastoreService for FileBackedMetastore {
                 }
             } else if index_exists(&*self.storage, index_id).await? {
                 if self.distributed {
-                    // Another node may have created the index file after we read the manifest,
-                    // and its manifest write may not have landed yet. Reload instead of reporting
-                    // an inconsistency; if the file is still there afterwards, the index exists.
-                    if attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    if self
+                        .index_file_matches_request(index_id, &index_uid)
+                        .await?
+                    {
+                        index_file_needs_to_be_written = false;
+                    } else if attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                        // Another node may have created the index file after we read the manifest,
+                        // and its manifest write may not have landed yet. Reload instead of
+                        // reporting an inconsistency; if the file is still there afterwards, the
+                        // index exists.
                         drop(state_wlock_guard);
                         tokio::time::sleep(distributed_retry_backoff(attempt)).await;
                         continue;
+                    } else {
+                        return Err(MetastoreError::AlreadyExists(EntityKind::Index {
+                            index_id: index_id.to_string(),
+                        }));
                     }
-                    return Err(MetastoreError::AlreadyExists(EntityKind::Index {
-                        index_id: index_id.to_string(),
-                    }));
+                } else {
+                    return Err(MetastoreError::Internal {
+                        message: format!("index {index_id} cannot be created"),
+                        cause: format!(
+                            "index {index_id} is not present in the manifest file but its file \
+                             `{index_id}/metastore.json` is on the storage"
+                        ),
+                    });
                 }
-                return Err(MetastoreError::Internal {
-                    message: format!("index {index_id} cannot be created"),
-                    cause: format!(
-                        "index {index_id} is not present in the manifest file but its file \
-                         `{index_id}/metastore.json` is on the storage"
-                    ),
-                });
             }
             // Set state to `Creating` and rollback on metastore error.
             state_wlock_guard
@@ -995,28 +1027,37 @@ impl MetastoreService for FileBackedMetastore {
 
             // The index file has to be created exactly once: two nodes racing on the same
             // `create_index` must not be able to overwrite one another's metadata.
-            if self.distributed {
+            if !self.distributed {
+                put_index(&*self.storage, &index).await?;
+            } else if index_file_needs_to_be_written {
                 match put_index_if_absent(&*self.storage, &index).await {
                     Ok(_) => {}
                     Err(MetastoreError::AlreadyExists(_))
                     | Err(MetastoreError::FailedPrecondition { .. }) => {
-                        state_wlock_guard.indexes.remove(index_id);
-                        if attempt < DISTRIBUTED_MAX_ATTEMPTS {
-                            drop(state_wlock_guard);
-                            tokio::time::sleep(distributed_retry_backoff(attempt)).await;
-                            continue;
+                        if self
+                            .index_file_matches_request(index_id, &index_uid)
+                            .await?
+                        {
+                            // The file is this request's own write: the previous attempt got that
+                            // far before losing the manifest race. This is not a conflict, the
+                            // manifest update below is what is still missing.
+                        } else {
+                            state_wlock_guard.indexes.remove(index_id);
+                            if attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                                drop(state_wlock_guard);
+                                tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                                continue;
+                            }
+                            return Err(MetastoreError::AlreadyExists(EntityKind::Index {
+                                index_id: index_id.to_string(),
+                            }));
                         }
-                        return Err(MetastoreError::AlreadyExists(EntityKind::Index {
-                            index_id: index_id.to_string(),
-                        }));
                     }
                     Err(error) => {
                         state_wlock_guard.indexes.remove(index_id);
                         return Err(error);
                     }
                 }
-            } else {
-                put_index(&*self.storage, &index).await?;
             }
 
             state_wlock_guard.indexes.insert(
@@ -3490,6 +3531,144 @@ mod tests {
         assert!(
             CAS_CONFLICTS_EXHAUSTED_TOTAL.get() - exhausted_before >= 1,
             "running out of retries must be visible to operators"
+        );
+        Ok(())
+    }
+
+    /// Builds a shared metastore over a RAM storage, with a hook on the manifest compare-and-swap.
+    ///
+    /// An `s3://` URI puts the metastore on the shared write path. `put_if_version_matches` is
+    /// forwarded to the RAM storage except when `fail_on_call` says otherwise, which is how the
+    /// tests below make a specific manifest write lose a race.
+    fn shared_metastore_over_ram(
+        ram_storage: Arc<RamStorage>,
+        fail_on_call: Option<usize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> MockStorage {
+        use std::sync::atomic::Ordering;
+
+        let mut mock_storage = MockStorage::default();
+        mock_storage
+            .expect_uri()
+            .return_const(Uri::for_test("s3://test-bucket/indexes"));
+        let ram = ram_storage.clone();
+        mock_storage
+            .expect_put()
+            .returning(move |path, payload| block_on(ram.put(path, payload)));
+        let ram = ram_storage.clone();
+        mock_storage
+            .expect_exists()
+            .returning(move |path| block_on(ram.exists(path)));
+        let ram = ram_storage.clone();
+        mock_storage
+            .expect_put_if_absent()
+            .returning(move |path, payload| block_on(ram.put_if_absent(path, payload)));
+        let ram = ram_storage.clone();
+        mock_storage
+            .expect_get_all_with_version()
+            .returning(move |path| block_on(ram.get_all_with_version(path)));
+        let ram = ram_storage.clone();
+        mock_storage
+            .expect_get_all()
+            .returning(move |path| block_on(ram.get_all(path)));
+        // The startup conditional-write probe cleans up after itself.
+        mock_storage.expect_delete().returning(|_| Ok(()));
+        let ram = ram_storage.clone();
+        mock_storage
+            .expect_put_if_version_matches()
+            .returning(move |path, payload, version| {
+                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if fail_on_call == Some(call) {
+                    return Err(StorageErrorKind::PreconditionFailed
+                        .with_error(anyhow::anyhow!("injected conflict")));
+                }
+                block_on(ram.put_if_version_matches(path, payload, version))
+            });
+        mock_storage
+    }
+
+    /// A create that loses a manifest compare-and-swap is replayed, and the replay finds the index
+    /// file written by the previous attempt. Reporting `AlreadyExists` there would fail a create
+    /// that actually happened, which is what a two-node cluster used to see (2 creates out of 40).
+    #[tokio::test]
+    async fn test_distributed_create_index_survives_a_replayed_manifest_conflict()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ram_storage = Arc::new(RamStorage::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Call 1 is the manifest write that marks the index `Creating`, call 2 the one that marks
+        // it `Active`: failing call 2 replays the create with the index file already written.
+        let mock_storage = shared_metastore_over_ram(ram_storage.clone(), Some(2), calls.clone());
+        let metastore = FileBackedMetastore::try_new(Arc::new(mock_storage), None).await?;
+        assert!(metastore.is_distributed());
+
+        let index_config = IndexConfig::for_test(
+            "test-create-replayed",
+            "s3://test-bucket/indexes/test-create-replayed",
+        );
+        let create_index_request = CreateIndexRequest::try_from_index_config(&index_config)?;
+        let response = metastore
+            .create_index(create_index_request)
+            .await
+            .expect("a replayed create must not be reported as an existing index");
+        assert_eq!(response.index_uid().index_id, "test-create-replayed");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "the create should have been replayed after the injected conflict"
+        );
+        // The index file is there, and so is its manifest entry.
+        assert!(
+            block_on(ram_storage.exists(&metastore_filepath("test-create-replayed"))).unwrap(),
+            "the index file must exist after the create"
+        );
+        let indexes_metadata = metastore
+            .list_indexes_metadata(ListIndexesMetadataRequest::all())
+            .await?
+            .deserialize_indexes_metadata()
+            .await?;
+        assert!(
+            indexes_metadata
+                .iter()
+                .any(|index| index.index_id() == "test-create-replayed"),
+            "the manifest must list the index that was just created"
+        );
+        Ok(())
+    }
+
+    /// The other direction: an index file written by *another* node (a different incarnation id)
+    /// must still be reported as an existing index instead of being adopted.
+    #[tokio::test]
+    async fn test_distributed_create_index_does_not_adopt_another_nodes_file() -> anyhow::Result<()>
+    {
+        use std::sync::atomic::AtomicUsize;
+
+        let ram_storage = Arc::new(RamStorage::default());
+        // Another node wrote the index file; its manifest write has not landed (yet).
+        let index_config = IndexConfig::for_test(
+            "test-create-other-node",
+            "s3://test-bucket/indexes/test-create-other-node",
+        );
+        let other_index = FileBackedIndex::from(IndexMetadata::new(index_config.clone()));
+        let other_index_bytes = serde_utils::to_json_bytes_pretty(&other_index)?;
+        block_on(ram_storage.put(
+            &metastore_filepath("test-create-other-node"),
+            Box::new(other_index_bytes),
+        ))?;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock_storage = shared_metastore_over_ram(ram_storage.clone(), None, calls);
+        let metastore = FileBackedMetastore::try_new(Arc::new(mock_storage), None).await?;
+        assert!(metastore.is_distributed());
+
+        let create_index_request = CreateIndexRequest::try_from_index_config(&index_config)?;
+        let error = metastore
+            .create_index(create_index_request)
+            .await
+            .expect_err("another node's index file must not be adopted");
+        assert!(
+            matches!(error, MetastoreError::AlreadyExists(_)),
+            "expected `AlreadyExists`, got: {error}"
         );
         Ok(())
     }
