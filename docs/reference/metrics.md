@@ -69,6 +69,14 @@ PostgreSQL-backed metastores also expose connection pool gauges:
 | `quickwit_metastore` | `acquire_connections` | Number of requests currently waiting to acquire a PostgreSQL pool connection | `gauge` |
 | `quickwit_metastore` | `max_connections` | Maximum number of PostgreSQL pool connections configured per metastore node | `gauge` |
 
+The file-backed metastore shared by several nodes (S3-compatible URI) exposes the contention of its
+compare-and-swap write path:
+
+| Namespace | Metric Name | Description | Type |
+| --------- | ----------- | ----------- | ---- |
+| `quickwit_metastore` | `file_backed_cas_conflicts_total` | Number of metadata writes that lost a compare-and-swap race and were replayed | `counter` |
+| `quickwit_metastore` | `file_backed_cas_conflicts_exhausted_total` | Number of mutations that failed after exhausting their replay budget | `counter` |
+
 ## Rest API Metrics
 
 | Namespace | Metric Name | Description | Type |

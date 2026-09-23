@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums. R2 was
   verified against the real endpoint: it enforces `If-None-Match`/`If-Match`, and it accepts both the
   `Content-MD5` and the default `crc32c` upload checksums.
+- Metastore: a shared (S3-compatible) file-backed metastore exposes
+  `quickwit_metastore_file_backed_cas_conflicts_total` and
+  `quickwit_metastore_file_backed_cas_conflicts_exhausted_total`, making contention between nodes
+  and writes dropped under contention observable from Prometheus.
 
 ### Fixed
 - (Jaeger) Query resource attributes when Jaeger request carries tags

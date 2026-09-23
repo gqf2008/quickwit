@@ -22,6 +22,7 @@ mod index_id_matcher;
 mod index_template_matcher;
 mod lazy_file_backed_index;
 pub(crate) mod manifest;
+mod metrics;
 mod state;
 mod store_operations;
 
@@ -109,6 +110,14 @@ fn distributed_retry_backoff(attempt: usize) -> Duration {
 /// Returns whether `error` is a compare-and-swap conflict, i.e. another node wrote first.
 fn is_manifest_conflict(error: &MetastoreError) -> bool {
     matches!(error, MetastoreError::FailedPrecondition { .. })
+}
+
+/// Records one lost compare-and-swap race, and whether the caller is giving up because of it.
+fn record_cas_conflict(giving_up: bool) {
+    metrics::CAS_CONFLICTS_TOTAL.inc();
+    if giving_up {
+        metrics::CAS_CONFLICTS_EXHAUSTED_TOTAL.inc();
+    }
 }
 
 /// Builds the error raised when the metastore storage cannot safely be shared.
@@ -487,10 +496,15 @@ impl FileBackedMetastore {
                         index_id,
                         attempt, "index metadata changed concurrently, replaying the mutation"
                     );
+                    record_cas_conflict(false);
                     tokio::time::sleep(distributed_retry_backoff(attempt)).await;
                     continue;
                 }
                 Err(error) => {
+                    if is_manifest_conflict(&error) {
+                        // The replay budget ran out on the last attempt.
+                        record_cas_conflict(true);
+                    }
                     self.discard_cached_index(index_id).await;
                     return Err(error);
                 }
@@ -581,6 +595,7 @@ impl FileBackedMetastore {
         &self,
         state_wlock_guard: &MetastoreState,
         manifest_version_opt: &mut Option<ObjectVersion>,
+        attempt: usize,
     ) -> MetastoreResult<()> {
         let manifest = state_wlock_guard.as_manifest();
         if !self.distributed {
@@ -592,9 +607,18 @@ impl FileBackedMetastore {
                 message: "distributed metastore requires a manifest version".to_string(),
                 cause: "the manifest was not reloaded before being written".to_string(),
             })?;
-        *manifest_version_opt =
-            save_manifest_if_version_matches(&*self.storage, &manifest, &version).await?;
-        Ok(())
+        match save_manifest_if_version_matches(&*self.storage, &manifest, &version).await {
+            Ok(new_version) => {
+                *manifest_version_opt = new_version;
+                Ok(())
+            }
+            Err(error) => {
+                if is_manifest_conflict(&error) {
+                    record_cas_conflict(attempt >= DISTRIBUTED_MAX_ATTEMPTS);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Compare-and-swap variant of `delete_index` for nodes that share one metastore prefix.
@@ -628,7 +652,7 @@ impl FileBackedMetastore {
                 .insert(index_id.clone(), LazyIndexStatus::Deleting);
 
             if let Err(error) = self
-                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                 .await
             {
                 state_wlock_guard.indexes.remove(&index_id);
@@ -648,7 +672,7 @@ impl FileBackedMetastore {
             ) {
                 state_wlock_guard.indexes.remove(&index_id);
                 if let Err(error) = self
-                    .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                    .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                     .await
                 {
                     state_wlock_guard
@@ -957,7 +981,7 @@ impl MetastoreService for FileBackedMetastore {
                 .insert(index_id.clone(), LazyIndexStatus::Creating);
 
             if let Err(error) = self
-                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                 .await
             {
                 state_wlock_guard.indexes.remove(index_id);
@@ -1006,7 +1030,7 @@ impl MetastoreService for FileBackedMetastore {
             );
             // Set state to `Active` and rollback on metastore error.
             if let Err(error) = self
-                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                 .await
             {
                 state_wlock_guard
@@ -1638,7 +1662,7 @@ impl MetastoreService for FileBackedMetastore {
             }
 
             if let Err(error) = self
-                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                 .await
             {
                 if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
@@ -1758,7 +1782,7 @@ impl MetastoreService for FileBackedMetastore {
             }
 
             if let Err(error) = self
-                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                 .await
             {
                 if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
@@ -1803,7 +1827,7 @@ impl MetastoreService for FileBackedMetastore {
                 state_wlock_guard.identity = Uuid::new_v4();
 
                 if let Err(error) = self
-                    .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt)
+                    .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                     .await
                 {
                     state_wlock_guard.identity = Uuid::nil();
@@ -3390,6 +3414,15 @@ mod tests {
     async fn test_distributed_metastore_gives_up_after_bounded_conflicts() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        use crate::metastore::file_backed::metrics::{
+            CAS_CONFLICTS_EXHAUSTED_TOTAL, CAS_CONFLICTS_TOTAL,
+        };
+
+        // Counters are process-global and tests run in parallel, so the assertions below are lower
+        // bounds: another test bumping the same counter only makes the observed delta larger.
+        let conflicts_before = CAS_CONFLICTS_TOTAL.get();
+        let exhausted_before = CAS_CONFLICTS_EXHAUSTED_TOTAL.get();
+
         let ram_storage = Arc::new(RamStorage::default());
         let mut mock_storage = MockStorage::default();
         // An `s3://` URI makes the metastore take the shared write path.
@@ -3449,6 +3482,14 @@ mod tests {
             conflicts.load(Ordering::SeqCst),
             DISTRIBUTED_MAX_ATTEMPTS,
             "the retry loop must stop after a bounded number of attempts"
+        );
+        assert!(
+            CAS_CONFLICTS_TOTAL.get() - conflicts_before >= DISTRIBUTED_MAX_ATTEMPTS as u64,
+            "every lost compare-and-swap race must be counted"
+        );
+        assert!(
+            CAS_CONFLICTS_EXHAUSTED_TOTAL.get() - exhausted_before >= 1,
+            "running out of retries must be visible to operators"
         );
         Ok(())
     }

@@ -90,6 +90,32 @@ Two cases remain single-node:
 
 The metastore logs which mode it started in.
 
+#### Monitoring a shared metastore
+
+A shared metastore exposes two counters on the `/metrics` endpoint:
+
+| Metric | Meaning |
+| ------ | ------- |
+| `quickwit_metastore_file_backed_cas_conflicts_total` | Metadata writes that lost a compare-and-swap race (`412 Precondition Failed`) and were replayed against the fresh file. A conflict is normal and harmless: it only says another node wrote first. |
+| `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (8 attempts with exponential backoff). The mutation was **not** applied. |
+
+Suggested alerts:
+
+- page on any increase of `quickwit_metastore_file_backed_cas_conflicts_exhausted_total`: it means a
+  write was dropped under contention, and the caller (`create_index`, `publish_splits`, a source
+  update, ...) got an error;
+- warn when conflicts exceed 10% of the metastore write rate over a 5-minute window
+  (`rate(quickwit_metastore_file_backed_cas_conflicts_total[5m])` against the write rate).
+  Occasional conflicts are expected, and a sustained high ratio only means the nodes contend heavily
+  on the same index; it is not by itself a correctness problem.
+
+Recovery requires no operator action: once the contention or the endpoint outage ends, the nodes
+converge by replaying their mutations. This was exercised against a metastore endpoint taken down
+and brought back while under load (a metastore proxy killing its active connections on every mode
+switch). Search returned errors while the metastore was unreachable and ingest kept acknowledging
+documents into its local queue; after reconnection every one of the 256 acknowledged documents was
+searchable, with no ingest failure and no readiness failure.
+
 ### Polling configuration
 
 By default, the File-Backed Metastore is only read once when you start a Quickwit process (searcher, indexer, ...).
