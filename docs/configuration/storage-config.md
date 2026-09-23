@@ -98,9 +98,10 @@ The MinIO flavor (`minio`) overrides the `region` parameter to `minio` and force
 *Cloudflare R2*
 
 The Cloudflare R2 flavor (`r2`, alias `cloudflare`) overrides the `region` parameter to `auto`, forces
-path-style access, and switches upload checksums to `md5`. R2 lists CRC-32C as a composite-only
-checksum, so the full-object CRC32C the AWS SDK sends by default on a single PUT is rejected;
-`Content-MD5` is supported instead.
+path-style access, and switches upload checksums to `md5`. Cloudflare's compatibility table lists
+CRC-32C as a composite-only checksum, which made the full-object CRC32C the AWS SDK sends by default
+look unsafe; measured against R2, both `md5` and the default `crc32c` upload fine, so `md5` is a
+conservative choice rather than a requirement.
 
 Example of a storage configuration for Google Cloud Storage in YAML format:
 

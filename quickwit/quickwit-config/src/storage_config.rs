@@ -429,9 +429,11 @@ impl S3StorageConfig {
                 self.region = Some("auto".to_string());
                 // R2's S3 endpoint is the account endpoint, addressed path-style.
                 self.force_path_style_access = true;
-                // R2 lists CRC-32C as a composite-only checksum and the SDK sends a full-object
-                // CRC32C on a single PUT, which R2 rejects; Content-MD5 is supported instead.
-                // https://developers.cloudflare.com/r2/api/s3/api/ (Checksum Types, PutObject).
+                // Cloudflare's compatibility table lists CRC-32C as a composite-only checksum
+                // (https://developers.cloudflare.com/r2/api/s3/api/, "Checksum Types"), so the
+                // SDK's full-object CRC32C looked unsafe on a single PUT. Measured against R2 on
+                // 2026-09-23, both the default CRC32C and Content-MD5 upload fine, so MD5 here is a
+                // conservative choice rather than a requirement.
                 self.checksum_algorithm = ChecksumAlgorithm::Md5;
             }
             _ => {}

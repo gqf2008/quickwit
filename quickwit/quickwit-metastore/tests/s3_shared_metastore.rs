@@ -36,7 +36,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use quickwit_common::rand::append_random_suffix;
 use quickwit_common::uri::Uri;
-use quickwit_config::{IndexConfig, S3StorageConfig};
+use quickwit_config::{
+    IndexConfig, S3StorageConfig, StorageBackendFlavor, StorageConfig, StorageConfigs,
+};
 use quickwit_metastore::{
     CreateIndexRequestExt, FileBackedMetastore, ListSplitsQuery, ListSplitsRequestExt,
     MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState, StageSplitsRequestExt,
@@ -50,13 +52,43 @@ use quickwit_storage::{ObjectVersion, S3CompatibleObjectStorage, Storage, Storag
 
 const TEST_BUCKET_URI: &str = "s3://quickwit-integration-tests";
 
+/// Bucket the tests write into.
+///
+/// Defaults to the bucket the other S3 integration tests use; `QW_TEST_S3_BUCKET_URI` points the
+/// same tests at another endpoint (for instance a Cloudflare R2 bucket).
+fn test_bucket_uri() -> String {
+    std::env::var("QW_TEST_S3_BUCKET_URI").unwrap_or_else(|_| TEST_BUCKET_URI.to_string())
+}
+
+/// S3 configuration for the endpoint under test.
+///
+/// `QW_TEST_S3_FLAVOR=r2` exercises a storage flavor (region, path-style access, checksum
+/// algorithm). Flavors are normally applied while loading the node config and `from_uri` expects an
+/// already-resolved config, so apply them here the same way.
+fn s3_storage_config() -> S3StorageConfig {
+    let flavor = match std::env::var("QW_TEST_S3_FLAVOR").ok().as_deref() {
+        None | Some("") => None,
+        Some("r2") => Some(StorageBackendFlavor::R2),
+        Some(other) => panic!("unsupported QW_TEST_S3_FLAVOR `{other}`"),
+    };
+    let mut storage_configs = StorageConfigs::new(vec![StorageConfig::S3(S3StorageConfig {
+        flavor,
+        ..Default::default()
+    })]);
+    storage_configs.apply_flavors();
+    storage_configs
+        .iter()
+        .find_map(|storage_config| storage_config.as_s3().cloned())
+        .expect("the storage config holds an S3 section")
+}
+
 fn endpoint_is_configured() -> bool {
     std::env::var("QW_S3_ENDPOINT").is_ok()
 }
 
 async fn s3_storage(bucket_uri: &str) -> anyhow::Result<Arc<dyn Storage>> {
     let storage_uri = Uri::from_str(bucket_uri)?;
-    let storage = S3CompatibleObjectStorage::from_uri(&S3StorageConfig::default(), &storage_uri)
+    let storage = S3CompatibleObjectStorage::from_uri(&s3_storage_config(), &storage_uri)
         .await
         .context("failed to open the S3-compatible storage")?;
     Ok(Arc::new(storage))
@@ -87,7 +119,7 @@ async fn test_conditional_writes_on_s3_endpoint() -> anyhow::Result<()> {
         eprintln!("skipping test_conditional_writes_on_s3_endpoint: QW_S3_ENDPOINT is not set");
         return Ok(());
     }
-    let bucket_uri = append_random_suffix(&format!("{TEST_BUCKET_URI}/conditional-writes"));
+    let bucket_uri = append_random_suffix(&format!("{}/conditional-writes", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
     let path = Path::new("lock.json");
 
@@ -196,10 +228,15 @@ async fn test_shared_metastore_either_shares_safely_or_refuses_to_start() -> any
         );
         return Ok(());
     }
-    let bucket_uri = append_random_suffix(&format!("{TEST_BUCKET_URI}/shared-metastore"));
+    let bucket_uri = append_random_suffix(&format!("{}/shared-metastore", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
     let endpoint_enforces_conditional_writes =
         storage_enforces_conditional_writes(&*storage).await?;
+    // Print the probe result either way: it is the evidence that decides which branch runs below.
+    eprintln!(
+        "endpoint enforces conditional writes: {endpoint_enforces_conditional_writes} (bucket: \
+         {bucket_uri})"
+    );
 
     let metastore_a = match FileBackedMetastore::try_new(storage.clone(), None).await {
         Ok(metastore) => {

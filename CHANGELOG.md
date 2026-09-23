@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Azure Blob Storage: support custom endpoints via `endpoint` and `endpoint_suffix` configuration options for sovereign clouds (#6624)
 - Storage: conditional writes (`put_if_absent`, `put_if_version_matches`, `get_all_with_version`) with a
   `PreconditionFailed` error kind, and a Cloudflare R2 storage flavor (`storage.s3.flavor: r2`, alias
-  `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums, because R2 only
-  supports CRC-32C as a composite checksum.
+  `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums. R2 was
+  verified against the real endpoint: it enforces `If-None-Match`/`If-Match`, and it accepts both the
+  `Content-MD5` and the default `crc32c` upload checksums.
 
 ### Fixed
 - (Jaeger) Query resource attributes when Jaeger request carries tags
