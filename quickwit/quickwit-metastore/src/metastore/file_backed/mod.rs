@@ -3323,6 +3323,67 @@ mod tests {
         Ok(())
     }
 
+    /// A storage that accepts `If-None-Match: *` unconditionally is what localstack 3.5.0 does, and
+    /// running in shared mode against it loses updates silently. The startup probe must catch it:
+    /// refuse by default, and fall back to single-writer mode when explicitly allowed.
+    #[tokio::test]
+    async fn test_distributed_metastore_refuses_storage_that_ignores_preconditions()
+    -> anyhow::Result<()> {
+        fn mock_storage_ignoring_preconditions() -> MockStorage {
+            let ram_storage = Arc::new(RamStorage::default());
+            let mut mock_storage = MockStorage::default();
+            mock_storage
+                .expect_uri()
+                .return_const(Uri::for_test("s3://test-bucket/indexes"));
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_put()
+                .returning(move |path, payload| block_on(ram_storage_clone.put(path, payload)));
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_exists()
+                .returning(move |path| block_on(ram_storage_clone.exists(path)));
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_get_all_with_version()
+                .returning(move |path| block_on(ram_storage_clone.get_all_with_version(path)));
+            // The probe writes twice; a store that enforces preconditions rejects the second write,
+            // this one accepts it.
+            mock_storage
+                .expect_put_if_absent()
+                .returning(|path, payload| {
+                    Ok(Some(ObjectVersion::new(format!(
+                        "unconditional-{}-{}",
+                        path.display(),
+                        payload.len()
+                    ))))
+                });
+            mock_storage.expect_delete().returning(|_| Ok(()));
+            mock_storage
+        }
+
+        let error =
+            FileBackedMetastore::try_new(Arc::new(mock_storage_ignoring_preconditions()), None)
+                .await
+                .expect_err("a storage that ignores preconditions must not be shared");
+        assert!(
+            error.to_string().contains("conditional writes"),
+            "the refusal must name the capability gap, got: {error}"
+        );
+
+        let metastore = FileBackedMetastore::try_new_with_options(
+            Arc::new(mock_storage_ignoring_preconditions()),
+            None,
+            true,
+        )
+        .await?;
+        assert!(
+            !metastore.is_distributed(),
+            "with `allow_unsafe_storage` the metastore must fall back to single-writer mode"
+        );
+        Ok(())
+    }
+
     /// A compare-and-swap that never wins must stop after a bounded number of attempts and report
     /// the conflict, rather than retrying forever or reporting success.
     #[tokio::test]
