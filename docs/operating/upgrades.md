@@ -68,8 +68,8 @@ Upgrade every node that writes to the metastore in the same maintenance window, 
 one by one while making sure **at most one** of them writes at a time (for example, leave the other
 nodes stopped). Rolling upgrades with mixed writers are safe only once every writer runs the CAS
 code. Indexers are writers, and so is the janitor, which rewrites the index metadata when it
-garbage-collects splits (and the manifest when it deletes indexes); a searcher-only node does not
-write and can keep running throughout.
+garbage-collects splits; creating or deleting an index rewrites the manifest. A searcher-only node
+does not write and can keep running throughout.
 
 ### Rolling back
 
