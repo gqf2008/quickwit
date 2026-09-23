@@ -42,3 +42,49 @@ Start up order:
 1) metastores
 2) control plane
 3) indexers, searchers and janitor
+
+## Shared object-storage metastore: upgrade and rollback
+
+Several nodes can share one S3-compatible metastore prefix. Metadata writes then reload the file
+together with its version and write it back with `If-Match`, replaying the mutation when another node
+wrote first (see [Distributed deployments](../configuration/metastore-config.md#distributed-deployments)).
+
+Versions that predate this behaviour keep the whole metastore state in memory and overwrite the
+manifest with a plain `PUT`. **A prefix must therefore never be written by a pre-CAS binary and a CAS
+binary at the same time**: the pre-CAS node's write silently drops everything the CAS node committed
+in the meantime. This is not a theoretical risk, it was reproduced: a CAS node created an index
+(`200 OK`) while a pre-CAS node was running on the same prefix, and the pre-CAS node's later write
+left the manifest without that index — the index directory was still in the bucket, but the index had
+vanished from the metastore.
+
+### Upgrading
+
+The metadata format itself did not change: both versions read and write the same
+`manifest.json` / `[index_id]/metastore.json`. A pre-CAS node started on a prefix written by a CAS
+node lists the same indexes and returns the same search hits, and documents published by it are later
+read back by the CAS node.
+
+Upgrade every node that writes to the metastore in the same maintenance window, or upgrade the nodes
+one by one while making sure **at most one** of them writes at a time (for example, leave the other
+nodes stopped). Rolling upgrades with mixed writers are safe only once every writer runs the CAS
+code.
+
+### Rolling back
+
+1. Stop all nodes that write to the metastore prefix (see the shutdown order above).
+2. Start the older binary, alone, on the same prefix. It reads the data written by the CAS version.
+3. Keep that prefix single-writer until every node runs the old version again.
+
+Two things to watch out for:
+
+- an older binary **cannot parse** a configuration using `storage.s3.flavor: r2` (the value did not
+  exist yet), so remove that field before starting it;
+- starting an older binary next to a CAS node is the lost-update case described above.
+
+### Disabling the feature
+
+Nothing in the metastore format forces CAS, so the feature can be turned off by moving the metastore:
+point `metastore_uri` at a `file://` path, or at a URI type that does not take the shared write path
+(`gs://`, `azure://`), and restart the nodes. A node can also be started on a storage that ignores
+conditional writes by setting `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` and running it as the only
+writer; on an endpoint that does enforce conditional writes the variable has no effect.

@@ -76,6 +76,11 @@ This is automatic for S3-compatible URIs (`s3://`); there is nothing to configur
 backend that supports conditional writes — Amazon S3 (since November 2024), Cloudflare R2 and MinIO
 do.
 
+See [Shared object-storage metastore: upgrade and
+rollback](../operating/upgrades.md#shared-object-storage-metastore-upgrade-and-rollback) before
+upgrading or downgrading a cluster: a prefix must never be written by an older (pre-CAS) node and a
+CAS node at the same time, because the older node overwrites whatever the CAS node committed.
+
 Quickwit does not take that on faith: at startup it writes a throwaway object twice with
 `If-None-Match` and checks that the second write is rejected. If the endpoint accepts it anyway
 (localstack 3.5.0 does, which would make a shared prefix lose updates silently), the node refuses to
