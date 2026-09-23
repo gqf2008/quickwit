@@ -121,6 +121,38 @@ switch). Search returned errors while the metastore was unreachable and ingest k
 documents into its local queue; after reconnection every one of the 256 acknowledged documents was
 searchable, with no ingest failure and no readiness failure.
 
+#### Cost and latency of the shared write path
+
+Compare-and-swap costs one extra read per metadata write: the node reloads the file together with its
+version before rewriting it, where a single-writer node writes straight from memory. Requests
+measured on a real node talking to Cloudflare R2, for one index created and then deleted:
+
+| Operation | Single writer | Shared |
+| --------- | ------------- | ------ |
+| create index | 3 PUT | 3 PUT + 1 GET |
+| delete index | 2 PUT + 1 DELETE | 2 PUT + 1 DELETE + 4 GET |
+
+Latency sampled on one machine far from the bucket (median round trip 0.81 s, so the network
+dominates — read these as a shape, not as constants):
+
+| Workload (median) | Single writer | Shared |
+| ----------------- | ------------- | ------ |
+| create index | 1.6 s | 2.1 s |
+| delete index | 1.3 s | 1.9 s |
+| ingest acknowledgement → searchable | 7.8 s | 9.0 s |
+| acknowledged documents / s, 1 node | 61 | 60 |
+| acknowledged documents / s, 2 nodes | — | 122 |
+
+Ingest acknowledgements do not wait for the metastore: splits are published asynchronously after the
+acknowledgement, so throughput is unchanged while publication latency grows by about one round trip.
+Two nodes publishing concurrently do not slow each other down; when they rewrite the same manifest at
+the same moment the loser replays its mutation, which costs another round trip: 15 contended creates
+had a median of 3.0 s against 1.8–2.1 s uncontended, with 9 replays counted by
+`quickwit_metastore_file_backed_cas_conflicts_total`.
+
+Object storage bills per request, so sharing a metastore means one extra GET per metadata write on
+top of the requests a single-writer node already makes.
+
 ### Polling configuration
 
 By default, the File-Backed Metastore is only read once when you start a Quickwit process (searcher, indexer, ...).

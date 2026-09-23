@@ -492,6 +492,10 @@ impl S3CompatibleObjectStorage {
         payload: Box<dyn crate::PutPayload>,
         condition: PutCondition,
     ) -> StorageResult<Option<crate::ObjectVersion>> {
+        // A conditional write is a PUT request like any other: count it here, otherwise
+        // `object_storage_puts_total` would miss every compare-and-swap write and operators would
+        // under-count the requests they pay for on a shared metastore.
+        crate::metrics::OBJECT_STORAGE_PUT_TOTAL.inc();
         let key = self.key(path);
         let total_len = payload.len();
         let part_num_bytes = self.multipart_policy.part_num_bytes(total_len);
@@ -504,7 +508,7 @@ impl S3CompatibleObjectStorage {
             )));
         }
         let _permit = REQUEST_SEMAPHORE.acquire().await;
-        let e_tag = aws_retry(&self.retry_params, || async {
+        let put_result = aws_retry(&self.retry_params, || async {
             self.put_single_part_single_try(
                 &self.bucket,
                 &key,
@@ -514,8 +518,11 @@ impl S3CompatibleObjectStorage {
             )
             .await
         })
-        .await
-        .map_err(|error| error.into_inner())?;
+        .await;
+        if put_result.is_err() {
+            crate::metrics::OBJECT_STORAGE_PUT_ERRORS_TOTAL.inc();
+        }
+        let e_tag = put_result.map_err(|error| error.into_inner())?;
         Ok(e_tag.map(crate::ObjectVersion::new))
     }
 
@@ -1862,6 +1869,32 @@ mod tests {
                 .body(SdkBody::empty())
                 .unwrap(),
         )
+    }
+
+    /// A compare-and-swap write is still a PUT request: it must show up in the request counters,
+    /// otherwise the cost of a shared metastore is invisible to operators.
+    #[tokio::test]
+    async fn test_conditional_put_is_counted_as_a_put() {
+        let client = StaticReplayClient::new(vec![ok_put_response()]);
+        let s3_storage =
+            make_s3_storage_with_replay(client.clone(), quickwit_config::ChecksumAlgorithm::Crc32c);
+        // Counters are process-global and tests run in parallel, so assert on the delta.
+        let puts_before = crate::metrics::OBJECT_STORAGE_PUT_TOTAL.get();
+        s3_storage
+            .put_if_absent(Path::new("test-key"), Box::new(vec![1u8, 2, 3]))
+            .await
+            .unwrap();
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers().get("if-none-match").unwrap(),
+            "*",
+            "the conditional write must send the precondition header"
+        );
+        assert!(
+            crate::metrics::OBJECT_STORAGE_PUT_TOTAL.get() - puts_before >= 1,
+            "a conditional write is a PUT and must be counted by object_storage_puts_total"
+        );
     }
 
     #[tokio::test]

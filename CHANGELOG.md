@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - (Jaeger) Query resource attributes when Jaeger request carries tags
+- Storage: conditional writes (`put_if_absent`, `put_if_version_matches`) are counted by
+  `object_storage_puts_total` and `object_storage_put_errors_total`. They were previously missing from
+  both counters, so a shared metastore's compare-and-swap traffic was invisible in the request metrics.
 
 ### Changed
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the
