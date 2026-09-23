@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Storage: conditional writes (`put_if_absent`, `put_if_version_matches`) are counted by
   `object_storage_puts_total` and `object_storage_put_errors_total`. They were previously missing from
   both counters, so a shared metastore's compare-and-swap traffic was invisible in the request metrics.
+- Indexing: a pipeline that keeps failing while the metastore or the storage is unreachable now backs
+  off exponentially (1s doubling up to 10 minutes, reset after a minute of healthy operation) instead
+  of restarting every second. The restart counter only covered failures to *spawn* the pipeline, so a
+  pipeline dying at runtime restarted with a fixed one-second delay for the whole outage.
 
 ### Changed
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the

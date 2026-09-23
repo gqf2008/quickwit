@@ -121,6 +121,10 @@ switch). Search returned errors while the metastore was unreachable and ingest k
 documents into its local queue; after reconnection every one of the 256 acknowledged documents was
 searchable, with no ingest failure and no readiness failure.
 
+While the endpoint is unreachable, an indexing pipeline that cannot reach it backs off exponentially
+(1 second doubling up to 10 minutes, and the delay is reset once the pipeline has been healthy for a
+minute), so a recovering metastore is not hammered by pipelines restarting every second.
+
 #### Cost and latency of the shared write path
 
 Compare-and-swap costs one extra read per metadata write: the node reloads the file together with its

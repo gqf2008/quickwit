@@ -39,7 +39,8 @@ use tracing::{debug, error, info, instrument, warn};
 use super::{DocProcessor, IndexSerializer, Indexer, MergePlanner, Packager};
 use crate::SplitsUpdateMailbox;
 use crate::actors::pipeline_shared::{
-    SPAWN_PIPELINE_SEMAPHORE, SUPERVISE_INTERVAL, Spawn, SuperviseLoop, wait_duration_before_retry,
+    RESTART_BACKOFF_RESET_DELAY, RestartBackoff, SPAWN_PIPELINE_SEMAPHORE, SUPERVISE_INTERVAL,
+    Spawn, SuperviseLoop, wait_duration_before_retry,
 };
 use crate::actors::sequencer::Sequencer;
 use crate::actors::uploader::UploaderType;
@@ -94,6 +95,10 @@ pub struct IndexingPipeline {
     // can be re-sent to the source on respawn; the source adopts it as its publish token.
     indexing_plan_id: IndexingPlanId,
     publish_token: SharedPublishToken,
+    // Restart counter shared by spawn failures and failures that happen while the pipeline runs,
+    // so that a pipeline flapping during a storage outage backs off instead of restarting
+    // every second.
+    restart_backoff: RestartBackoff,
     _indexing_pipelines_gauge_guard: GaugeGuard,
 }
 
@@ -144,6 +149,7 @@ impl IndexingPipeline {
             shard_ids: Default::default(),
             indexing_plan_id: IndexingPlanId::new(),
             publish_token: SharedPublishToken::default(),
+            restart_backoff: RestartBackoff::default(),
             _indexing_pipelines_gauge_guard: indexing_pipelines_gauge_guard,
         }
     }
@@ -261,11 +267,26 @@ impl IndexingPipeline {
         };
         let health = self.healthcheck(check_for_progress);
         match health {
-            Health::Healthy => {}
+            Health::Healthy => {
+                if self.restart_backoff.register_healthy(Instant::now()) {
+                    info!(
+                        "indexing pipeline has been healthy for {:?}, resetting the restart \
+                         backoff",
+                        RESTART_BACKOFF_RESET_DELAY
+                    );
+                }
+            }
             Health::FailureOrUnhealthy => {
                 self.terminate().await;
-                let first_retry_delay = wait_duration_before_retry(0);
-                ctx.schedule_self_msg(first_retry_delay, Spawn { retry_count: 0 });
+                // Count runtime failures like spawn failures: a pipeline that dies while the
+                // storage is unreachable used to come back with a fixed one-second delay forever.
+                let (retry_count, retry_delay) = self.restart_backoff.next_restart_delay();
+                warn!(
+                    retry_count,
+                    retry_delay = ?retry_delay,
+                    "indexing pipeline is unhealthy, restarting it after a backoff"
+                );
+                ctx.schedule_self_msg(retry_delay, Spawn { retry_count });
             }
             Health::Success => {
                 return Err(ActorExitStatus::Success);
@@ -483,6 +504,9 @@ impl Handler<Spawn> for IndexingPipeline {
         if self.handles_opt.is_some() {
             return Ok(());
         }
+        // Carry the failures of the previous attempts into the running pipeline, so that a pipeline
+        // that keeps dying right after a successful spawn keeps backing off.
+        self.restart_backoff.carry_spawn_failures(spawn.retry_count);
         self.previous_generations_statistics.num_spawn_attempts = 1 + spawn.retry_count;
         if let Err(spawn_error) = self.spawn_pipeline(ctx).await {
             if let Some(MetastoreError::NotFound { .. }) =
@@ -491,12 +515,13 @@ impl Handler<Spawn> for IndexingPipeline {
                 info!(error = ?spawn_error, "could not spawn pipeline, index might have been deleted");
                 return Err(ActorExitStatus::Success);
             }
-            let retry_delay = wait_duration_before_retry(spawn.retry_count + 1);
-            error!(error = ?spawn_error, retry_count = spawn.retry_count, retry_delay = ?retry_delay, "error while spawning indexing pipeline, retrying after some time");
+            let retry_count = self.restart_backoff.register_failure();
+            let retry_delay = wait_duration_before_retry(retry_count + 1);
+            error!(error = ?spawn_error, retry_count, retry_delay = ?retry_delay, "error while spawning indexing pipeline, retrying after some time");
             ctx.schedule_self_msg(
                 retry_delay,
                 Spawn {
-                    retry_count: spawn.retry_count + 1,
+                    retry_count: retry_count + 1,
                 },
             );
         }
