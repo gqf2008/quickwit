@@ -67,24 +67,28 @@ read back by the CAS node.
 Upgrade every node that writes to the metastore in the same maintenance window, or upgrade the nodes
 one by one while making sure **at most one** of them writes at a time (for example, leave the other
 nodes stopped). Rolling upgrades with mixed writers are safe only once every writer runs the CAS
-code.
+code. Indexers are writers, and so is the janitor, which rewrites the manifest when it garbage
+collects splits; a searcher-only node does not write and can keep running throughout.
 
 ### Rolling back
 
 1. Stop all nodes that write to the metastore prefix (see the shutdown order above).
 2. Start the older binary, alone, on the same prefix. It reads the data written by the CAS version.
-3. Keep that prefix single-writer until every node runs the old version again.
+3. Keep that prefix single-writer for good. A pre-CAS binary has no locking either, so two of them
+   sharing a prefix overwrite each other's manifest, exactly like the mixed case above.
 
 Two things to watch out for:
 
 - an older binary **cannot parse** a configuration using `storage.s3.flavor: r2` (the value did not
   exist yet), so remove that field before starting it;
-- starting an older binary next to a CAS node is the lost-update case described above.
+- an older binary keeps the manifest it read at startup in memory: as soon as a CAS node commits
+  anything after that read, the older node's next write drops it (the lost-update case above).
 
 ### Disabling the feature
 
 Nothing in the metastore format forces CAS, so the feature can be turned off by moving the metastore:
 point `metastore_uri` at a `file://` path, or at a URI type that does not take the shared write path
-(`gs://`, `azure://`), and restart the nodes. A node can also be started on a storage that ignores
-conditional writes by setting `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` and running it as the only
-writer; on an endpoint that does enforce conditional writes the variable has no effect.
+(`gs://`, `azure://`), and restart the nodes. Those metastores, and the one you fell back from, stay
+single-writer: only one node may write the prefix. A node can also be started on a storage that
+ignores conditional writes by setting `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` and running it as the
+only writer; on an endpoint that does enforce conditional writes the variable has no effect.
