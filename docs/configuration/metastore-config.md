@@ -102,7 +102,7 @@ A shared metastore exposes two counters on the `/metrics` endpoint:
 | Metric | Meaning |
 | ------ | ------- |
 | `quickwit_metastore_file_backed_cas_conflicts_total` | Metadata writes that lost a compare-and-swap race (`412 Precondition Failed`) and were replayed against the fresh file. A conflict is normal and harmless: it only says another node wrote first. |
-| `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (8 attempts with exponential backoff). The mutation was **not** applied. |
+| `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (16 attempts, doubling from 10 ms up to a 2 s cap — under 20 s in total). The mutation was **not** applied. |
 
 Suggested alerts:
 

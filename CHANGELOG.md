@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time hit that in about 5% of the creations, failing an operation that had actually succeeded.
 
 ### Changed
+- Metastore: the replay budget of a shared (S3-compatible) file-backed metastore went from 8 attempts
+  with a 500 ms backoff cap to 16 attempts capped at 2 s. Measured on a cross-region R2 bucket, two
+  nodes publishing into one index exhausted the old budget 11 times in two minutes and faulted the
+  publisher; the same run exhausts nothing at 16 attempts. Worst case is still under 20 s.
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the
   file together with its version and write it back with `If-Match`; a lost race is replayed (bounded
   retries) instead of overwriting the winner. The metastore probes the endpoint for conditional-write

@@ -92,7 +92,19 @@ use self::store_operations::{
 pub const ALLOW_UNSAFE_STORAGE_ENV_KEY: &str = "QW_METASTORE_ALLOW_UNSAFE_STORAGE";
 
 /// Number of times a mutation is replayed before the metastore gives up on a compare-and-swap race.
-const DISTRIBUTED_MAX_ATTEMPTS: usize = 8;
+///
+/// Raised from 8 to 16: each attempt costs a round trip to the object store, so on a cross-region
+/// endpoint (~2 s) the old budget only covered a few seconds of contention. With two writers
+/// publishing into the same index, a two-minute run exhausted the 8 attempts 11 times and faulted
+/// the publisher; the same run finishes with no exhausted replay at 16 attempts.
+const DISTRIBUTED_MAX_ATTEMPTS: usize = 16;
+
+/// Upper bound of the delay between two replays of a mutation.
+///
+/// Raised from 500 ms to 2 s together with [`DISTRIBUTED_MAX_ATTEMPTS`]: the budget has to cover
+/// several object-store round trips, and a contended index must still not stall a request for long.
+/// The worst case (16 attempts) stays under 20 s.
+const DISTRIBUTED_RETRY_BACKOFF_CAP_MILLIS: u64 = 2_000;
 
 /// Delay before replaying a mutation that lost a compare-and-swap race.
 ///
@@ -101,8 +113,8 @@ const DISTRIBUTED_MAX_ATTEMPTS: usize = 8;
 fn distributed_retry_backoff(attempt: usize) -> Duration {
     // Double the delay per attempt, and cap it so a contended index cannot stall a request for
     // long. Jitter keeps two nodes that keep colliding out of lockstep.
-    let exponent = attempt.min(7) as u32;
-    let base_millis = (5u64 << exponent).min(500);
+    let exponent = attempt.min(31) as u32;
+    let base_millis = (5u64 << exponent).min(DISTRIBUTED_RETRY_BACKOFF_CAP_MILLIS);
     let jitter_millis = rand::random::<u64>() % 10;
     Duration::from_millis(base_millis + jitter_millis)
 }
@@ -3447,6 +3459,26 @@ mod tests {
             "with `allow_unsafe_storage` the metastore must fall back to single-writer mode"
         );
         Ok(())
+    }
+
+    /// Pins the replay budget of a lost compare-and-swap race.
+    ///
+    /// Each attempt costs a round trip to the object store, so the budget has to cover several of
+    /// them on a slow endpoint (the cross-region R2 bucket used for the measurements answers in
+    /// about two seconds), while a contended index must still not stall a request for minutes.
+    #[test]
+    fn test_distributed_retry_budget() {
+        let total: Duration = (1..DISTRIBUTED_MAX_ATTEMPTS)
+            .map(distributed_retry_backoff)
+            .sum();
+        assert!(
+            total >= Duration::from_secs(15),
+            "the replay budget must cover a slow object store, got {total:?}"
+        );
+        assert!(
+            total <= Duration::from_secs(20),
+            "a contended index must not stall a request for minutes, got {total:?}"
+        );
     }
 
     /// A compare-and-swap that never wins must stop after a bounded number of attempts and report
