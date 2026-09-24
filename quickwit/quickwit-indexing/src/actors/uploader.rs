@@ -17,6 +17,7 @@ use std::iter::FromIterator;
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -41,6 +42,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
 use tracing::{Instrument, Span, debug, error, info, instrument, warn};
 
 use crate::actors::Publisher;
+use crate::actors::publisher::is_transient_metastore_conflict;
 use crate::actors::sequencer::{Sequencer, SequencerCommand};
 use crate::merge_policy::{MergePolicy, MergeTask};
 use crate::metrics::{AVAILABLE_CONCURRENT_UPLOAD_PERMITS, COMPONENT};
@@ -159,6 +161,9 @@ impl SplitsUpdateSender {
         Ok(())
     }
 }
+
+/// How many times staging splits is retried when it loses a compare-and-swap race.
+const STAGE_SPLITS_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct Uploader {
@@ -355,10 +360,40 @@ impl Handler<PackagedSplitBatch> for Uploader {
                         return;
                     }
                 };
-                if let Err(error) = metastore.stage_splits(stage_splits_request).await {
-                    error!(?error, "failed to stage splits");
-                    return;
-                };
+                // Staging writes the index metadata, so two nodes uploading into the same index can
+                // lose the compare-and-swap race. The metastore already replays its own bounded
+                // budget; when that runs out the error is transient (another node wrote first), so
+                // retry it here instead of aborting the upload, which would close the channel to
+                // the sequencer and fault the whole pipeline.
+                let mut stage_attempt = 0;
+                loop {
+                    stage_attempt += 1;
+                    match metastore.stage_splits(stage_splits_request.clone()).await {
+                        Ok(_) => break,
+                        Err(error)
+                            if is_transient_metastore_conflict(&error)
+                                && stage_attempt < STAGE_SPLITS_MAX_ATTEMPTS =>
+                        {
+                            let retry_delay = Duration::from_secs(1 << (stage_attempt - 1));
+                            warn!(
+                                %error,
+                                attempt = stage_attempt,
+                                retry_delay = ?retry_delay,
+                                "failed to stage splits, retrying"
+                            );
+                            // This runs inside a spawned task, so a plain sleep is used; the kill
+                            // switch guard below keeps a shutdown from waiting on the retry.
+                            if kill_switch.is_dead() {
+                                return;
+                            }
+                            tokio::time::sleep(retry_delay).await;
+                        }
+                        Err(error) => {
+                            error!(?error, "failed to stage splits");
+                            return;
+                        }
+                    }
+                }
 
                 counters
                     .num_staged_splits
@@ -590,7 +625,9 @@ mod tests {
     use quickwit_common::pubsub::EventSubscriber;
     use quickwit_common::temp_dir::TempDirectory;
     use quickwit_metastore::checkpoint::{IndexCheckpointDelta, SourceCheckpointDelta};
-    use quickwit_proto::metastore::{EmptyResponse, MockMetastoreService};
+    use quickwit_proto::metastore::{
+        EmptyResponse, EntityKind, MetastoreError, MockMetastoreService,
+    };
     use quickwit_proto::types::{DocMappingUid, NodeId, SplitId};
     use quickwit_storage::RamStorage;
     use tantivy::DateTime;
@@ -649,6 +686,138 @@ mod tests {
             })
             .times(1)
             .returning(|_| Ok(EmptyResponse {}));
+        let ram_storage = RamStorage::default();
+        let split_store =
+            IndexingSplitStore::create_without_local_store_for_test(Arc::new(ram_storage.clone()));
+        let merge_policy = Arc::new(NopMergePolicy);
+        let uploader = Uploader::new(
+            UploaderType::IndexUploader,
+            MetastoreServiceClient::from_mock(mock_metastore),
+            merge_policy,
+            None,
+            split_store,
+            SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
+            4,
+            event_broker,
+        );
+        let (uploader_mailbox, uploader_handle) = universe.spawn_builder().spawn(uploader);
+        let split_scratch_directory = TempDirectory::for_test();
+        let checkpoint_delta_opt: Option<IndexCheckpointDelta> = Some(IndexCheckpointDelta {
+            source_id: "test-source".to_string(),
+            source_delta: SourceCheckpointDelta::from_range(3..15),
+        });
+        uploader_mailbox
+            .send_message(PackagedSplitBatch::new(
+                vec![PackagedSplit {
+                    split_attrs: SplitAttrs {
+                        node_id,
+                        index_uid,
+                        source_id,
+                        doc_mapping_uid: DocMappingUid::default(),
+                        partition_id: 3u64,
+                        time_range: Some(
+                            DateTime::from_timestamp_secs(1_628_203_589)
+                                ..=DateTime::from_timestamp_secs(1_628_203_640),
+                        ),
+                        uncompressed_docs_size_in_bytes: 1_000,
+                        num_docs: 10,
+                        replaced_split_ids: Vec::new(),
+                        split_id: "test-split".into(),
+                        delete_opstamp: 10,
+                        num_merge_ops: 0,
+                    },
+                    serialized_split_fields: Vec::new(),
+                    split_scratch_directory,
+                    tags: Default::default(),
+                    hotcache_bytes: Vec::new(),
+                    split_files: Vec::new(),
+                }],
+                checkpoint_delta_opt,
+                PublishLock::default(),
+                None,
+                Span::none(),
+            ))
+            .await?;
+        assert_eq!(
+            uploader_handle.process_pending_and_observe().await.obs_type,
+            ObservationType::Alive
+        );
+        let mut publish_futures: Vec<oneshot::Receiver<SequencerCommand<SplitsUpdate>>> =
+            sequencer_inbox.drain_for_test_typed();
+        assert_eq!(publish_futures.len(), 1);
+
+        let publisher_message = match publish_futures.pop().unwrap().await? {
+            SequencerCommand::Discard => panic!(
+                "expected `SequencerCommand::Proceed(SplitUpdate)`, got \
+                 `SequencerCommand::Discard`"
+            ),
+            SequencerCommand::Proceed(publisher_message) => publisher_message,
+        };
+        let SplitsUpdate {
+            index_uid,
+            new_splits,
+            checkpoint_delta_opt,
+            replaced_split_ids,
+            ..
+        } = publisher_message;
+
+        assert_eq!(index_uid.index_id, "test-index");
+        assert_eq!(new_splits.len(), 1);
+        assert_eq!(new_splits[0].split_id(), "test-split");
+        let checkpoint_delta = checkpoint_delta_opt.unwrap();
+        assert_eq!(checkpoint_delta.source_id, "test-source");
+        assert_eq!(
+            checkpoint_delta.source_delta,
+            SourceCheckpointDelta::from_range(3..15)
+        );
+        assert!(replaced_split_ids.is_empty());
+        let mut files = ram_storage.list_files().await;
+        files.sort();
+        assert_eq!(&files, &[PathBuf::from("test-split.split")]);
+        universe.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_uploader_retries_staging_after_a_lost_compare_and_swap() -> anyhow::Result<()> {
+        quickwit_common::setup_logging_for_tests();
+
+        let node_id = NodeId::from_str("test-node");
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
+        let source_id = "test-source".to_string();
+
+        let event_broker = EventBroker::default();
+        let universe = Universe::new();
+        let (sequencer_mailbox, sequencer_inbox) =
+            universe.create_test_mailbox::<Sequencer<Publisher>>();
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_stage_splits()
+            .withf(move |stage_splits_request| -> bool {
+                let splits_metadata = stage_splits_request.deserialize_splits_metadata().unwrap();
+                let split_metadata = &splits_metadata[0];
+                let index_uid: IndexUid = stage_splits_request.index_uid().clone();
+                index_uid.index_id == "test-index"
+                    && split_metadata.split_id() == "test-split"
+                    && split_metadata.time_range == Some(1628203589..=1628203640)
+            })
+            // The first attempt loses the compare-and-swap race (the metastore already burned its
+            // own replay budget); the uploader must retry instead of aborting the upload.
+            .times(2)
+            .returning(|_| {
+                static ATTEMPTS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(MetastoreError::FailedPrecondition {
+                        entity: EntityKind::Index {
+                            index_id: "test-index".to_string(),
+                        },
+                        message: "the index metadata was modified concurrently".to_string(),
+                    })
+                } else {
+                    Ok(EmptyResponse {})
+                }
+            });
         let ram_storage = RamStorage::default();
         let split_store =
             IndexingSplitStore::create_without_local_store_for_test(Arc::new(ram_storage.clone()));

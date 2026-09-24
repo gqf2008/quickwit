@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and writes dropped under contention observable from Prometheus.
 
 ### Fixed
+- Indexing: staging splits now retries a lost compare-and-swap instead of aborting the upload. The
+  uploader returned on `FailedPrecondition`, which closed the channel to the sequencer and faulted the
+  whole pipeline; a three-node run against one shared metastore hit exactly that while the publisher
+  path (already fixed) retried happily. Both paths now share one transient-error classification.
 - Indexing: a publisher that loses a compare-and-swap race no longer faults the pipeline. The retired
   publish token was the only retryable metastore error, so a `FailedPrecondition` (the metastore
   exhausted its replay budget against a concurrent writer) restarted the whole indexing pipeline.

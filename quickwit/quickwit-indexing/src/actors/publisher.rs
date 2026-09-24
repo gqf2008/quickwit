@@ -150,6 +150,18 @@ pub(crate) async fn suggest_truncate(
 
 // This is used primarily for publisher-specific metastore retry logic, specifically to have a
 // handle on an invalid publish token, which will cause the pipeline to be terminated and not
+/// Returns whether a metastore error is transient when several nodes write the same index.
+///
+/// Two cases qualify: the publish token was revoked because the shard moved to another node, and a
+/// lost compare-and-swap (the metastore already replayed its own bounded budget, and the error just
+/// means another node wrote first). Retrying re-reads the metadata and re-applies the change.
+pub(crate) fn is_transient_metastore_conflict(error: &MetastoreError) -> bool {
+    matches!(
+        error,
+        MetastoreError::InvalidPublishToken { .. } | MetastoreError::FailedPrecondition { .. }
+    )
+}
+
 pub(crate) async fn publish_with_retry<T, F, Fut>(
     ctx: &ActorContext<Publisher>,
     operation_name: &str,
@@ -174,10 +186,7 @@ where
         // budget on it) are both transient: retrying re-reads the index metadata and publishes
         // again. Faulting the publisher instead would restart the whole pipeline, which is what
         // used to happen when two nodes published into the same index.
-        let retryable = matches!(
-            error,
-            MetastoreError::InvalidPublishToken { .. } | MetastoreError::FailedPrecondition { .. }
-        );
+        let retryable = is_transient_metastore_conflict(&error);
         match (retryable, retry_delay) {
             (true, Some(retry_delay)) => {
                 warn!(
