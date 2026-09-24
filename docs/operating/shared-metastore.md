@@ -106,9 +106,10 @@ It needs conditional writes; a node refuses to start with this layout on a stora
 | sharded | the entries of the touched slots since their last fold | 1.6 KB → 5.6 KB over the same growth |
 
 The single-object figure grows with the index (it *is* the index); the sharded one is bounded by the
-fold threshold. Extrapolated to the 12 GB index above, the single-object layout writes 12 GB per
-publish against ~0.1–0.5 MB for the sharded one, and the gap keeps widening with retention. The same
-measurement is asserted in `quickwit-metastore`'s
+fold threshold. Those two rows were measured with 64 slots and a fold threshold of 8, so that the
+sawtooth fits in a unit test rather than with the 256/512 defaults. Extrapolated to the 12 GB index
+above, the single-object layout writes 12 GB per publish against ~0.1–0.5 MB for the sharded one, and
+the gap keeps widening with retention. The same measurement is asserted in `quickwit-metastore`'s
 `sharded_layout::tests::test_sharded_writes_do_not_follow_the_index_size`, and the layout is also
 covered on a real R2 bucket by `tests/s3_shared_metastore.rs`.
 
@@ -117,3 +118,7 @@ What has *not* changed: a reader still materialises the whole split map, so the 
 but the segments are still large). Sizing the layout for a very large index — more slots, a smaller
 fold threshold, or splitting the segments further — is the next step, not something this
 configuration already solves.
+
+A node that runs a shared prefix in single-writer mode (see `QW_METASTORE_ALLOW_UNSAFE_STORAGE`)
+must not be pointed at an index in this layout: its write path assumes the single object and would
+write one, shadowing the sharded objects rather than updating them.

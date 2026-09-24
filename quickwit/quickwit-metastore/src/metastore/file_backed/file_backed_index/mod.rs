@@ -363,6 +363,11 @@ impl FileBackedIndex {
         self.splits = splits;
     }
 
+    /// Returns a split by id, without recording it as touched.
+    pub(super) fn split_opt(&self, split_id: &SplitId) -> Option<&Split> {
+        self.splits.get(split_id)
+    }
+
     /// Whether the split map is empty. Used to check the hidden contract of [`Self::take_splits`].
     pub(super) fn splits_is_empty(&self) -> bool {
         self.splits.is_empty()

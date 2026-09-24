@@ -548,11 +548,15 @@ pub(super) async fn store_sharded_index(
     let index_id = index.index_id().to_string();
     let num_slots = context.num_slots;
     let touched_split_ids = index.take_touched_split_ids();
-    let splits = index.take_splits();
 
     // The root is only rewritten when its own content changed: a split publish must not turn into a
     // write of the one object every writer also touches.
-    let root_bytes = serialize_root(index, num_slots)?;
+    let root_bytes = {
+        let splits = index.take_splits();
+        let root_bytes = serialize_root(index, num_slots);
+        index.put_splits(splits);
+        root_bytes?
+    };
     if root_bytes.as_slice() != context.root_bytes.as_slice() {
         let write_result = storage
             .put_if_version_matches(
@@ -563,7 +567,6 @@ pub(super) async fn store_sharded_index(
             .await
             .map_err(|error| convert_error(&index_id, error));
         if let Err(error) = write_result {
-            index.put_splits(splits);
             index.put_touched_split_ids(touched_split_ids);
             return Err(error);
         }
@@ -601,7 +604,7 @@ pub(super) async fn store_sharded_index(
             },
         };
         for split_id in &split_ids {
-            slot_file.push(split_id.clone(), splits.get(split_id).cloned());
+            slot_file.push(split_id.clone(), index.split_opt(split_id).cloned());
         }
         let slot_bytes = serde_utils::to_json_bytes(&slot_file).map_err(|error| {
             internal_error("failed to serialize a split slot", error.to_string())
@@ -617,7 +620,6 @@ pub(super) async fn store_sharded_index(
         }
         .map_err(|error| convert_error(&index_id, error))?;
         let Some(slot_version) = slot_version_opt else {
-            index.put_splits(splits);
             return Err(no_version_error(&index_id, &path));
         };
         if slot_file.entries.len() >= context.view.fold_threshold
@@ -634,7 +636,6 @@ pub(super) async fn store_sharded_index(
             );
         }
     }
-    index.put_splits(splits);
     Ok(())
 }
 
@@ -707,9 +708,13 @@ async fn fold_slot(
             .map(|_| ()),
     };
     if let Err(error) = view_write_result {
-        // Another writer folded first. Our segment is unreferenced: drop it instead of leaving it
-        // behind.
-        let _ = storage.delete(&segment_path).await;
+        // The view write failed, which normally means another writer folded first and our segment
+        // is unreferenced. It must *not* be deleted here: a conditional write that was committed
+        // but whose response was lost (a retry then fails with a stale `If-Match`) is
+        // indistinguishable from a lost race, and in that case the view does name our
+        // segment — deleting it would leave the slot unreadable, since its slot file is
+        // skipped as already folded. The orphan is left to `garbage_collect_segments`,
+        // which only deletes segments a generation out of date.
         return Err(convert_error(index_id, error));
     }
     garbage_collect_segments(storage, index_id, slot, new_generation).await;
@@ -1126,6 +1131,105 @@ mod tests {
     enum LayoutUnderTest {
         SingleObject,
         Sharded,
+    }
+
+    async fn num_segments(storage: &dyn Storage, slot: u32) -> usize {
+        let mut pages = storage.list(&segments_prefix(INDEX_ID, slot));
+        let mut num_segments = 0;
+        while let Some(page) = pages.try_next().await.unwrap() {
+            num_segments += page
+                .iter()
+                .filter(|metadata| metadata.path.extension() == Some(std::ffi::OsStr::new("json")))
+                .count();
+        }
+        num_segments
+    }
+
+    async fn write_splits(
+        storage: &dyn Storage,
+        split_ids: &[SplitId],
+        context: &ShardedWriteContext,
+    ) {
+        let (mut index, _) = load_sharded_index(storage, INDEX_ID).await.unwrap();
+        for split_id in split_ids {
+            index
+                .stage_split(SplitMetadata::for_test(split_id.clone()))
+                .unwrap();
+        }
+        store_sharded_index(storage, &mut index, context)
+            .await
+            .unwrap();
+    }
+
+    /// A fold that loses the view race must leave everything behind it readable.
+    ///
+    /// This is the failure mode that looks harmless and is not: a conditional write that was
+    /// committed but whose response was lost cannot be told apart from a lost race, so a fold may
+    /// not "clean up" the segment it wrote. If it deletes it, the slot becomes unreadable — the
+    /// view names the deleted segment, and the slot file is skipped as already folded.
+    #[tokio::test]
+    async fn test_a_losing_fold_keeps_the_index_readable() {
+        const FOLD_THRESHOLD: usize = 8;
+        const NUM_SLOTS: u32 = 2;
+        let storage = test_storage();
+        let index = FileBackedIndex::new(
+            IndexMetadata::for_test(INDEX_ID, "file:///test-index"),
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
+        create_sharded_index(&*storage, &index, NUM_SLOTS, FOLD_THRESHOLD)
+            .await
+            .unwrap();
+
+        let split_ids_for_slot = |range: std::ops::Range<usize>, slot: u32| -> Vec<SplitId> {
+            (range)
+                .map(|i| SplitId::from(format!("split-{i:06}")))
+                .filter(|split_id| slot_of(split_id.as_str(), NUM_SLOTS) == slot)
+                .collect()
+        };
+        // Fold slot 0, then load a context: it is current for both the view and slot 0's file.
+        let slot_0_first = split_ids_for_slot(0..40, 0);
+        let (_, context_before_slot_0_fold) =
+            load_sharded_index(&*storage, INDEX_ID).await.unwrap();
+        write_splits(&*storage, &slot_0_first, &context_before_slot_0_fold).await;
+        let (_, stale_context) = load_sharded_index(&*storage, INDEX_ID).await.unwrap();
+        let num_segments_after_first_fold = num_segments(&*storage, 0).await;
+        assert!(num_segments_after_first_fold >= 1);
+
+        // Move the view ahead by folding the other slot and another chunk of slot 0. The stale
+        // context's view version is now out of date while the version of slot 0's file — the one it
+        // compares and swaps against — is not, so its next write gets as far as the fold.
+        let slot_1_splits = split_ids_for_slot(40..80, 1);
+        let (_, context_after_slot_0_fold) = load_sharded_index(&*storage, INDEX_ID).await.unwrap();
+        write_splits(&*storage, &slot_1_splits, &context_after_slot_0_fold).await;
+        let num_segments_before_losing_fold = num_segments(&*storage, 0).await;
+
+        // Write to slot 0 with the stale view: the slot compare-and-swap still matches, the fold
+        // inside the write loses the view race, and it must leave the index readable.
+        let slot_0_third = split_ids_for_slot(200..240, 0);
+        let context = stale_context;
+        let (mut index, _) = load_sharded_index(&*storage, INDEX_ID).await.unwrap();
+        for split_id in &slot_0_third {
+            index
+                .stage_split(SplitMetadata::for_test(split_id.clone()))
+                .unwrap();
+        }
+        store_sharded_index(&*storage, &mut index, &context)
+            .await
+            .unwrap();
+
+        // The losing fold left its segment on the storage instead of deleting it, and the index is
+        // still readable with every split.
+        assert!(
+            num_segments(&*storage, 0).await > num_segments_before_losing_fold,
+            "a losing fold must not delete the segment it wrote"
+        );
+        let split_ids = list_split_ids(&*storage).await;
+        assert_eq!(
+            split_ids.len(),
+            slot_0_first.len() + slot_1_splits.len() + slot_0_third.len()
+        );
     }
 
     // The property the layout exists for: what a publish rewrites must stop following the size of

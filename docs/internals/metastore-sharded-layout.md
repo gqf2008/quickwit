@@ -33,10 +33,10 @@ metastore/
   manifest.json                     # index list, source configs, checkpoints. Small, low churn: keep
                                     # as today (single CAS file).
   <index_id>/
-    root.json                       # everything of the index except the splits, its own CAS
-    splits/view.json                # per-slot bookmark: folded sequence, segment, slot file version
-    splits/slots/<slot>.json        # entries written to that slot since it was last folded
-    splits/segments/<slot>/<generation>-<id>.json
+    v2/root.json                    # everything of the index except the splits, its own CAS
+    v2/splits/view.json             # per-slot bookmark: folded sequence, segment, slot file version
+    v2/splits/slots/<slot:05>.json  # entries written to that slot since it was last folded
+    v2/splits/segments/<slot:05>/<generation:016>-<uuid>.json
                                     # immutable folded snapshot of one slot
 ```
 
@@ -52,10 +52,10 @@ from the bookmark — never all N slots.
    is; a **segment** holds the whole content of one slot, so `N` bounds it (12 GB / 256 ≈ 47 MB).
    `N` therefore trades the number of objects a read has to fetch against the per-slot conflict
    probability (`1/N` per pair of concurrent writers: at `N = 256` and 11.6 writes/s, a pair of
-   writers collides on ~0.05 writes/s, which the existing bounded replay absorbs). `N = 256` is the
-   current default; sizing it for a 12 GB index is still open (a per-range segment would let a read
-   fetch far fewer objects, see Next steps). Invariant: a slot file may be written by anyone, but
-   only the writer holding its CAS version may commit it.
+   writers touches the same slot on ~0.05 writes/s — an order-of-magnitude estimate, not a measured
+   collision rate). `N = 256` is the current default; sizing it for a 12 GB index is still open (a
+   per-range segment would let a read fetch far fewer objects, see Next steps). Invariant: a slot
+   file may be written by anyone, but only the writer holding its CAS version may commit it.
 2. **Pointer switch.** Compaction writes the new segment, then CASes `view.json` (one write) to a new
    generation, and only then may the superseded segments be deleted. Invariant: every generation is a
    complete snapshot — readers never need to combine "old segments plus new segments" across a switch.
@@ -88,9 +88,10 @@ from the bookmark — never all N slots.
 
    Implemented so far: `root.json`, `view.json` and every segment carry `format_version = 1`, and a
    node that finds an unknown version refuses to interpret the object instead of guessing. Nothing
-   migrates an existing legacy index yet — a sharded index is created sharded — and reading falls
-   back to `<index_id>/metastore.json` when there is no sharded root, which is what keeps a mixed
-   fleet working.
+   migrates an existing legacy index yet — a sharded index is created sharded. Reading tries
+   `<index_id>/metastore.json` first, which is the path every index created before this layout uses,
+   and only looks for a sharded root when that object is missing; that is what keeps a mixed fleet
+   working.
 
 ## Read path
 

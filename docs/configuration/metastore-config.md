@@ -95,6 +95,17 @@ Two cases remain single-node:
 
 The metastore logs which mode it started in.
 
+#### Very large indexes: sharded splits
+
+By default an index keeps all of its split metadata in one object, which every metadata write
+rewrites. Set `QW_METASTORE_SHARDED_LAYOUT=true` to make this node create indexes whose splits are
+spread over 256 objects instead (`<index_id>/v2/`), so a write only rewrites the slots it touched.
+It is a per-index, per-node choice recorded in the objects themselves: a node reads whichever layout
+an index was created with, and the variable only decides what new indexes use. It requires a storage
+that enforces conditional writes, and the node refuses to start with this setting otherwise. See
+[Shared object-storage metastore](../operating/shared-metastore.md) for the layout and the measured
+write amplification.
+
 #### Monitoring a shared metastore
 
 A shared metastore exposes two counters on the `/metrics` endpoint:
