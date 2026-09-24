@@ -159,22 +159,51 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = MetastoreResult<T>>,
 {
-    for retry_delay in [
+    let retry_delays = [
         Some(Duration::from_secs(1)),
         Some(Duration::from_secs(3)),
         None,
-    ] {
+    ];
+    let num_tries = retry_delays.len();
+    for (attempt, retry_delay) in retry_delays.into_iter().enumerate() {
         let Err(error) = ctx.protect_future(publish()).await else {
             return Ok(());
         };
-        let retryable = matches!(error, MetastoreError::InvalidPublishToken { .. });
-        match retry_delay {
-            Some(retry_delay) if retryable => {
-                warn!(%error, operation = operation_name, "metastore publish failed, retrying");
+        // A revoked publish token (the shard moved to another node) and a failed precondition (this
+        // node lost the compare-and-swap race and the metastore already burned its own replay
+        // budget on it) are both transient: retrying re-reads the index metadata and publishes
+        // again. Faulting the publisher instead would restart the whole pipeline, which is what
+        // used to happen when two nodes published into the same index.
+        let retryable = matches!(
+            error,
+            MetastoreError::InvalidPublishToken { .. } | MetastoreError::FailedPrecondition { .. }
+        );
+        match (retryable, retry_delay) {
+            (true, Some(retry_delay)) => {
+                warn!(
+                    %error,
+                    operation = operation_name,
+                    attempt = attempt + 1,
+                    "metastore publish failed, retrying"
+                );
                 ctx.protect_future(ctx.sleep(retry_delay)).await;
             }
-            _ => {
-                warn!(%error, operation = operation_name, retryable, "metastore publish failed, giving up after 3 tries");
+            (true, None) => {
+                warn!(
+                    %error,
+                    operation = operation_name,
+                    "metastore publish failed, giving up after {num_tries} tries"
+                );
+                return Err(anyhow::Error::from(error)
+                    .context(format!("failed to {operation_name}"))
+                    .into());
+            }
+            (false, _) => {
+                warn!(
+                    %error,
+                    operation = operation_name,
+                    "metastore publish failed, giving up (not retryable)"
+                );
                 return Err(anyhow::Error::from(error)
                     .context(format!("failed to {operation_name}"))
                     .into());

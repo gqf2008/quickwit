@@ -162,7 +162,7 @@ mod tests {
     };
     use quickwit_metastore::{PublishSplitsRequestExt, SplitMetadata};
     use quickwit_proto::metastore::{
-        EmptyResponse, MetastoreError, MetastoreServiceClient, MockMetastoreService,
+        EmptyResponse, EntityKind, MetastoreError, MetastoreServiceClient, MockMetastoreService,
     };
     use quickwit_proto::types::{IndexUid, Position, SplitId};
     use tracing::Span;
@@ -465,6 +465,67 @@ mod tests {
         drop(publisher_mailbox);
         let (exit_status, observation) = publisher_handle.join().await;
         assert!(exit_status.is_success());
+        assert_eq!(observation.num_published_splits, 1);
+        universe.assert_quit().await;
+    }
+
+    /// A lost compare-and-swap is transient, not a reason to restart the pipeline.
+    ///
+    /// Two nodes publishing into the same index lose the manifest race from time to time; the
+    /// metastore already replays its own bounded budget, and when that runs out the publisher must
+    /// retry rather than fault (faulting restarted the whole pipeline in production-like runs).
+    #[tokio::test]
+    async fn test_publisher_retries_then_succeeds_on_failed_precondition() {
+        let universe = Universe::with_accelerated_time();
+        let index_uid: IndexUid = IndexUid::for_test("index", 1);
+        let mut mock_metastore = MockMetastoreService::new();
+        let mut attempt = 0;
+        mock_metastore
+            .expect_publish_splits()
+            .times(2)
+            .returning(move |_| {
+                attempt += 1;
+                if attempt == 1 {
+                    Err(MetastoreError::FailedPrecondition {
+                        entity: EntityKind::Index {
+                            index_id: "index".to_string(),
+                        },
+                        message: "another node wrote the manifest first".to_string(),
+                    })
+                } else {
+                    Ok(EmptyResponse {})
+                }
+            });
+        let publisher = Publisher::new(
+            PUBLISHER_NAME,
+            QueueCapacity::Bounded(1),
+            MetastoreServiceClient::from_mock(mock_metastore),
+            None,
+            None,
+            SharedPublishToken::default(),
+        );
+        let (publisher_mailbox, publisher_handle) = universe.spawn_builder().spawn(publisher);
+        publisher_mailbox
+            .send_message(SplitsUpdate {
+                index_uid,
+                new_splits: vec![SplitMetadata {
+                    split_id: SplitId::from("split"),
+                    ..Default::default()
+                }],
+                replaced_split_ids: Vec::new(),
+                checkpoint_delta_opt: None,
+                publish_lock: PublishLock::default(),
+                merge_task: None,
+                parent_span: Span::none(),
+            })
+            .await
+            .unwrap();
+        drop(publisher_mailbox);
+        let (exit_status, observation) = publisher_handle.join().await;
+        assert!(
+            exit_status.is_success(),
+            "a lost compare-and-swap must not fault the publisher: {exit_status:?}"
+        );
         assert_eq!(observation.num_published_splits, 1);
         universe.assert_quit().await;
     }

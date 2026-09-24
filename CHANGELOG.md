@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and writes dropped under contention observable from Prometheus.
 
 ### Fixed
+- Indexing: a publisher that loses a compare-and-swap race no longer faults the pipeline. The retired
+  publish token was the only retryable metastore error, so a `FailedPrecondition` (the metastore
+  exhausted its replay budget against a concurrent writer) restarted the whole indexing pipeline.
+  Two nodes publishing into one index on a cross-region bucket now finish a two-minute run with zero
+  exhausted replays, zero publisher faults and no lost documents.
 - (Jaeger) Query resource attributes when Jaeger request carries tags
 - Storage: conditional writes (`put_if_absent`, `put_if_version_matches`) are counted by
   `object_storage_puts_total` and `object_storage_put_errors_total`. They were previously missing from
