@@ -1,4 +1,3 @@
-<!--
 # Changelog
 All notable changes to this project will be documented in this file.
 
@@ -11,57 +10,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Azure Blob Storage: support custom endpoints via `endpoint` and `endpoint_suffix` configuration options for sovereign clouds (#6624)
 - Storage: conditional writes (`put_if_absent`, `put_if_version_matches`, `get_all_with_version`) with a
   `PreconditionFailed` error kind, and a Cloudflare R2 storage flavor (`storage.s3.flavor: r2`, alias
-  `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums. R2 was
-  verified against the real endpoint: it enforces `If-None-Match`/`If-Match`, and it accepts both the
-  `Content-MD5` and the default `crc32c` upload checksums.
-- Metastore: a shared (S3-compatible) file-backed metastore exposes
-  `quickwit_metastore_file_backed_cas_conflicts_total` and
-  `quickwit_metastore_file_backed_cas_conflicts_exhausted_total`, making contention between nodes
-  and writes dropped under contention observable from Prometheus.
-
-### Fixed
-- Indexing: staging splits now retries a lost compare-and-swap instead of aborting the upload. The
-  uploader returned on `FailedPrecondition`, which closed the channel to the sequencer and faulted the
-  whole pipeline; a three-node run against one shared metastore hit exactly that while the publisher
-  path (already fixed) retried happily. Both paths now share one transient-error classification.
-- Indexing: a publisher that loses a compare-and-swap race no longer faults the pipeline. The retired
-  publish token was the only retryable metastore error, so a `FailedPrecondition` (the metastore
-  exhausted its replay budget against a concurrent writer) restarted the whole indexing pipeline.
-  Two nodes publishing into one index on a cross-region bucket now finish a two-minute run with zero
-  exhausted replays, zero publisher faults and no lost documents.
-- (Jaeger) Query resource attributes when Jaeger request carries tags
-- Storage: conditional writes (`put_if_absent`, `put_if_version_matches`) are counted by
-  `object_storage_puts_total` and `object_storage_put_errors_total`. They were previously missing from
-  both counters, so a shared metastore's compare-and-swap traffic was invisible in the request metrics.
-- Indexing: a pipeline that keeps failing while the metastore or the storage is unreachable now backs
-  off exponentially (1s doubling up to 10 minutes, reset after a minute of healthy operation) instead
-  of restarting every second. The restart counter only covered failures to *spawn* the pipeline, so a
-  pipeline dying at runtime restarted with a fixed one-second delay for the whole outage.
-- Metastore: a shared (S3-compatible) metastore no longer reports a spurious `index already exists`
-  when a create is replayed after losing a manifest race. The replay used to mistake the index file
-  written by the previous attempt for another node's index; two nodes creating indexes at the same
-  time hit that in about 5% of the creations, failing an operation that had actually succeeded.
+  `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums. Verified against the
+  real R2 endpoint: it enforces `If-None-Match`/`If-Match` and accepts both the `Content-MD5` and the default
+  `crc32c` upload checksums. (walgit: `qw-dist-metastore-s3-r2`, `qw-r2-flavor-and-storage-polish`, `qw-real-r2-verification`)
+- Metastore: a shared (S3-compatible) file-backed metastore now reports
+  `quickwit_metastore_file_backed_cas_conflicts_total` (writes that lost a compare-and-swap race and were
+  replayed) and `..._exhausted_total` (mutations dropped after the replay budget ran out), so contention and
+  dropped writes are visible from Prometheus. (walgit: `qw-metastore-cas-observability`)
 
 ### Changed
-- Metastore: the replay budget of a shared (S3-compatible) file-backed metastore went from 8 attempts
-  with a 500 ms backoff cap to 16 attempts capped at 2 s. Measured on a cross-region R2 bucket, two
-  nodes publishing into one index exhausted the old budget 11 times in two minutes and faulted the
-  publisher; the same run exhausts nothing at 16 attempts. Worst case is still under 20 s.
-- **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the
-  file together with its version and write it back with `If-Match`; a lost race is replayed (bounded
-  retries) instead of overwriting the winner. The metastore probes the endpoint for conditional-write
-  support at startup and refuses to run in shared mode when the endpoint would silently ignore the
-  preconditions (`QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on such an
-  endpoint). `file://`, `gs://` and `azure://` metastores keep the single-writer behaviour, and the
-  startup log says which mode is in use.
+- **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the file
+  together with its version and write it back with `If-Match`; a lost race is replayed within a bounded budget
+  (16 attempts, 1s doubling to a 2s cap, reset after a minute of healthy operation) instead of overwriting the
+  winner. The metastore probes the endpoint for conditional-write support at startup and refuses to run in
+  shared mode when the endpoint would silently ignore the preconditions
+  (`QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on such an endpoint). `file://`,
+  `gs://` and `azure://` metastores keep the single-writer behaviour. (walgit: `qw-dist-metastore-s3-r2`,
+  `qw-metastore-distributed-mode`, `qw-capability-probe`)
+- Documentation: how to upgrade and roll back a cluster that shares an object-storage metastore (including the
+  lost-update hazard of mixing versions), and what a metadata write costs in requests and latency.
+  (walgit: `qw-metastore-rollback-drill`, `qw-metastore-perf-bench`)
 
-### Deprecated
+### Fixed
+- Metastore: a create that is replayed after losing a manifest race no longer answers `already exists` for the
+  index file it wrote itself. Two nodes creating indexes at the same time used to hit that in about 5% of the
+  creations, failing an operation that had actually succeeded (real R2: 80/80 creations after the fix).
+  (walgit: `qw-metastore-create-replay-fix`)
+- Metastore: the compare-and-swap replay budget went from 8 attempts with a 500 ms cap to 16 attempts capped at
+  2 s; two nodes publishing into one index exhausted the old budget 11 times in two minutes.
+  (walgit: `qw-metastore-retry-budget`)
+- Indexing: publishing a split that lost a compare-and-swap, and staging one that hit a transient storage
+  error, now retry instead of faulting the pipeline. Three nodes publishing into one index on a cross-region
+  bucket finish a two-minute run with zero actor faults and no lost documents.
+  (walgit: `qw-indexing-publish-conflict-retry`, `qw-indexing-stage-retry`)
+- Indexing: a pipeline that keeps failing while the metastore or the storage is unreachable now backs off
+  exponentially instead of restarting every second. (walgit: `qw-indexing-restart-backoff`)
+- (Jaeger) Query resource attributes when Jaeger request carries tags
 
-### Removed
 
-### Security
-
---->
 
 # [0.9.0]
 
