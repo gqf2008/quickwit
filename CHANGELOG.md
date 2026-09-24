@@ -21,12 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the file
   together with its version and write it back with `If-Match`; a lost race is replayed within a bounded budget
-  (16 attempts, 1s doubling to a 2s cap, reset after a minute of healthy operation) instead of overwriting the
+  (16 attempts, delays doubling from 5 ms to a 2 s cap) instead of overwriting the
   winner. The metastore probes the endpoint for conditional-write support at startup and refuses to run in
   shared mode when the endpoint would silently ignore the preconditions
   (`QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on such an endpoint). `file://`,
-  `gs://` and `azure://` metastores keep the single-writer behaviour. (walgit: `qw-dist-metastore-s3-r2`,
-  `qw-metastore-distributed-mode`, `qw-capability-probe`)
+  `gs://` and `azure://` metastores keep the single-writer behaviour, and the startup probe that decides
+  between the two modes is covered by the same thread. (walgit: `qw-dist-metastore-s3-r2`,
+  `qw-metastore-distributed-mode`)
 - Documentation: how to upgrade and roll back a cluster that shares an object-storage metastore (including the
   lost-update hazard of mixing versions), and what a metadata write costs in requests and latency.
   (walgit: `qw-metastore-rollback-drill`, `qw-metastore-perf-bench`)
