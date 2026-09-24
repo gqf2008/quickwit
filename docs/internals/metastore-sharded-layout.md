@@ -1,6 +1,10 @@
 # Metastore layout for very large indexes: shards, segments and compaction
 
-> Status: design note (batch-21). No code implements this yet.
+> Status: design note (batch-21), partly implemented in batch-22 (branch
+> `feat/metastore-sharded-store`): the slot write path, the per-slot fold, the view bookmark and the
+> read path exist and are tested; the compactor lease, the generation-gated GC grace beyond two
+> generations, the tombstone/format-migration story and the incremental reader are still open. The
+> implementation lives in `quickwit-metastore/src/metastore/file_backed/sharded_layout.rs`.
 
 ## Why the current layout does not scale
 
@@ -95,6 +99,11 @@ Searchers already poll the metastore rather than reading it per query, so the st
 
 ## Next steps
 
-1. Replay spike: synthesise the split stream for 5·10¹² docs/day and measure bytes rewritten per write,
-   conflict rate and cold-read GETs for (a) the current layout, (b) this design, (c) PostgreSQL.
-2. Only then implement, behind a format version, with the legacy path kept readable.
+1. Measured instead of simulated (batch-22): bytes rewritten per publish now come from diffing a
+   listing by object version, on both layouts. An index growing to 180 splits rewrites 6.5 KB → 123.9
+   KB per publish on the single-object layout against 1.6 KB → 5.6 KB on the sharded one.
+2. Still to measure at scale: cold-read GETs and conflict rate with 256 slots and hundreds of
+   writers, plus the fold cost of a slot that holds millions of splits.
+3. Remaining implementation work: fold the segments per slot range instead of per slot (so a reader
+   does not have to fetch one object per slot), a compaction lease, and an incremental reader that
+   keeps what it has instead of materialising the whole split map.
