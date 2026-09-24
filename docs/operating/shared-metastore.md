@@ -122,3 +122,11 @@ configuration already solves.
 A node that runs a shared prefix in single-writer mode (see `QW_METASTORE_ALLOW_UNSAFE_STORAGE`)
 must not be pointed at an index in this layout: its write path assumes the single object and would
 write one, shadowing the sharded objects rather than updating them.
+
+One more consequence of not conflicting: with the single-object layout, two writers on the same
+index almost always collide, so the loser replays and its cached copy of the index is refreshed as a
+side effect. With the sharded layout writers usually do not collide, so a node's cached split map can
+stay behind another node's writes until the next poll — the object store has every split, the cache
+does not. That is the same contract as today (`#polling_interval` is what makes a node notice other
+nodes' work), but the margin is thinner: configure polling wherever a node reads an index it also
+writes, and expect a node that neither polls nor writes to keep the view it loaded.

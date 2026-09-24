@@ -1161,6 +1161,78 @@ mod tests {
             .unwrap();
     }
 
+    /// Concurrent writers must not lose each other's splits, even when they do not conflict.
+    ///
+    /// This is the counterpart of the shared metastore suite's race-condition test, read back
+    /// through a *fresh* metastore. With several slots two writers rarely touch the same slot, so
+    /// unlike the single-object layout a write can succeed without replaying against the winner;
+    /// the storage still has to hold every split.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_concurrent_publishes_leave_every_split_in_the_storage() {
+        use quickwit_config::IndexConfig;
+        use quickwit_proto::metastore::{
+            CreateIndexRequest, ListSplitsRequest, MetastoreService, PublishSplitsRequest,
+            StageSplitsRequest,
+        };
+
+        use crate::{
+            CreateIndexRequestExt, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt,
+            StageSplitsRequestExt,
+        };
+
+        let storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let mut metastore = super::super::FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(super::super::IndexLayout::Sharded { num_slots: 8 });
+
+        let index_config = IndexConfig::for_test(INDEX_ID, "ram:///indexes/test-index");
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+
+        let mut handles = Vec::new();
+        for i in 1..=20 {
+            let metastore = metastore.clone();
+            let index_uid = index_uid.clone();
+            handles.push(tokio::spawn(async move {
+                let split_metadata = SplitMetadata::for_test(SplitId::from(format!("split-{i}")));
+                let stage_splits_request =
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                        .unwrap();
+                metastore.stage_splits(stage_splits_request).await.unwrap();
+                let publish_splits_request = PublishSplitsRequest {
+                    index_uid: Some(index_uid),
+                    staged_split_ids: vec![format!("split-{i}")],
+                    ..Default::default()
+                };
+                metastore
+                    .publish_splits(publish_splits_request)
+                    .await
+                    .unwrap();
+            }));
+        }
+        futures::future::try_join_all(handles).await.unwrap();
+
+        // A second metastore over the same storage has no cached view to be behind: it reads what
+        // the writers actually left behind.
+        let reader = super::super::FileBackedMetastore::try_new(storage, None)
+            .await
+            .unwrap();
+        let splits = reader
+            .list_splits(ListSplitsRequest::try_from_index_uid(index_uid).unwrap())
+            .await
+            .unwrap()
+            .collect_splits()
+            .await
+            .unwrap();
+        assert_eq!(splits.len(), 20, "concurrent writers lost a split");
+    }
+
     /// A fold that loses the view race must leave everything behind it readable.
     ///
     /// This is the failure mode that looks harmless and is not: a conditional write that was
