@@ -49,7 +49,11 @@ use super::{
     Assignment, BATCH_NUM_BYTES_LIMIT, BatchBuilder, EMIT_BATCHES_TIMEOUT, Source, SourceContext,
     SourceRuntime, SourceSink, TypedSourceFactory,
 };
+use crate::actors::publisher::is_transient_metastore_conflict;
 use crate::models::{LocalShardPositionsUpdate, NewPublishLock, PublishLock, SharedPublishToken};
+
+/// How many times acquiring shards is retried before the source actor gives up.
+const ACQUIRE_SHARDS_MAX_ATTEMPTS: usize = 3;
 
 pub struct IngestSourceFactory;
 
@@ -530,10 +534,45 @@ impl Source for IngestSource {
             shard_ids: shard_ids_to_acquire.clone(),
             publish_token: publish_token.to_string(),
         };
-        let acquire_shards_response: AcquireShardsResponse = ctx
-            .protect_future(self.metastore.acquire_shards(acquire_shards_request))
-            .await
-            .context("failed to acquire shards")?;
+        // Acquiring shards is a metastore write: while several nodes are being (re)planned at once
+        // it can lose a compare-and-swap race or hit a transient storage error. Retry it a bounded
+        // number of times instead of faulting the source actor and restarting the whole pipeline.
+        // Every error is retried, not only the classified compare-and-swap conflicts: a transient
+        // storage error reaches this call as `Internal { cause: String }` and cannot be told apart
+        // from a permanent one. The retries are bounded and a permanent error still surfaces on the
+        // last attempt, with the usual error context.
+        let acquire_shards_response: AcquireShardsResponse = {
+            let mut acquire_attempt = 0;
+            loop {
+                acquire_attempt += 1;
+                match ctx
+                    .protect_future(
+                        self.metastore
+                            .acquire_shards(acquire_shards_request.clone()),
+                    )
+                    .await
+                {
+                    Ok(acquire_shards_response) => break Ok(acquire_shards_response),
+                    Err(error) if acquire_attempt < ACQUIRE_SHARDS_MAX_ATTEMPTS => {
+                        let transient = is_transient_metastore_conflict(&error);
+                        let retry_delay = Duration::from_secs(1 << (acquire_attempt - 1));
+                        warn!(
+                            %error,
+                            attempt = acquire_attempt,
+                            transient,
+                            retry_delay = ?retry_delay,
+                            "failed to acquire shards, retrying"
+                        );
+                        // `ctx.sleep` rather than `tokio::time::sleep`, like the publisher's retry:
+                        // it goes through the actor scheduler, so an actor that is already draining
+                        // is not held up by the wait.
+                        ctx.protect_future(ctx.sleep(retry_delay)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        }
+        .context("failed to acquire shards")?;
         self.publish_token.store(Some(Arc::new(publish_token)));
 
         if acquire_shards_response.acquired_shards.len() != shard_ids_to_acquire.len() {
@@ -656,7 +695,7 @@ mod tests {
     use std::iter::once;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use bytesize::ByteSize;
     use itertools::Itertools;
@@ -671,7 +710,9 @@ mod tests {
         FetchMessage, IngesterServiceClient, MockIngesterService, TruncateShardsResponse,
     };
     use quickwit_proto::ingest::{IngestV2Error, MRecordBatch, Shard, ShardState};
-    use quickwit_proto::metastore::{AcquireShardsResponse, MockMetastoreService};
+    use quickwit_proto::metastore::{
+        AcquireShardsResponse, EntityKind, MetastoreError, MockMetastoreService,
+    };
     use quickwit_proto::types::{DocMappingUid, IndexUid, PipelineUid};
     use quickwit_storage::StorageResolver;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -1063,6 +1104,119 @@ mod tests {
 
         // Wait for the truncate future to complete.
         time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Acquiring shards is a metastore *write*. On a metastore shared by several nodes it can lose a
+    // compare-and-swap race or hit a transient storage error; a single failure used to be fatal and
+    // restarted the whole pipeline. This test pins the bounded retry: the first attempt fails, the
+    // second one succeeds, and the source keeps its assignment instead of faulting.
+    //
+    // Negative control: set `ACQUIRE_SHARDS_MAX_ATTEMPTS` to 1 and this test fails, first on the
+    // `unwrap` of `assign_shards` and then on the unmet twice-call expectation of the mock.
+    #[tokio::test]
+    async fn test_ingest_source_retries_acquire_shards() {
+        let pipeline_id = IndexingPipelineId {
+            node_id: NodeId::from_str("test-node"),
+            index_uid: IndexUid::for_test("test-index", 0),
+            source_id: "test-source".to_string(),
+            pipeline_uid: PipelineUid::default(),
+        };
+        let source_config = SourceConfig::for_test("test-source", SourceParams::Ingest);
+        let publish_token = "indexer/test-node/test-index:0/test-source/\
+                             00000000000000000000000000/00000000000000000000000000";
+
+        let num_attempts = Arc::new(AtomicUsize::new(0));
+        let num_attempts_clone = num_attempts.clone();
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_acquire_shards()
+            .withf(|request| request.shard_ids == [ShardId::from(0)])
+            .times(2)
+            .returning(move |request| {
+                assert_eq!(request.index_uid(), &("test-index", 0));
+                assert_eq!(request.source_id, "test-source");
+                let attempt = num_attempts_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    // This is the error the metastore returns when this node lost the
+                    // compare-and-swap race on the index metadata.
+                    return Err(MetastoreError::FailedPrecondition {
+                        entity: EntityKind::Index {
+                            index_id: "test-index".to_string(),
+                        },
+                        message: "the index metadata was written by another node".to_string(),
+                    });
+                }
+                let response = AcquireShardsResponse {
+                    acquired_shards: vec![Shard {
+                        index_uid: Some(IndexUid::for_test("test-index", 0)),
+                        source_id: "test-source".to_string(),
+                        ingester_id: "test-ingester-0".to_string(),
+                        shard_id: Some(ShardId::from(0)),
+                        shard_state: ShardState::Open as i32,
+                        doc_mapping_uid: Some(DocMappingUid::default()),
+                        // The shard is already fully published: no ingester is needed to assert
+                        // that the assignment went through.
+                        publish_position_inclusive: Some(Position::eof(10u64)),
+                        publish_token: Some(publish_token.to_string()),
+                        update_timestamp: 1724158996,
+                    }],
+                };
+                Ok(response)
+            });
+
+        let source_runtime = SourceRuntime {
+            pipeline_id,
+            source_config,
+            metastore: MetastoreServiceClient::from_mock(mock_metastore),
+            ingester_pool: IngesterPool::default(),
+            queues_dir_path: PathBuf::from("./queues"),
+            storage_resolver: StorageResolver::for_test(),
+            event_broker: EventBroker::default(),
+            indexing_setting: IndexingSettings::default(),
+            publish_token: SharedPublishToken::default(),
+        };
+        let mut source = IngestSource::try_new(source_runtime, RetryParams::no_retries())
+            .await
+            .unwrap();
+
+        let universe = Universe::with_accelerated_time();
+        let (source_mailbox, _source_inbox) = universe.create_test_mailbox::<SourceActor>();
+        let (doc_processor_mailbox, _doc_processor_inbox) =
+            universe.create_test_mailbox::<DocProcessor>();
+        let source_sink = SourceSink::from(doc_processor_mailbox.clone());
+        let (observable_state_tx, _observable_state_rx) = watch::channel(serde_json::Value::Null);
+        let ctx: SourceContext =
+            ActorContext::for_test(&universe, source_mailbox, observable_state_tx);
+
+        let shard_ids: BTreeSet<ShardId> = once(0).map(ShardId::from).collect();
+        source
+            .assign_shards(
+                Assignment {
+                    shard_ids,
+                    indexing_plan_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                },
+                &source_sink,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            num_attempts.load(Ordering::SeqCst),
+            2,
+            "the transient acquire_shards failure must be retried exactly once"
+        );
+        assert_eq!(source.assigned_shards.len(), 1);
+        let assigned_shard = source.assigned_shards.get(&ShardId::from(0)).unwrap();
+        assert_eq!(assigned_shard.status, IndexingStatus::Complete);
+        assert_eq!(
+            assigned_shard.current_position_inclusive,
+            Position::eof(10u64)
+        );
+        assert_eq!(
+            source.publish_token.load_full().unwrap().as_str(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV-test-node"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ mod packager;
 #[cfg(feature = "metrics")]
 pub(crate) mod parquet_pipeline;
 pub(crate) mod pipeline_shared;
-mod publisher;
+pub(crate) mod publisher;
 mod sequencer;
 mod uploader;
 #[cfg(feature = "vrl")]
