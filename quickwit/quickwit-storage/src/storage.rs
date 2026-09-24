@@ -41,6 +41,13 @@ pub struct ObjectMetadata {
     pub size: ByteSize,
     /// Last modification time.
     pub last_modified: SystemTime,
+    /// Version of the listed object, when the backend reports one.
+    ///
+    /// This is the same opaque token [`Storage::put_if_version_matches`] expects, so a caller can
+    /// compare a listing against versions it recorded earlier to find out which objects changed,
+    /// without downloading any of them. Backends that do not report a version when listing (local
+    /// files, RAM) leave it `None`, and callers must then fall back to reading the object.
+    pub object_version: Option<ObjectVersion>,
 }
 
 /// Stream of object metadata batches returned by [`Storage::list`].

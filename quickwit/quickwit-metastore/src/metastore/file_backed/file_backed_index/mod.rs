@@ -19,7 +19,7 @@
 mod serialize;
 mod shards;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::ops::Bound;
 
@@ -108,6 +108,15 @@ pub(crate) struct FileBackedIndex {
     /// it possible to discard this entry if there is an error
     /// while mutating the Index.
     pub discarded: bool,
+    /// Splits this index has changed since it was loaded.
+    ///
+    /// Hidden contract: the sharded layout writes one object per slot of the split map, so it
+    /// needs to know which splits a mutation touched; rebuilding that by diffing the whole map
+    /// would cost as much as the write it is trying to avoid. Every method that mutates a
+    /// split must therefore record it here, and the store takes (and clears) the set when it
+    /// writes. The field is not serialized: it describes a mutation, not the index.
+    #[serde(skip)]
+    touched_split_ids: BTreeSet<SplitId>,
 }
 
 #[cfg(any(test, feature = "testsuite"))]
@@ -187,6 +196,7 @@ impl From<IndexMetadata> for FileBackedIndex {
             stamper: Default::default(),
             recently_modified: false,
             discarded: false,
+            touched_split_ids: BTreeSet::new(),
         }
     }
 }
@@ -253,6 +263,7 @@ impl FileBackedIndex {
             stamper: Stamper::new(last_opstamp),
             recently_modified: false,
             discarded: false,
+            touched_split_ids: BTreeSet::new(),
         }
     }
 
@@ -329,8 +340,42 @@ impl FileBackedIndex {
             publish_timestamp: None,
             split_metadata,
         };
-        self.splits.insert(split.split_id().clone(), split);
+        let split_id = split.split_id().clone();
+        self.splits.insert(split_id.clone(), split);
+        self.record_touched_split(&split_id);
         Ok(())
+    }
+
+    /// Records that a split changed, for the sharded layout to know which slot to rewrite.
+    fn record_touched_split(&mut self, split_id: &SplitId) {
+        self.touched_split_ids.insert(split_id.clone());
+    }
+
+    /// Takes the splits out of the index, leaving it with an empty split map.
+    ///
+    /// Hidden contract: the caller has to put them back before using the index again. The sharded
+    /// layout uses this to serialize the rest of the index without cloning every split.
+    pub(super) fn take_splits(&mut self) -> HashMap<SplitId, Split> {
+        std::mem::take(&mut self.splits)
+    }
+
+    pub(super) fn put_splits(&mut self, splits: HashMap<SplitId, Split>) {
+        self.splits = splits;
+    }
+
+    /// Whether the split map is empty. Used to check the hidden contract of [`Self::take_splits`].
+    pub(super) fn splits_is_empty(&self) -> bool {
+        self.splits.is_empty()
+    }
+
+    /// Takes the set of splits this index changed since it was loaded.
+    pub(super) fn take_touched_split_ids(&mut self) -> BTreeSet<SplitId> {
+        std::mem::take(&mut self.touched_split_ids)
+    }
+
+    /// Puts back a set of touched splits, for a caller that failed before writing them.
+    pub(super) fn put_touched_split_ids(&mut self, touched_split_ids: BTreeSet<SplitId>) {
+        self.touched_split_ids = touched_split_ids;
     }
 
     /// Marks the splits for deletion. Returns whether a mutation occurred.
@@ -365,6 +410,7 @@ impl FileBackedIndex {
             }
             metadata.split_state = SplitState::MarkedForDeletion;
             metadata.update_timestamp = now_timestamp;
+            self.touched_split_ids.insert(SplitId::from(split_id_ref));
             mutation_occurred = true;
         }
         if !split_not_found_ids.is_empty() {
@@ -413,6 +459,8 @@ impl FileBackedIndex {
                 metadata.split_state = SplitState::Published;
                 metadata.update_timestamp = now_timestamp;
                 metadata.publish_timestamp = Some(now_timestamp);
+                self.touched_split_ids
+                    .insert(SplitId::from(staged_split_id_ref));
             } else {
                 split_not_staged_ids.push(staged_split_id_ref.to_string());
             }
@@ -516,6 +564,7 @@ impl FileBackedIndex {
         match self.splits.get(split_id).map(|split| split.split_state) {
             Some(SplitState::MarkedForDeletion) => {
                 self.splits.remove(split_id);
+                self.touched_split_ids.insert(SplitId::from(split_id));
                 DeleteSplitOutcome::Success
             }
             Some(SplitState::Staged | SplitState::Published) => DeleteSplitOutcome::Forbidden,
@@ -661,6 +710,7 @@ impl FileBackedIndex {
                 })
             })?;
             split.split_metadata.delete_opstamp = delete_opstamp;
+            self.touched_split_ids.insert(SplitId::from(*split_id));
         }
         Ok(true)
     }

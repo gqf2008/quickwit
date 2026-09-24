@@ -23,6 +23,7 @@ mod index_template_matcher;
 mod lazy_file_backed_index;
 pub(crate) mod manifest;
 mod metrics;
+mod sharded_layout;
 mod state;
 mod store_operations;
 
@@ -81,15 +82,32 @@ use self::manifest::{
     MANIFEST_FILE_NAME, load_manifest_with_version, load_or_create_manifest, save_manifest,
     save_manifest_if_version_matches,
 };
+use self::sharded_layout::DEFAULT_NUM_SLOTS;
 use self::state::MetastoreState;
+pub use self::store_operations::IndexLayout;
 use self::store_operations::{
-    delete_index, index_exists, load_index, load_index_with_version, put_index,
-    put_index_if_absent, put_index_if_version_matches,
+    create_index_file, delete_index, index_exists, load_index, load_index_with_version, put_index,
+    put_index_if_version_matches,
 };
 
 /// Environment variable that lets an operator run a metastore on a storage that ignores conditional
 /// writes. The metastore then falls back to single-writer mode instead of refusing to start.
 pub const ALLOW_UNSAFE_STORAGE_ENV_KEY: &str = "QW_METASTORE_ALLOW_UNSAFE_STORAGE";
+
+/// Environment variable that makes this node create indexes in the sharded split layout.
+///
+/// The layout is opt-in per node and per index: a node reads whichever layout an index was created
+/// with (`<index_id>/metastore.json` or `<index_id>/v2/root.json`), and this variable only decides
+/// what *new* indexes are created with. See
+/// [`sharded_layout`](crate::metastore::file_backed::sharded_layout).
+pub const SHARDED_LAYOUT_ENV_KEY: &str = "QW_METASTORE_SHARDED_LAYOUT";
+
+/// Environment variable that makes the metastore test suite run on the sharded layout.
+///
+/// The suite is generic over the metastore implementation, so the layout cannot be a type parameter
+/// without a wrapper for every method. Running the same suite twice, once with this variable set,
+/// gives the sharded layout the same coverage as the historical one.
+pub const SHARDED_LAYOUT_TEST_ENV_KEY: &str = "QW_METASTORE_TEST_SHARDED_LAYOUT";
 
 /// Number of times a mutation is replayed before the metastore gives up on a compare-and-swap race.
 ///
@@ -230,6 +248,8 @@ pub struct FileBackedMetastore {
     /// single-node, because claiming to share without conditional writes would turn a lost
     /// update into a silent one.
     distributed: bool,
+    /// Layout new indexes are created with. See [`IndexLayout`].
+    index_layout: IndexLayout,
 }
 
 impl fmt::Debug for FileBackedMetastore {
@@ -250,6 +270,7 @@ impl FileBackedMetastore {
             storage,
             polling_interval_opt: None,
             distributed: false,
+            index_layout: IndexLayout::SingleObject,
         }
     }
 
@@ -264,6 +285,19 @@ impl FileBackedMetastore {
     /// compare-and-swap path against in-memory storage.
     pub fn set_distributed(&mut self, distributed: bool) {
         self.distributed = distributed;
+    }
+
+    /// Returns the layout new indexes are created with.
+    pub fn index_layout(&self) -> IndexLayout {
+        self.index_layout
+    }
+
+    /// Sets the layout new indexes are created with.
+    ///
+    /// Production code reads it once from [`SHARDED_LAYOUT_ENV_KEY`]; tests use it to exercise both
+    /// layouts against the same in-memory storage.
+    pub fn set_index_layout(&mut self, index_layout: IndexLayout) {
+        self.index_layout = index_layout;
     }
 
     /// Sets the polling interval.
@@ -392,11 +426,32 @@ impl FileBackedMetastore {
                 "file-backed metastore is single-node; metadata writes assume one writer"
             );
         }
+        // The sharded layout is built on conditional writes, so it only makes sense where the
+        // distributed path runs; asking for it on a storage that cannot compare-and-swap would
+        // publish indexes this node cannot write back.
+        let index_layout = if quickwit_common::get_bool_from_env(SHARDED_LAYOUT_ENV_KEY, false) {
+            if !distributed {
+                return Err(MetastoreError::Internal {
+                    message: "the sharded metastore layout requires conditional writes".to_string(),
+                    cause: format!(
+                        "{SHARDED_LAYOUT_ENV_KEY}=true but `{}` does not support the \
+                         compare-and-swap this layout is built on",
+                        storage.uri()
+                    ),
+                });
+            }
+            IndexLayout::Sharded {
+                num_slots: DEFAULT_NUM_SLOTS,
+            }
+        } else {
+            IndexLayout::SingleObject
+        };
         let metastore = Self {
             state: Arc::new(RwLock::new(state)),
             storage,
             polling_interval_opt,
             distributed,
+            index_layout,
         };
         Ok(metastore)
     }
@@ -496,7 +551,7 @@ impl FileBackedMetastore {
                     return Ok(value);
                 }
             };
-            match put_index_if_version_matches(&*self.storage, &index, &version).await {
+            match put_index_if_version_matches(&*self.storage, &mut index, &version).await {
                 Ok(_) => {
                     self.replace_cached_index(index_id, index).await;
                     return Ok(value);
@@ -1042,7 +1097,7 @@ impl MetastoreService for FileBackedMetastore {
             if !self.distributed {
                 put_index(&*self.storage, &index).await?;
             } else if index_file_needs_to_be_written {
-                match put_index_if_absent(&*self.storage, &index).await {
+                match create_index_file(&*self.storage, &index, self.index_layout).await {
                     Ok(_) => {}
                     Err(MetastoreError::AlreadyExists(_))
                     | Err(MetastoreError::FailedPrecondition { .. }) => {
@@ -2218,9 +2273,17 @@ async fn get_index_metadata(
 impl crate::tests::DefaultForTest for FileBackedMetastore {
     async fn default_for_test() -> Self {
         use quickwit_storage::RamStorage;
-        FileBackedMetastore::try_new(Arc::new(RamStorage::default()), None)
+        let mut metastore = FileBackedMetastore::try_new(Arc::new(RamStorage::default()), None)
             .await
-            .unwrap()
+            .unwrap();
+        // The whole metastore test suite is run twice: once on the historical layout and once, with
+        // this environment variable set, on the sharded one. The layout of an index is recorded in
+        // the objects themselves, so the same tests can exercise both without knowing about it.
+        if quickwit_common::get_bool_from_env(SHARDED_LAYOUT_TEST_ENV_KEY, false) {
+            metastore.set_distributed(true);
+            metastore.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
+        }
+        metastore
     }
 }
 
@@ -2278,6 +2341,52 @@ mod tests {
     }
 
     metastore_test_suite!(crate::FileBackedMetastore);
+
+    // Hook of the layout itself: the suite above runs on whichever layout the environment selects,
+    // so this test pins that the selection actually reaches the storage.
+    #[tokio::test]
+    async fn test_sharded_layout_is_used_when_configured() {
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::Sharded { num_slots: 4 });
+
+        let index_id = "test-sharded-layout";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let create_index_request =
+            CreateIndexRequest::try_from_index_config(&index_config).unwrap();
+        let index_uid = metastore
+            .create_index(create_index_request)
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+
+        assert!(
+            storage
+                .exists(Path::new("test-sharded-layout/v2/root.json"))
+                .await
+                .unwrap(),
+            "the index should have been created in the sharded layout"
+        );
+        assert!(
+            !storage
+                .exists(Path::new("test-sharded-layout/metastore.json"))
+                .await
+                .unwrap(),
+            "the sharded layout must not also write the single metadata file"
+        );
+        assert!(metastore.index_exists(index_id).await.unwrap());
+        metastore
+            .delete_index(DeleteIndexRequest {
+                index_uid: Some(index_uid),
+            })
+            .await
+            .unwrap();
+        assert!(!metastore.index_exists(index_id).await.unwrap());
+    }
 
     #[tokio::test]
     async fn test_metastore_connectivity_and_endpoints() {

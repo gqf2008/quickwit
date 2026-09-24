@@ -29,7 +29,7 @@
 #![cfg(feature = "ci-test")]
 
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ use quickwit_config::{
     IndexConfig, S3StorageConfig, StorageBackendFlavor, StorageConfig, StorageConfigs,
 };
 use quickwit_metastore::{
-    CreateIndexRequestExt, FileBackedMetastore, ListSplitsQuery, ListSplitsRequestExt,
+    CreateIndexRequestExt, FileBackedMetastore, IndexLayout, ListSplitsQuery, ListSplitsRequestExt,
     MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState, StageSplitsRequestExt,
 };
 use quickwit_proto::metastore::{
@@ -317,5 +317,88 @@ async fn test_shared_metastore_either_shares_safely_or_refuses_to_start() -> any
             index_uid: Some(index_uid),
         })
         .await?;
+    Ok(())
+}
+
+/// The sharded layout on a real endpoint: two nodes publish, both keep their splits, and the index
+/// lives in the objects the layout describes (and nowhere else).
+///
+/// The write amplification itself is measured in `sharded_layout.rs`, where it does not need a
+/// network round trip per metadata write to be visible.
+#[tokio::test]
+async fn test_sharded_layout_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!("skipping test_sharded_layout_on_s3_endpoint: QW_S3_ENDPOINT is not set");
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/sharded-layout", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let mut metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    metastore_a.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
+    let metastore_b = {
+        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+        metastore.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
+        metastore
+    };
+    // A node that was not told about the layout still reads the index: the layout is recorded in
+    // the objects, not in the configuration.
+    let metastore_c = FileBackedMetastore::try_new(storage.clone(), None).await?;
+
+    let index_id = append_random_suffix("sharded-layout-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid: IndexUid = metastore_a
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    let root_path = PathBuf::from(&index_id).join("v2/root.json");
+    assert!(
+        storage.exists(&root_path).await?,
+        "the index should live in the sharded layout"
+    );
+    assert!(
+        !storage
+            .exists(&PathBuf::from(&index_id).join("metastore.json"))
+            .await?,
+        "the sharded layout must not also write the single metadata file"
+    );
+
+    // Both nodes publish into the same index. They touch the same slot on purpose: the layout is
+    // only worth having if a lost slot race is retried rather than lost.
+    stage_and_publish_split(&metastore_a, &index_uid, "sharded-a-0").await?;
+    stage_and_publish_split(&metastore_b, &index_uid, "sharded-b-0").await?;
+    stage_and_publish_split(&metastore_c, &index_uid, "sharded-c-0").await?;
+
+    assert_eq!(
+        list_published_split_ids(&metastore_c, &index_uid).await?,
+        vec![
+            "sharded-a-0".to_string(),
+            "sharded-b-0".to_string(),
+            "sharded-c-0".to_string()
+        ],
+        "every node's splits must survive, whichever layout the index uses"
+    );
+
+    // The slot files and the view are there, and a split publish did not rewrite the root.
+    let (_, root_version) = storage.get_all_with_version(&root_path).await?;
+    let root_version = root_version.context("the root should be a versioned object")?;
+    stage_and_publish_split(&metastore_a, &index_uid, "sharded-a-1").await?;
+    let (_, root_version_after) = storage.get_all_with_version(&root_path).await?;
+    assert_eq!(
+        root_version,
+        root_version_after.context("the root should still be a versioned object")?,
+        "publishing a split must not rewrite the shared root object"
+    );
+
+    metastore_a
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    assert!(
+        !storage.exists(&root_path).await?,
+        "deleting the index should remove its sharded objects"
+    );
     Ok(())
 }

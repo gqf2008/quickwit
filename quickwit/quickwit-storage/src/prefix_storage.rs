@@ -281,6 +281,7 @@ mod tests {
                 path: PathBuf::from("ram:///indexes/splits/foo.split"),
                 size: bytesize::ByteSize(11),
                 last_modified: SystemTime::UNIX_EPOCH,
+                object_version: None,
             }];
             stream::once(async move { Ok(objects) }).boxed()
         });
@@ -311,11 +312,13 @@ mod tests {
                     path: PathBuf::from("ram:///indexes/foo.split"),
                     size: bytesize::ByteSize(11),
                     last_modified: SystemTime::UNIX_EPOCH,
+                    object_version: None,
                 },
                 ObjectMetadata {
                     path: PathBuf::from("ram:///indexes-old/unrelated.split"),
                     size: bytesize::ByteSize(13),
                     last_modified: SystemTime::UNIX_EPOCH,
+                    object_version: None,
                 },
             ];
             stream::once(async move { Ok(objects) }).boxed()
@@ -342,6 +345,7 @@ mod tests {
                 path: PathBuf::from("ram:///unrelated/foo.split"),
                 size: bytesize::ByteSize(11),
                 last_modified: SystemTime::UNIX_EPOCH,
+                object_version: None,
             }];
             stream::once(async move { Ok(objects) }).boxed()
         });

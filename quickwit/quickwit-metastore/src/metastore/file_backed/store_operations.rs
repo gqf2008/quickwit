@@ -18,6 +18,10 @@ use quickwit_proto::metastore::{EntityKind, MetastoreError, MetastoreResult, ser
 use quickwit_storage::{ObjectVersion, Storage, StorageError, StorageErrorKind};
 
 use crate::metastore::file_backed::file_backed_index::FileBackedIndex;
+use crate::metastore::file_backed::sharded_layout::{
+    SLOT_FOLD_THRESHOLD as DEFAULT_FOLD_THRESHOLD, ShardedWriteContext, create_sharded_index,
+    delete_sharded_index, load_sharded_index, sharded_index_exists, store_sharded_index,
+};
 
 /// Index metastore file managed by [`FileBackedMetastore`](crate::FileBackedMetastore).
 pub(super) const METASTORE_FILE_NAME: &str = "metastore.json";
@@ -27,7 +31,7 @@ pub(super) fn metastore_filepath(index_id: &str) -> PathBuf {
     Path::new(index_id).join(METASTORE_FILE_NAME)
 }
 
-fn convert_error(index_id: &str, storage_error: StorageError) -> MetastoreError {
+pub(super) fn convert_error(index_id: &str, storage_error: StorageError) -> MetastoreError {
     match storage_error.kind() {
         StorageErrorKind::NotFound => MetastoreError::NotFound(EntityKind::Index {
             index_id: index_id.to_string(),
@@ -60,21 +64,67 @@ fn convert_error(index_id: &str, storage_error: StorageError) -> MetastoreError 
     }
 }
 
-/// Loads an index together with the version a conditional write has to match.
+/// Where an index lives on the storage.
 ///
-/// Hidden contract: the returned version is only meaningful for the exact bytes returned here. It
-/// is `None` on backends that cannot version an object, and callers that intend to compare-and-swap
-/// must treat that as "unsupported" instead of falling back to an unconditional write.
+/// An index either lives in the historical single object (`<index_id>/metastore.json`) or in the
+/// sharded layout, which keeps the splits in one object per slot. The layout is recorded by the
+/// objects themselves, so a node reads either one; the layout below only decides what a *new* index
+/// is created with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexLayout {
+    /// Historical layout: the whole index, splits included, lives in `<index_id>/metastore.json`.
+    SingleObject,
+    /// Splits are spread over `num_slots` objects, one per hash slot of the split id.
+    Sharded {
+        /// Number of slots the split map is spread over.
+        num_slots: u32,
+    },
+}
+
+/// Version of an index, in whichever layout it lives.
+#[derive(Debug)]
+pub(super) enum IndexVersion {
+    SingleObject(ObjectVersion),
+    /// Carries what the sharded layout needs to write the index back without re-reading it.
+    Sharded(Box<ShardedWriteContext>),
+}
+
 pub(super) async fn load_index_with_version(
     storage: &dyn Storage,
     index_id: &str,
-) -> MetastoreResult<(FileBackedIndex, Option<ObjectVersion>)> {
+) -> MetastoreResult<(FileBackedIndex, Option<IndexVersion>)> {
+    load_index_state(storage, index_id).await
+}
+
+/// Loads an index and, when the storage versions objects, the version to compare-and-swap against.
+pub(super) async fn load_index_state(
+    storage: &dyn Storage,
+    index_id: &str,
+) -> MetastoreResult<(FileBackedIndex, Option<IndexVersion>)> {
     let metastore_filepath = metastore_filepath(index_id);
 
-    let (content, version) = storage
-        .get_all_with_version(&metastore_filepath)
-        .await
-        .map_err(|storage_err| convert_error(index_id, storage_err))?;
+    let (content, version) = match storage.get_all_with_version(&metastore_filepath).await {
+        Ok((content, version)) => (content, version),
+        Err(storage_error) if storage_error.kind() == StorageErrorKind::NotFound => {
+            // The index may live in the sharded layout instead. Asking the storage is what keeps a
+            // node able to read an index another node created in a layout it did not configure.
+            if sharded_index_exists(storage, index_id).await? {
+                let (index, context) = load_sharded_index(storage, index_id).await?;
+                if index.index_id() != index_id {
+                    return Err(MetastoreError::Internal {
+                        message: "inconsistent manifest: index_id mismatch".to_string(),
+                        cause: format!(
+                            "expected index_id `{index_id}`, but found `{}`",
+                            index.index_id()
+                        ),
+                    });
+                }
+                return Ok((index, Some(IndexVersion::Sharded(Box::new(context)))));
+            }
+            return Err(convert_error(index_id, storage_error));
+        }
+        Err(storage_error) => return Err(convert_error(index_id, storage_error)),
+    };
 
     let index: FileBackedIndex = serde_utils::from_json_bytes(&content)?;
 
@@ -88,7 +138,7 @@ pub(super) async fn load_index_with_version(
             ),
         });
     }
-    Ok((index, version))
+    Ok((index, version.map(IndexVersion::SingleObject)))
 }
 
 /// Writes the index metadata back, but only if it still has `version` (compare-and-swap).
@@ -97,9 +147,16 @@ pub(super) async fn load_index_with_version(
 /// caller is expected to reload the index and replay its mutation.
 pub(super) async fn put_index_if_version_matches(
     storage: &dyn Storage,
-    index: &FileBackedIndex,
-    version: &ObjectVersion,
+    index: &mut FileBackedIndex,
+    version: &IndexVersion,
 ) -> MetastoreResult<Option<ObjectVersion>> {
+    if let IndexVersion::Sharded(context) = version {
+        store_sharded_index(storage, index, context).await?;
+        return Ok(None);
+    }
+    let IndexVersion::SingleObject(version) = version else {
+        unreachable!("handled above");
+    };
     let index_id = index.index_id();
     let content: Vec<u8> = serde_utils::to_json_bytes_pretty(index)?;
     let metastore_filepath = metastore_filepath(index_id);
@@ -107,6 +164,24 @@ pub(super) async fn put_index_if_version_matches(
         .put_if_version_matches(&metastore_filepath, Box::new(content), version)
         .await
         .map_err(|storage_err| convert_error(index_id, storage_err))
+}
+
+/// Creates the index metadata file, failing if it already exists.
+///
+/// Used by `create_index` in distributed mode: two nodes racing to create the same index must not
+/// be able to overwrite each other's metadata, and the loser has to observe the winner's metadata.
+pub(super) async fn create_index_file(
+    storage: &dyn Storage,
+    index: &FileBackedIndex,
+    layout: IndexLayout,
+) -> MetastoreResult<Option<ObjectVersion>> {
+    match layout {
+        IndexLayout::SingleObject => put_index_if_absent(storage, index).await,
+        IndexLayout::Sharded { num_slots } => {
+            create_sharded_index(storage, index, num_slots, DEFAULT_FOLD_THRESHOLD).await?;
+            Ok(None)
+        }
+    }
 }
 
 /// Creates the index metadata file, failing if it already exists.
@@ -132,11 +207,17 @@ pub(super) async fn load_index(
 ) -> MetastoreResult<FileBackedIndex> {
     let metastore_filepath = metastore_filepath(index_id);
 
-    let content = storage
-        .get_all(&metastore_filepath)
-        .await
-        .map_err(|storage_err| convert_error(index_id, storage_err))?;
-
+    let content = match storage.get_all(&metastore_filepath).await {
+        Ok(content) => content,
+        Err(storage_error) if storage_error.kind() == StorageErrorKind::NotFound => {
+            if sharded_index_exists(storage, index_id).await? {
+                let (index, _) = load_sharded_index(storage, index_id).await?;
+                return Ok(index);
+            }
+            return Err(convert_error(index_id, storage_error));
+        }
+        Err(storage_error) => return Err(convert_error(index_id, storage_error)),
+    };
     let index: FileBackedIndex = serde_utils::from_json_bytes(&content)?;
 
     if index.index_id() != index_id {
@@ -158,7 +239,10 @@ pub(super) async fn index_exists(storage: &dyn Storage, index_id: &str) -> Metas
         .exists(&metastore_filepath)
         .await
         .map_err(|storage_error| convert_error(index_id, storage_error))?;
-    Ok(exists)
+    if exists {
+        return Ok(true);
+    }
+    sharded_index_exists(storage, index_id).await
 }
 
 /// Serializes the `Index` object and stores the data on the storage.
@@ -199,6 +283,11 @@ pub(super) async fn delete_index(storage: &dyn Storage, index_id: &str) -> Metas
         .map_err(|storage_err| convert_error(index_id, storage_err))?;
 
     if !file_exists {
+        // An index created in the sharded layout has no single metadata file: it is spread over a
+        // root, a view, the slot files and the segments.
+        if sharded_index_exists(storage, index_id).await? {
+            return delete_sharded_index(storage, index_id).await;
+        }
         return Err(MetastoreError::NotFound(EntityKind::Index {
             index_id: index_id.to_string(),
         }));

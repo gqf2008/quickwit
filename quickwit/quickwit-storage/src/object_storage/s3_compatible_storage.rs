@@ -1323,6 +1323,9 @@ fn convert_list_objects(
             path: relative_path,
             size: ByteSize(size_bytes),
             last_modified,
+            // S3-compatible stores always return an ETag in list responses; keeping it lets a
+            // caller detect which objects changed without fetching them.
+            object_version: object.e_tag().map(crate::ObjectVersion::new),
         });
     }
     Ok(object_metadata)

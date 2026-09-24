@@ -19,8 +19,11 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
+use bytesize::ByteSize;
+use futures::{StreamExt, stream};
 use quickwit_common::uri::{Protocol, Uri};
 use quickwit_config::StorageBackend;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -29,8 +32,8 @@ use tokio::sync::RwLock;
 use crate::prefix_storage::add_prefix_to_storage;
 use crate::storage::SendableAsync;
 use crate::{
-    BulkDeleteError, ObjectVersion, OwnedBytes, Storage, StorageErrorKind, StorageFactory,
-    StorageResolverError, StorageResult,
+    BulkDeleteError, ListObjectsStream, ObjectMetadata, ObjectVersion, OwnedBytes, Storage,
+    StorageErrorKind, StorageFactory, StorageResolverError, StorageResult,
 };
 
 /// A single object held by the [`RamStorage`], with the version conditional writes compare
@@ -246,6 +249,30 @@ impl Storage for RamStorage {
                 .with_error(anyhow::anyhow!("failed to find dest_path {:?}", path))
         })?;
         Ok(payload_bytes)
+    }
+
+    /// Lists the objects under `prefix`.
+    ///
+    /// The object version is the internal write counter, so a listing tells a caller which objects
+    /// changed since it last looked at them, like an ETag would on object storage.
+    fn list(&self, prefix: &Path) -> ListObjectsStream {
+        let prefix = prefix.to_path_buf();
+        let files = self.files.clone();
+        stream::once(async move {
+            let files = files.read().await;
+            let objects = files
+                .iter()
+                .filter(|(path, _)| path.starts_with(&prefix))
+                .map(|(path, object)| ObjectMetadata {
+                    path: path.clone(),
+                    size: ByteSize(object.data.len() as u64),
+                    last_modified: SystemTime::UNIX_EPOCH,
+                    object_version: Some(ObjectVersion::new(object.version.to_string())),
+                })
+                .collect();
+            Ok(objects)
+        })
+        .boxed()
     }
 
     fn uri(&self) -> &Uri {
