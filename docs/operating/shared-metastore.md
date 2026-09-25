@@ -170,3 +170,12 @@ Choosing PostgreSQL is not free — it is another component to run, back up and 
 scale it is a single point of failure unless it is itself made highly available. What the numbers
 above say is narrower and firmer: an index whose metadata no longer fits the object-storage
 metastore's whole-index model needs the query-and-row model, and PostgreSQL already implements it.
+
+Sizing it from the same measurement: 1 M splits took 1.5 GB of table *and* indexes, so the 15 M
+splits of that 30-day index are ~23 GB in the database — plan storage for the metadata of every index
+you keep, and prefer retention (or one index per period) over a single index that lives forever.
+Throughput is not the constraint: the index above accepted splits at ~18 000/s in batches, needs
+5.8 publishes/s at 5·10¹² documents/day, and a single publish takes 8 ms, so one connection has
+orders of magnitude of headroom. Watch the connection count instead: every node holds
+`max_connections` connections (`metastore.postgresql` in the node config), so a large cluster wants
+its `max_connections` per node kept small or a pooler in front.
