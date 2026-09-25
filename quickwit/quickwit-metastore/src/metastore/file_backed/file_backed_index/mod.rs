@@ -444,9 +444,19 @@ impl FileBackedIndex {
 
     /// Helper to mark a list of splits as published.
     /// This function however does not update the checkpoint.
+    /// Marks splits as published.
+    ///
+    /// `tolerate_already_published` exists for exactly one caller: a mutation replayed after a
+    /// partial commit (the manifest layout commits one stripe at a time, so a mutation can have
+    /// published some of its splits before it lost the compare-and-swap of another). On a replay
+    /// those splits *are* published, and the publication already happened — refusing here would
+    /// fail an RPC whose work is done. It does not weaken the rule: publishing a split that was
+    /// never staged is still an error, because such a split is not `Published` in the replay's
+    /// snapshot.
     fn mark_splits_as_published_helper(
         &mut self,
         staged_split_ids: impl IntoIterator<Item = impl AsRef<str>>,
+        tolerate_already_published: bool,
     ) -> MetastoreResult<()> {
         let mut split_not_found_ids = Vec::new();
         let mut split_not_staged_ids = Vec::new();
@@ -464,6 +474,11 @@ impl FileBackedIndex {
                 metadata.split_state = SplitState::Published;
                 metadata.update_timestamp = now_timestamp;
                 metadata.publish_timestamp = Some(now_timestamp);
+                self.touched_split_ids
+                    .insert(SplitId::from(staged_split_id_ref));
+            } else if tolerate_already_published && metadata.split_state == SplitState::Published {
+                // Already published by the attempt that got partway through: publishing it again is
+                // what the replay does, and the op it publishes is the same value.
                 self.touched_split_ids
                     .insert(SplitId::from(staged_split_id_ref));
             } else {
@@ -486,12 +501,19 @@ impl FileBackedIndex {
     }
 
     /// Publishes splits.
-    pub(crate) fn publish_splits(
+    /// Publishes splits.
+    ///
+    /// `tolerate_already_published` is passed by the manifest layout, which commits one stripe at a
+    /// time and therefore can replay a mutation whose publication already partly happened; the
+    /// other layouts pass `false`, because their mutation sees the whole index in one
+    /// compare-and-swap.
+    pub(crate) fn publish_splits_with_retry_tolerance(
         &mut self,
         staged_split_ids: impl IntoIterator<Item = impl AsRef<str>>,
         replaced_split_ids: impl IntoIterator<Item = impl AsRef<str>>,
         checkpoint_delta_opt: Option<IndexCheckpointDelta>,
         publish_token_opt: Option<PublishToken>,
+        tolerate_already_published: bool,
     ) -> MetastoreResult<()> {
         if let Some(checkpoint_delta) = checkpoint_delta_opt {
             let source_id = checkpoint_delta.source_id.clone();
@@ -529,7 +551,7 @@ impl FileBackedIndex {
                     })?;
             }
         }
-        self.mark_splits_as_published_helper(staged_split_ids)?;
+        self.mark_splits_as_published_helper(staged_split_ids, tolerate_already_published)?;
         self.mark_splits_for_deletion(replaced_split_ids, &[SplitState::Published], true)?;
         Ok(())
     }

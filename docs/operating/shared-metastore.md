@@ -250,3 +250,9 @@ says. The measurement is opt-in: `QW_TEST_S3_MEASURE=1 cargo test -p quickwit-me
 The layout is opt-in per node and recorded in the objects, so a node reads an index whichever layout
 created it, and `QW_METASTORE_TEST_MANIFEST_LAYOUT=true` runs the shared metastore suite on it locally
 (CI runs it next to the other two).
+
+Where its pruning pays off, and where it does not: the win comes from the query's *time* window, so an
+index whose splits carry time ranges benefits in proportion to how narrow the queries are. Splits
+without a time range belong to no bucket and are fetched by every query (the metastore's own predicate
+returns them for every window), so an index of untimed splits gets this layout's write path and its
+parallel reads, but none of its read pruning.

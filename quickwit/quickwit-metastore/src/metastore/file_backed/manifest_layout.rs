@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use futures::TryStreamExt;
 use quickwit_proto::metastore::{MetastoreError, MetastoreResult, serde_utils};
 use quickwit_proto::types::SplitId;
-use quickwit_storage::{ObjectVersion, OwnedBytes, Storage};
+use quickwit_storage::{ObjectVersion, OwnedBytes, Storage, StorageErrorKind};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
@@ -68,6 +68,30 @@ pub(crate) const MANIFEST_LAYOUT_FORMAT_VERSION: u32 = 1;
 
 /// Generations of segments kept after a fold, so a reader that lost a race can still finish.
 const SEGMENT_GRACE_GENERATIONS: u64 = 2;
+
+/// Test-only way to make a stripe's manifest commit fail once, so a test can build the state a
+/// replay faces: part of a mutation committed, the rest not.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Mutex;
+
+    static FAIL_NEXT_COMMIT_FOR_STRIPE: Mutex<Option<usize>> = Mutex::new(None);
+
+    /// Fails the next manifest commit of `stripe`, once.
+    pub(crate) fn fail_next_commit_for_stripe(stripe: usize) {
+        *FAIL_NEXT_COMMIT_FOR_STRIPE.lock().unwrap() = Some(stripe);
+    }
+
+    pub(super) fn take_failure_for(stripe: usize) -> bool {
+        let mut guard = FAIL_NEXT_COMMIT_FOR_STRIPE.lock().unwrap();
+        if *guard == Some(stripe) {
+            *guard = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Bucket of the splits that carry no time range. A time window never prunes it away.
 const UNTIMED_BUCKET: i64 = i64::MIN;
@@ -132,6 +156,14 @@ struct StripeManifest {
     format_version: u32,
     /// Commit counter of this stripe; bumped by every compare-and-swap.
     epoch: u64,
+    /// Fold counter of this stripe; bumped by every fold.
+    ///
+    /// Segments and WAL objects are named after *this* and not after `epoch`: the grace that keeps
+    /// them alive for a reader is a number of folds, and one commit is not a useful unit for it
+    /// (at 11.6 writes/s two commits are a sixth of a second, while a reader a bucket away
+    /// needs seconds to fetch what a manifest names).
+    #[serde(default)]
+    fold_generation: u64,
     /// Segment currently serving each time bucket.
     segments: BTreeMap<i64, SegmentRef>,
     /// WAL objects not yet folded into segments.
@@ -148,6 +180,7 @@ impl StripeManifest {
         Self {
             format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
             epoch: 0,
+            fold_generation: 0,
             segments: BTreeMap::new(),
             wal: Vec::new(),
             wal_ops: 0,
@@ -286,10 +319,16 @@ impl ManifestLayout {
         futures::future::try_join_all((0..self.num_stripes).map(|stripe| {
             let body = body.clone();
             async move {
-                storage
+                match storage
                     .put_if_absent(&self.manifest_path(stripe), Box::new(body))
                     .await
-                    .map_err(|error| map_storage_error(&self.index_id, error))
+                {
+                    Ok(_) => Ok(()),
+                    // An existing manifest is this node's own from an interrupted create: the
+                    // content is fixed, so it is the same object.
+                    Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => Ok(()),
+                    Err(error) => Err(map_storage_error(&self.index_id, error)),
+                }
             }
         }))
         .await?;
@@ -319,13 +358,17 @@ impl ManifestLayout {
             index: index_without_splits,
         };
         let root_bytes = serde_utils::to_json_bytes_pretty(&root)?;
-        let create_result = storage
-            .put_if_absent(&self.root_path(), Box::new(root_bytes))
-            .await;
         let mut restore_splits = root.index;
         restore_splits.put_splits(splits);
-        create_result.map_err(|error| map_storage_error(&self.index_id, error))?;
-        self.create(storage).await
+        // Manifests first, root last: the root is what makes the index exist, so an interrupted
+        // create leaves a state a retry can finish instead of an index that exists but cannot be
+        // read.
+        self.create(storage).await?;
+        storage
+            .put_if_absent(&self.root_path(), Box::new(root_bytes))
+            .await
+            .map_err(|error| map_storage_error(&self.index_id, error))?;
+        Ok(())
     }
 
     /// Reads the root: the index without its splits, with the version to compare-and-swap against.
@@ -580,6 +623,15 @@ impl ManifestLayout {
         );
         manifest.wal_ops += num_ops;
         manifest.epoch += 1;
+        #[cfg(test)]
+        if test_hooks::take_failure_for(stripe) {
+            return Err(MetastoreError::FailedPrecondition {
+                entity: quickwit_proto::metastore::EntityKind::Index {
+                    index_id: self.index_id.clone(),
+                },
+                message: "injected manifest commit conflict".to_string(),
+            });
+        }
         storage
             .put_if_version_matches(
                 &self.manifest_path(stripe),
@@ -610,6 +662,8 @@ impl ManifestLayout {
             return Ok(false);
         }
         let mut per_bucket: BTreeMap<i64, Vec<SplitOp>> = BTreeMap::new();
+        // Segments already read while placing removals, so a fold does not read the same one twice.
+        let mut read_segments: BTreeMap<i64, Vec<Split>> = BTreeMap::new();
         for wal_key in manifest.wal.clone() {
             let bytes = storage
                 .get_all(Path::new(&wal_key))
@@ -619,28 +673,46 @@ impl ManifestLayout {
             for op in wal.ops {
                 let bucket = match &op.split {
                     Some(split) => self.bucket_of(split),
-                    // A removal has to go to the bucket of the split it removes; find it below by
-                    // looking the id up in the buckets this fold already knows about. Splits whose
-                    // bucket is unknown are dropped here and can only come from a segment written
-                    // by another stripe, which the id cannot be in (the stripe is a function of the
-                    // id), so this is a corrupt-state error rather than a routine case.
-                    None => match self.bucket_of_split_id(&per_bucket, &op.split_id) {
-                        Some(bucket) => bucket,
-                        None => {
-                            return Err(internal(
-                                "a removal refers to a split this fold cannot place",
-                                format!("split `{}`", op.split_id),
-                            ));
+                    // A removal goes to the bucket holding the split it removes. That split is
+                    // usually older than this fold's WAL tail — deleting a split a merge replaced,
+                    // after it was folded into a segment, is the routine path — so the tail is only
+                    // the first place to look; the segments of this stripe are the second. Both
+                    // places are on the split's own stripe, because the stripe is a function of the
+                    // id. A removal that is in neither is a corrupt state.
+                    None => {
+                        let mut bucket = self.bucket_of_split_id(&per_bucket, &op.split_id);
+                        if bucket.is_none() {
+                            bucket = self
+                                .bucket_of_folded_split(
+                                    storage,
+                                    &manifest,
+                                    &op.split_id,
+                                    &mut read_segments,
+                                )
+                                .await?;
                         }
-                    },
+                        match bucket {
+                            Some(bucket) => bucket,
+                            None => {
+                                return Err(internal(
+                                    "a removal refers to a split neither the tail nor a segment \
+                                     of its stripe holds",
+                                    format!("split `{}`", op.split_id),
+                                ));
+                            }
+                        }
+                    }
                 };
                 per_bucket.entry(bucket).or_default().push(op);
             }
         }
         for (bucket, ops) in per_bucket {
-            let mut splits = match manifest.segments.get(&bucket) {
-                Some(segment_ref) => self.read_segment(storage, &segment_ref.key).await?.splits,
-                None => Vec::new(),
+            let mut splits = match read_segments.remove(&bucket) {
+                Some(splits) => splits,
+                None => match manifest.segments.get(&bucket) {
+                    Some(segment_ref) => self.read_segment(storage, &segment_ref.key).await?.splits,
+                    None => Vec::new(),
+                },
             };
             apply_ops(&mut splits, ops);
             splits.sort_unstable_by(|left, right| left.split_id().cmp(right.split_id()));
@@ -670,7 +742,7 @@ impl ManifestLayout {
                 num_splits: splits.len(),
             };
             let object_id = Uuid::new_v4().to_string();
-            let segment_key = self.segment_path(bucket, manifest.epoch + 1, &object_id);
+            let segment_key = self.segment_path(bucket, manifest.fold_generation + 1, &object_id);
             let segment = SplitSegment {
                 format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
                 bucket,
@@ -694,7 +766,8 @@ impl ManifestLayout {
         manifest.wal.clear();
         manifest.wal_ops = 0;
         manifest.epoch += 1;
-        let commit_epoch = manifest.epoch;
+        manifest.fold_generation += 1;
+        let commit_epoch = manifest.fold_generation;
         storage
             .put_if_version_matches(
                 &self.manifest_path(stripe),
@@ -713,15 +786,19 @@ impl ManifestLayout {
     /// Deletes segments no reader can still need: those the manifests no longer name and whose
     /// generation is older than the grace period.
     async fn garbage_collect(&self, storage: &dyn Storage, epoch: u64) {
-        let Some(delete_before) = epoch.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
-            return;
-        };
-        let live: BTreeSet<String> = match self.live_segments(storage).await {
+        let (live, slowest_generation) = match self.live_segments(storage).await {
             Ok(live) => live,
             Err(error) => {
                 warn!(index_id = %self.index_id, %error, "failed to list live segments for gc");
                 return;
             }
+        };
+        // `epoch` is this stripe's own generation; the watermark is the slowest stripe's, because a
+        // generation names objects on every stripe's own timeline. A slow stripe only makes garbage
+        // live longer, which is the safe direction.
+        let watermark = epoch.min(slowest_generation);
+        let Some(delete_before) = watermark.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
+            return;
         };
         let mut pages = storage.list(&self.segments_prefix());
         loop {
@@ -764,7 +841,15 @@ impl ManifestLayout {
     /// the segments get, and for the same reason: a reader holding an older manifest may still
     /// be fetching what it names.
     async fn garbage_collect_wal(&self, storage: &dyn Storage, stripe: usize, epoch: u64) {
-        let Some(delete_before) = epoch.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
+        let slowest_generation = match self.slowest_fold_generation(storage).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                warn!(index_id = %self.index_id, %error, "failed to read the fold generations for gc");
+                return;
+            }
+        };
+        let watermark = epoch.min(slowest_generation);
+        let Some(delete_before) = watermark.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
             return;
         };
         let prefix = self.wal_prefix(stripe);
@@ -798,8 +883,14 @@ impl ManifestLayout {
         }
     }
 
-    async fn live_segments(&self, storage: &dyn Storage) -> MetastoreResult<BTreeSet<String>> {
+    /// Segments the manifests name, plus the fold generation of the stripe that has folded least
+    /// recently.
+    async fn live_segments(
+        &self,
+        storage: &dyn Storage,
+    ) -> MetastoreResult<(BTreeSet<String>, u64)> {
         let mut live = BTreeSet::new();
+        let mut slowest_generation = u64::MAX;
         for stripe in 0..self.num_stripes {
             let (manifest, _) = self.read_manifest(storage, stripe).await?;
             live.extend(
@@ -808,10 +899,21 @@ impl ManifestLayout {
                     .values()
                     .map(|segment| segment.key.clone()),
             );
+            slowest_generation = slowest_generation.min(manifest.fold_generation);
             // A fold that has written its segments but not yet committed them leaves them
             // unreferenced; they are younger than the grace period and survive.
         }
-        Ok(live)
+        Ok((live, slowest_generation))
+    }
+
+    /// Fold generation of the stripe that has folded least recently.
+    async fn slowest_fold_generation(&self, storage: &dyn Storage) -> MetastoreResult<u64> {
+        let mut slowest_generation = u64::MAX;
+        for stripe in 0..self.num_stripes {
+            let (manifest, _) = self.read_manifest(storage, stripe).await?;
+            slowest_generation = slowest_generation.min(manifest.fold_generation);
+        }
+        Ok(slowest_generation)
     }
 
     async fn read_segment(
@@ -843,6 +945,10 @@ impl ManifestLayout {
         from: i64,
         to: i64,
     ) -> MetastoreResult<Vec<Split>> {
+        if to <= from {
+            // An empty window: `to - 1` below would underflow, and there is nothing to return.
+            return Ok(Vec::new());
+        }
         let mut splits = BTreeMap::new();
         // One round trip per stripe is the floor of this layout, so they are fetched together:
         // eight manifests in sequence turn a windowed read into eight times the bucket's
@@ -915,6 +1021,35 @@ impl ManifestLayout {
             }
         }
         None
+    }
+
+    /// Bucket of a split that a *previous* fold put into a segment.
+    ///
+    /// The segment references carry the split-id range they cover, so this reads only the segments
+    /// that can hold the id, and only when the segment confirms it does it answer with the bucket.
+    async fn bucket_of_folded_split(
+        &self,
+        storage: &dyn Storage,
+        manifest: &StripeManifest,
+        split_id: &SplitId,
+        read_segments: &mut BTreeMap<i64, Vec<Split>>,
+    ) -> MetastoreResult<Option<i64>> {
+        for (bucket, segment_ref) in &manifest.segments {
+            if split_id < &segment_ref.min_split_id || split_id > &segment_ref.max_split_id {
+                continue;
+            }
+            if !read_segments.contains_key(bucket) {
+                let segment = self.read_segment(storage, &segment_ref.key).await?;
+                read_segments.insert(*bucket, segment.splits);
+            }
+            if read_segments[bucket]
+                .iter()
+                .any(|split| split.split_id() == split_id)
+            {
+                return Ok(Some(*bucket));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1105,6 +1240,58 @@ mod tests {
         );
     }
 
+    /// A stripe that folds often must not collect what a stripe that folds rarely may still have
+    /// readers fetching.
+    ///
+    /// Segments of every stripe live in the same bucket directory, so a watermark taken from the
+    /// folding stripe's own generation deletes a slow stripe's segments — which its readers,
+    /// holding a manifest that names them, are still fetching. The watermark is the slowest
+    /// stripe's.
+    #[tokio::test]
+    async fn test_gc_watermark_follows_the_slowest_stripe() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        // One split per stripe, found by hashing candidates, so both stripes have something to
+        // fold.
+        let split_for_stripe = |stripe: usize| {
+            (0..)
+                .map(|candidate| {
+                    split(
+                        &format!("split-{candidate}"),
+                        Some(1_700_000_000..=1_700_000_060),
+                    )
+                })
+                .find(|split| layout.stripe_of(split.split_id().as_str()) == stripe)
+                .unwrap()
+        };
+        let publish_and_fold = |split: Split| {
+            let layout = layout.clone();
+            let storage = storage.clone();
+            async move {
+                let stripe = layout.stripe_of(split.split_id().as_str());
+                let ops = vec![SplitOp {
+                    split_id: split.split_id().clone(),
+                    split: Some(split),
+                }];
+                layout.publish_ops(&storage, ops).await.unwrap();
+                layout.fold(&storage, stripe).await.unwrap();
+            }
+        };
+        // The slow stripe folds twice; the fast one six times.
+        for _ in 0..2 {
+            publish_and_fold(split_for_stripe(1)).await;
+        }
+        for _ in 0..6 {
+            publish_and_fold(split_for_stripe(0)).await;
+        }
+        let segments = count_objects(&storage, "segments").await;
+        assert_eq!(
+            segments, 8,
+            "the slow stripe's generations must survive the fast stripe's folds"
+        );
+    }
+
     async fn count_objects(storage: &RamStorage, prefix: &str) -> usize {
         let mut pages = storage.list(Path::new(&format!("test-index/v3/{prefix}")));
         let mut count = 0;
@@ -1141,6 +1328,70 @@ mod tests {
         assert!(
             bytes_read < 4_000,
             "a one-hour window read {bytes_read} bytes out of 24 hours of segments"
+        );
+    }
+
+    /// Removing a split a fold has already taken into a segment is the routine path after a merge:
+    /// the split is in a segment, its removal is in the tail, and the fold that follows has to
+    /// place that removal. Getting this wrong is not a lost delete, it is a stripe whose every
+    /// later fold fails on the same op, with its tail growing forever.
+    #[tokio::test]
+    async fn test_a_removal_of_a_folded_split_folds() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let split_a = split("split-a", Some(1_700_000_000..=1_700_000_060));
+        let split_b = split("split-b", Some(1_700_000_000..=1_700_000_060));
+        publish_and_fold(&layout, &storage, vec![split_a.clone(), split_b.clone()]).await;
+        // Both are in a segment now; publish the removal of one of them, as a merge would.
+        layout
+            .publish_ops(
+                &storage,
+                vec![SplitOp {
+                    split_id: split_a.split_id().clone(),
+                    split: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let stripe = layout.stripe_of(split_a.split_id().as_str());
+        assert!(
+            layout.fold(&storage, stripe).await.unwrap(),
+            "the fold that places the removal has to succeed"
+        );
+        // And again, with nothing in the tail: the stripe must not be stuck on that op.
+        assert!(!layout.fold(&storage, stripe).await.unwrap());
+        let splits = layout
+            .list_splits(&storage, 1_699_999_000, 1_700_010_000)
+            .await
+            .unwrap();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].split_id().as_str(), "split-b");
+    }
+
+    /// The negative control: a removal for a split that was never published is a corrupt state, and
+    /// saying so is what keeps the routine case above from being a silent no-op.
+    #[tokio::test]
+    async fn test_a_removal_of_an_unknown_split_is_an_error() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        publish_and_fold(&layout, &storage, vec![split("split-a", None)]).await;
+        layout
+            .publish_ops(
+                &storage,
+                vec![SplitOp {
+                    split_id: SplitId::from("split-never-existed"),
+                    split: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let stripe = layout.stripe_of("split-never-existed");
+        let error = layout.fold(&storage, stripe).await.unwrap_err();
+        assert!(
+            error.to_string().contains("neither the tail nor a segment"),
+            "unexpected error: {error}"
         );
     }
 }

@@ -34,7 +34,8 @@ pub(super) struct MetastoreState {
     ///
     /// The layout of an index is fixed when it is created, so it is discovered once and kept: a
     /// write must not pay a round trip to learn what did not change.
-    pub manifest_layouts: HashMap<IndexId, super::manifest_layout::ManifestLayout>,
+    /// `Some(layout)` for an index stored as manifests, `None` for one that was probed and is not.
+    pub manifest_layouts: HashMap<IndexId, Option<super::manifest_layout::ManifestLayout>>,
     pub templates: HashMap<IndexTemplateId, IndexTemplate>,
     pub template_matcher: IndexTemplateMatcher,
     pub identity: Uuid,

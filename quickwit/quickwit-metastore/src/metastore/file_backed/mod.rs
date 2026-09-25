@@ -1075,15 +1075,13 @@ impl FileBackedMetastore {
         incarnation_id_opt: Option<Ulid>,
         list_splits_query: &ListSplitsQuery,
     ) -> MetastoreResult<Option<Vec<Split>>> {
-        let probe = manifest_layout::ManifestLayout::new(
-            index_id,
-            MANIFEST_LAYOUT_BUCKET_SECS,
-            MANIFEST_LAYOUT_NUM_STRIPES,
-        );
-        if !probe.exists(&*self.storage).await? {
+        // Through the cache, so an index that uses another layout pays the probe once per process
+        // rather than once per query.
+        let Some(layout) = self.manifest_layout_of(index_id).await? else {
             return Ok(None);
-        }
-        let (root_info, _, _) = probe.load_root(&*self.storage).await?;
+        };
+        // The root carries the incarnation the request may name, so it is read either way.
+        let (root_info, _, _) = layout.load_root(&*self.storage).await?;
         if let Some(incarnation_id) = incarnation_id_opt
             && root_info.index.index_uid().incarnation_id != incarnation_id
         {
@@ -1091,11 +1089,6 @@ impl FileBackedMetastore {
                 index_id: index_id.to_string(),
             }));
         }
-        let layout = manifest_layout::ManifestLayout::new(
-            index_id,
-            root_info.bucket_secs,
-            root_info.num_stripes,
-        );
         let (window_start, window_end) = pruning_window(list_splits_query);
         let splits = layout
             .list_splits(&*self.storage, window_start, window_end)
@@ -1119,15 +1112,23 @@ impl FileBackedMetastore {
         &self,
         index_uid: &IndexUid,
         split_ids: &[SplitId],
-        mutate_fn: impl Fn(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+        mutate_fn: impl Fn(&mut FileBackedIndex, bool) -> MetastoreResult<MutationOccurred<T>>,
     ) -> MetastoreResult<T> {
         let index_id = &index_uid.index_id;
         let Some(layout) = self.manifest_layout_of(index_id).await? else {
-            return self.mutate(index_uid, mutate_fn).await;
+            // The other layouts write the whole index in one compare-and-swap, so a mutation never
+            // observes a partial commit of its own and keeps the strict contract.
+            return self
+                .mutate(index_uid, |index| mutate_fn(index, false))
+                .await;
         };
         let mut attempt = 0;
         loop {
             attempt += 1;
+            // Attempt 2 onwards replays a mutation that got partway: this layout commits one stripe
+            // at a time, so splits of the stripes already committed are published. The closure is
+            // told, because refusing them would fail an RPC whose publication already happened.
+            let is_replay = attempt > 1;
             let (root_info, root_version, root_bytes) = layout.load_root(&*self.storage).await?;
             let mut index = root_info.index;
             if index.index_uid() != index_uid {
@@ -1138,10 +1139,11 @@ impl FileBackedMetastore {
             // Only the splits this mutation can touch, never the whole map.
             let touched_state = layout.get_splits_by_id(&*self.storage, split_ids).await?;
             index.put_splits(touched_state);
-            let value = match mutate_fn(&mut index)? {
+            let value = match mutate_fn(&mut index, is_replay)? {
                 MutationOccurred::Yes(value) => value,
                 MutationOccurred::No(value) => {
-                    self.replace_cached_index(index_id, index).await;
+                    // The index here holds only the splits this mutation looked at, so it is not a
+                    // view of the index and must not be cached as one.
                     return Ok(value);
                 }
             };
@@ -1199,8 +1201,10 @@ impl FileBackedMetastore {
     ) -> MetastoreResult<Option<manifest_layout::ManifestLayout>> {
         {
             let state_rlock_guard = self.state.read().await;
-            if let Some(layout) = state_rlock_guard.manifest_layouts.get(index_id) {
-                return Ok(Some(layout.clone()));
+            // `Some(None)` means "probed, and this index is not in that layout": without it every
+            // read of every index that uses another layout would pay a HEAD for the probe.
+            if let Some(layout_opt) = state_rlock_guard.manifest_layouts.get(index_id) {
+                return Ok(layout_opt.clone());
             }
         }
         let probe = manifest_layout::ManifestLayout::new(
@@ -1209,6 +1213,10 @@ impl FileBackedMetastore {
             MANIFEST_LAYOUT_NUM_STRIPES,
         );
         if !probe.exists(&*self.storage).await? {
+            let mut state_wlock_guard = self.state.write().await;
+            state_wlock_guard
+                .manifest_layouts
+                .insert(index_id.to_string(), None);
             return Ok(None);
         }
         let (root_info, _, _) = probe.load_root(&*self.storage).await?;
@@ -1220,7 +1228,7 @@ impl FileBackedMetastore {
         let mut state_wlock_guard = self.state.write().await;
         state_wlock_guard
             .manifest_layouts
-            .insert(index_id.to_string(), layout.clone());
+            .insert(index_id.to_string(), Some(layout.clone()));
         Ok(Some(layout))
     }
 
@@ -1534,7 +1542,7 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_metadata| split_metadata.split_id.clone())
             .collect();
 
-        self.mutate_splits(&index_uid, &staged_split_ids, |index| {
+        self.mutate_splits(&index_uid, &staged_split_ids, |index, _is_replay| {
             let mut failed_split_ids = Vec::new();
 
             for split_metadata in splits_metadata.clone() {
@@ -1582,12 +1590,17 @@ impl MetastoreService for FileBackedMetastore {
                 .iter()
                 .map(|split_id| SplitId::from(split_id.as_str())),
         );
-        self.mutate_splits(&index_uid, &touched_split_ids, |index| {
-            index.publish_splits(
+        self.mutate_splits(&index_uid, &touched_split_ids, |index, is_replay| {
+            // Only a replay tolerates an already-published split: the manifest layout commits one
+            // stripe at a time, so a replay can find half of its own publication already done.
+            // A caller that simply publishes a split that is already published still gets the hard
+            // error it always got, on every layout.
+            index.publish_splits_with_retry_tolerance(
                 request.staged_split_ids.clone(),
                 request.replaced_split_ids.clone(),
                 index_checkpoint_delta.clone(),
                 request.publish_token_opt.clone().map(|token| token.into()),
+                is_replay,
             )?;
             Ok(MutationOccurred::Yes(()))
         })
@@ -1607,7 +1620,7 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_id| SplitId::from(split_id.as_str()))
             .collect();
 
-        self.mutate_splits(&index_uid, &marked_split_ids, |index| {
+        self.mutate_splits(&index_uid, &marked_split_ids, |index, _is_replay| {
             index
                 .mark_splits_for_deletion(
                     request.split_ids.clone(),
@@ -1633,7 +1646,7 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_id| SplitId::from(split_id.as_str()))
             .collect();
 
-        self.mutate_splits(&index_uid, &deleted_split_ids, |index| {
+        self.mutate_splits(&index_uid, &deleted_split_ids, |index, _is_replay| {
             index.delete_splits(request.split_ids.clone())?;
             Ok(MutationOccurred::Yes(EmptyResponse {}))
         })
@@ -1998,7 +2011,7 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_id| SplitId::from(split_id.as_str()))
             .collect();
 
-        self.mutate_splits(index_uid, &opstamped_split_ids, |index| {
+        self.mutate_splits(index_uid, &opstamped_split_ids, |index, _is_replay| {
             let split_ids_str = request
                 .split_ids
                 .iter()
@@ -2814,6 +2827,92 @@ mod tests {
         let metastore = FileBackedMetastore::default_for_test().await;
         metastore.check_connectivity().await.unwrap();
         assert_eq!(metastore.endpoints()[0].protocol(), Protocol::Ram);
+    }
+    /// The manifest layout commits one stripe at a time, so a mutation can be replayed after part
+    /// of its own publication happened. The state that replay sees — some requested splits
+    /// already `Published`, the rest still `Staged` — is indistinguishable from another writer
+    /// having published them, so the mutation is told it is a replay and tolerates them there.
+    ///
+    /// Without that, the publish fails permanently: the first attempt committed one stripe, and the
+    /// replay refuses the splits it published itself, so an RPC whose work is half done can never
+    /// finish. The test injects the failure on the second stripe, then asserts the publish finishes
+    /// and both splits are published.
+    ///
+    /// Publishing a split that is already published *without* being a replay stays the hard error
+    /// it always was, on every layout.
+    #[tokio::test]
+    async fn test_a_publish_that_lost_one_stripe_replays_to_success() {
+        use crate::metastore::file_backed::manifest_layout::{ManifestLayout, test_hooks};
+
+        let index_id = "test-publish-replay";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 4,
+        });
+        let layout = ManifestLayout::new(index_id, 3_600, 4);
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+
+        // One split per stripe, so the publish commits two manifests and can fail on the second.
+        let split_for_stripe = |stripe: usize| {
+            (0..)
+                .map(|candidate| {
+                    SplitMetadata::for_test(SplitId::from(format!("split-{candidate}")))
+                })
+                .find(|split_metadata| layout.stripe_of(split_metadata.split_id.as_str()) == stripe)
+                .unwrap()
+        };
+        let split_a = split_for_stripe(0);
+        let split_b = split_for_stripe(1);
+        for split_metadata in [&split_a, &split_b] {
+            metastore
+                .stage_splits(
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), split_metadata)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        // Stripes commit in ascending order, so failing stripe 1 lets stripe 0 land first.
+        test_hooks::fail_next_commit_for_stripe(1);
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![split_a.split_id.to_string(), split_b.split_id.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("the replay has to finish the publication the first attempt started");
+        let mut expected = vec![split_a.split_id.to_string(), split_b.split_id.to_string()];
+        expected.sort();
+        assert_eq!(
+            list_published_split_ids_with(&metastore, &index_uid)
+                .await
+                .unwrap(),
+            expected
+        );
+
+        // The control: publishing an already-published split, not as a replay, is still an error.
+        let error = metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid),
+                staged_split_ids: vec![split_a.split_id.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "publishing a published split outside a replay must still fail: {error:?}"
+        );
     }
 
     #[tokio::test]
