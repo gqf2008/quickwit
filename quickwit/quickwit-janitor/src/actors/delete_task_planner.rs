@@ -369,9 +369,9 @@ impl DeleteTaskPlanner {
         let stale_splits_response = ctx
             .protect_future(self.metastore.list_stale_splits(list_stale_splits_request))
             .await?;
-        // Deserializing the response is work this actor does on the blocking pool; a large
-        // stale-split list takes long enough for the heartbeat to tick, so it runs in the
-        // protected zone too.
+        // Deserializing the response is work this actor farms out to the shared CPU pool; while it
+        // waits its turn behind whatever else is using that pool it is not reporting progress, so
+        // it runs in the protected zone too.
         let stale_splits = ctx
             .protect_future(stale_splits_response.deserialize_splits())
             .await?;
