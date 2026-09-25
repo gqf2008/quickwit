@@ -30,6 +30,11 @@ use super::manifest::{IndexStatus, Manifest};
 #[derive(Default)]
 pub(super) struct MetastoreState {
     pub indexes: HashMap<IndexId, LazyIndexStatus>,
+    /// Layouts of the indexes stored as manifests, segments and a WAL tail.
+    ///
+    /// The layout of an index is fixed when it is created, so it is discovered once and kept: a
+    /// write must not pay a round trip to learn what did not change.
+    pub manifest_layouts: HashMap<IndexId, super::manifest_layout::ManifestLayout>,
     pub templates: HashMap<IndexTemplateId, IndexTemplate>,
     pub template_matcher: IndexTemplateMatcher,
     pub identity: Uuid,
@@ -67,6 +72,7 @@ impl MetastoreState {
             templates: manifest.templates,
             template_matcher,
             identity: manifest.identity,
+            manifest_layouts: HashMap::new(),
         };
         Ok(state)
     }

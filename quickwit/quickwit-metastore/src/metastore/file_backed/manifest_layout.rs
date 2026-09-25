@@ -102,6 +102,18 @@ struct WalBatch {
     ops: Vec<SplitOp>,
 }
 
+/// A segment the manifest points at, with the split-id range it covers.
+///
+/// The range is what makes a split id findable without scanning every segment of a stripe, the way
+/// a sorted run in an LSM tree lets a point lookup skip the runs that cannot hold the key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SegmentRef {
+    key: String,
+    min_split_id: SplitId,
+    max_split_id: SplitId,
+    num_splits: usize,
+}
+
 /// The mutable state of one stripe: references, never splits.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StripeManifest {
@@ -109,7 +121,7 @@ struct StripeManifest {
     /// Commit counter of this stripe; bumped by every compare-and-swap.
     epoch: u64,
     /// Segment currently serving each time bucket.
-    segments: BTreeMap<i64, String>,
+    segments: BTreeMap<i64, SegmentRef>,
     /// WAL objects not yet folded into segments.
     wal: Vec<String>,
     /// Number of operations those objects carry, so a fold triggers on size and not only on count.
@@ -385,6 +397,72 @@ impl ManifestLayout {
         self.list_splits(storage, i64::MIN, i64::MAX).await
     }
 
+    /// Reads the splits with these ids, and only those.
+    ///
+    /// This is what lets a mutation look at the splits it is about to change instead of at the
+    /// whole index: the stripe of an id is a pure function of the id, and the segment id ranges
+    /// in the manifest tell which segments could hold it. Segments are fetched once per call,
+    /// so a mutation touching several splits of one bucket pays for that segment once.
+    pub(crate) async fn get_splits_by_id(
+        &self,
+        storage: &dyn Storage,
+        split_ids: &[SplitId],
+    ) -> MetastoreResult<std::collections::HashMap<SplitId, Split>> {
+        let mut per_stripe: BTreeMap<usize, Vec<SplitId>> = BTreeMap::new();
+        for split_id in split_ids {
+            per_stripe
+                .entry(self.stripe_of(split_id.as_str()))
+                .or_default()
+                .push(split_id.clone());
+        }
+        let mut found: std::collections::HashMap<SplitId, Split> = std::collections::HashMap::new();
+        for (stripe, wanted) in per_stripe {
+            let (manifest, _) = self.read_manifest(storage, stripe).await?;
+            let mut fetched: BTreeMap<String, SplitSegment> = BTreeMap::new();
+            for split_id in &wanted {
+                for segment_ref in manifest.segments.values() {
+                    if split_id < &segment_ref.min_split_id || split_id > &segment_ref.max_split_id
+                    {
+                        continue;
+                    }
+                    if !fetched.contains_key(&segment_ref.key) {
+                        let segment = self.read_segment(storage, &segment_ref.key).await?;
+                        fetched.insert(segment_ref.key.clone(), segment);
+                    }
+                    if let Some(split) = fetched[&segment_ref.key]
+                        .splits
+                        .iter()
+                        .find(|split| split.split_id() == split_id)
+                    {
+                        found.insert(split_id.clone(), split.clone());
+                    }
+                }
+            }
+            // The WAL tail wins: it holds everything published since the last fold.
+            for wal_key in &manifest.wal {
+                let bytes = storage
+                    .get_all(Path::new(wal_key))
+                    .await
+                    .map_err(|error| map_storage_error(&self.index_id, error))?;
+                let wal: WalBatch = serde_utils::from_json_bytes(&bytes)?;
+                for op in wal.ops {
+                    if !wanted.contains(&op.split_id) {
+                        continue;
+                    }
+                    match op.split {
+                        Some(split) => {
+                            found.insert(op.split_id, split);
+                        }
+                        None => {
+                            found.remove(&op.split_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Deletes every object of the index.
     pub(crate) async fn delete(&self, storage: &dyn Storage) -> MetastoreResult<()> {
         let mut pages = storage.list(&self.prefix());
@@ -533,10 +611,23 @@ impl ManifestLayout {
         }
         for (bucket, ops) in per_bucket {
             let mut splits = match manifest.segments.get(&bucket) {
-                Some(segment_key) => self.read_segment(storage, segment_key).await?.splits,
+                Some(segment_ref) => self.read_segment(storage, &segment_ref.key).await?.splits,
                 None => Vec::new(),
             };
             apply_ops(&mut splits, ops);
+            splits.sort_unstable_by(|left, right| left.split_id().cmp(right.split_id()));
+            let segment_ref = SegmentRef {
+                key: String::new(),
+                min_split_id: splits
+                    .first()
+                    .map(|split| split.split_id().clone())
+                    .unwrap_or_else(|| SplitId::from("")),
+                max_split_id: splits
+                    .last()
+                    .map(|split| split.split_id().clone())
+                    .unwrap_or_else(|| SplitId::from("")),
+                num_splits: splits.len(),
+            };
             let object_id = Uuid::new_v4().to_string();
             let segment_key = self.segment_path(bucket, manifest.epoch + 1, &object_id);
             let segment = SplitSegment {
@@ -551,9 +642,13 @@ impl ManifestLayout {
                 )
                 .await
                 .map_err(|error| map_storage_error(&self.index_id, error))?;
-            manifest
-                .segments
-                .insert(bucket, segment_key.to_string_lossy().to_string());
+            manifest.segments.insert(
+                bucket,
+                SegmentRef {
+                    key: segment_key.to_string_lossy().to_string(),
+                    ..segment_ref
+                },
+            );
         }
         manifest.wal.clear();
         manifest.wal_ops = 0;
@@ -622,7 +717,12 @@ impl ManifestLayout {
         let mut live = BTreeSet::new();
         for stripe in 0..self.num_stripes {
             let (manifest, _) = self.read_manifest(storage, stripe).await?;
-            live.extend(manifest.segments.values().cloned());
+            live.extend(
+                manifest
+                    .segments
+                    .values()
+                    .map(|segment| segment.key.clone()),
+            );
             // A fold that has written its segments but not yet committed them leaves them
             // unreferenced; they are younger than the grace period and survive.
         }
@@ -682,11 +782,11 @@ impl ManifestLayout {
         let mut splits = BTreeMap::new();
         for stripe in 0..self.num_stripes {
             let (manifest, _) = self.read_manifest(storage, stripe).await?;
-            for (bucket, segment_key) in &manifest.segments {
+            for (bucket, segment_ref) in &manifest.segments {
                 if *bucket != UNTIMED_BUCKET && (*bucket < first_bucket || *bucket > last_bucket) {
                     continue;
                 }
-                let segment = self.read_segment(storage, segment_key).await?;
+                let segment = self.read_segment(storage, &segment_ref.key).await?;
                 for split in segment.splits {
                     splits.insert(split.split_id().clone(), split);
                 }

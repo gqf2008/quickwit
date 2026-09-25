@@ -68,7 +68,7 @@ use quickwit_proto::metastore::{
     UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
     UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
-use quickwit_proto::types::{IndexId, IndexUid};
+use quickwit_proto::types::{IndexId, IndexUid, SplitId};
 use quickwit_storage::{ObjectVersion, Storage, StorageErrorKind};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -1077,6 +1077,122 @@ impl FileBackedMetastore {
         Ok(Some(splits))
     }
 
+    /// Applies a mutation that only touches the splits with the given ids.
+    ///
+    /// On the layouts that keep the split map in one object the whole index is loaded, because that
+    /// is where the map lives. On the manifest layout only the named splits are read (through
+    /// their stripe's manifests and the segments whose id range can hold them), the *same*
+    /// mutation closure runs, and the splits it changed are published as operations — so a
+    /// publish costs what it touches rather than what the index holds.
+    async fn mutate_splits<T>(
+        &self,
+        index_uid: &IndexUid,
+        split_ids: &[SplitId],
+        mutate_fn: impl Fn(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+    ) -> MetastoreResult<T> {
+        let index_id = &index_uid.index_id;
+        let Some(layout) = self.manifest_layout_of(index_id).await? else {
+            return self.mutate(index_uid, mutate_fn).await;
+        };
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (root_info, root_version, root_bytes) = layout.load_root(&*self.storage).await?;
+            let mut index = root_info.index;
+            if index.index_uid() != index_uid {
+                return Err(MetastoreError::NotFound(EntityKind::Index {
+                    index_id: index_id.to_string(),
+                }));
+            }
+            // Only the splits this mutation can touch, never the whole map.
+            let touched_state = layout.get_splits_by_id(&*self.storage, split_ids).await?;
+            index.put_splits(touched_state);
+            let value = match mutate_fn(&mut index)? {
+                MutationOccurred::Yes(value) => value,
+                MutationOccurred::No(value) => {
+                    self.replace_cached_index(index_id, index).await;
+                    return Ok(value);
+                }
+            };
+            let ops: Vec<manifest_layout::SplitOp> = index
+                .take_touched_split_ids()
+                .into_iter()
+                .map(|split_id| manifest_layout::SplitOp {
+                    split: index.split_opt(&split_id).cloned(),
+                    split_id,
+                })
+                .collect();
+            match layout.publish_ops(&*self.storage, ops).await {
+                Ok(()) => {}
+                Err(MetastoreError::FailedPrecondition { .. })
+                    if attempt < DISTRIBUTED_MAX_ATTEMPTS =>
+                {
+                    record_cas_conflict(false);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => {
+                    if is_manifest_conflict(&error) {
+                        record_cas_conflict(true);
+                    }
+                    self.discard_cached_index(index_id).await;
+                    return Err(error);
+                }
+            }
+            // The rest of the index (metadata, sources, checkpoints, delete tasks) keeps its own
+            // small compare-and-swap; it is only written when it actually changed.
+            if let Err(error) = layout
+                .store_root(&*self.storage, &mut index, &root_bytes, &root_version)
+                .await
+            {
+                if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
+                    record_cas_conflict(false);
+                    tokio::time::sleep(distributed_retry_backoff(attempt)).await;
+                    continue;
+                }
+                self.discard_cached_index(index_id).await;
+                return Err(error);
+            }
+            self.discard_cached_index(index_id).await;
+            return Ok(value);
+        }
+    }
+
+    /// Layout of an index when it is stored as manifests, segments and a WAL tail.
+    ///
+    /// Cached per index: the layout of an index does not change over its life, and a write should
+    /// not pay two round trips to learn what it already knows.
+    async fn manifest_layout_of(
+        &self,
+        index_id: &str,
+    ) -> MetastoreResult<Option<manifest_layout::ManifestLayout>> {
+        {
+            let state_rlock_guard = self.state.read().await;
+            if let Some(layout) = state_rlock_guard.manifest_layouts.get(index_id) {
+                return Ok(Some(layout.clone()));
+            }
+        }
+        let probe = manifest_layout::ManifestLayout::new(
+            index_id,
+            MANIFEST_LAYOUT_BUCKET_SECS,
+            MANIFEST_LAYOUT_NUM_STRIPES,
+        );
+        if !probe.exists(&*self.storage).await? {
+            return Ok(None);
+        }
+        let (root_info, _, _) = probe.load_root(&*self.storage).await?;
+        let layout = manifest_layout::ManifestLayout::new(
+            index_id,
+            root_info.bucket_secs,
+            root_info.num_stripes,
+        );
+        let mut state_wlock_guard = self.state.write().await;
+        state_wlock_guard
+            .manifest_layouts
+            .insert(index_id.to_string(), layout.clone());
+        Ok(Some(layout))
+    }
+
     /// Returns the list of splits for the given request.
     /// No error is returned if any of the requested `index_uid` does not exist.
     async fn list_splits_inner(&self, request: ListSplitsRequest) -> MetastoreResult<Vec<Split>> {
@@ -1382,8 +1498,12 @@ impl MetastoreService for FileBackedMetastore {
     async fn stage_splits(&self, request: StageSplitsRequest) -> MetastoreResult<EmptyResponse> {
         let index_uid = request.index_uid().clone();
         let splits_metadata = request.deserialize_splits_metadata()?;
+        let staged_split_ids: Vec<SplitId> = splits_metadata
+            .iter()
+            .map(|split_metadata| split_metadata.split_id.clone())
+            .collect();
 
-        self.mutate(&index_uid, |index| {
+        self.mutate_splits(&index_uid, &staged_split_ids, |index| {
             let mut failed_split_ids = Vec::new();
 
             for split_metadata in splits_metadata.clone() {
@@ -1420,7 +1540,18 @@ impl MetastoreService for FileBackedMetastore {
         let index_checkpoint_delta: Option<IndexCheckpointDelta> =
             request.deserialize_index_checkpoint()?;
         let index_uid = request.index_uid().clone();
-        self.mutate(&index_uid, |index| {
+        let mut touched_split_ids: Vec<SplitId> = request
+            .staged_split_ids
+            .iter()
+            .map(|split_id| SplitId::from(split_id.as_str()))
+            .collect();
+        touched_split_ids.extend(
+            request
+                .replaced_split_ids
+                .iter()
+                .map(|split_id| SplitId::from(split_id.as_str())),
+        );
+        self.mutate_splits(&index_uid, &touched_split_ids, |index| {
             index.publish_splits(
                 request.staged_split_ids.clone(),
                 request.replaced_split_ids.clone(),
@@ -1439,8 +1570,13 @@ impl MetastoreService for FileBackedMetastore {
         request: MarkSplitsForDeletionRequest,
     ) -> MetastoreResult<EmptyResponse> {
         let index_uid = request.index_uid().clone();
+        let marked_split_ids: Vec<SplitId> = request
+            .split_ids
+            .iter()
+            .map(|split_id| SplitId::from(split_id.as_str()))
+            .collect();
 
-        self.mutate(&index_uid, |index| {
+        self.mutate_splits(&index_uid, &marked_split_ids, |index| {
             index
                 .mark_splits_for_deletion(
                     request.split_ids.clone(),
@@ -1460,8 +1596,13 @@ impl MetastoreService for FileBackedMetastore {
     #[instrument(name = "metastore.file_backed.delete_splits", skip_all, fields(index_uid = %request.index_uid()))]
     async fn delete_splits(&self, request: DeleteSplitsRequest) -> MetastoreResult<EmptyResponse> {
         let index_uid = request.index_uid().clone();
+        let deleted_split_ids: Vec<SplitId> = request
+            .split_ids
+            .iter()
+            .map(|split_id| SplitId::from(split_id.as_str()))
+            .collect();
 
-        self.mutate(&index_uid, |index| {
+        self.mutate_splits(&index_uid, &deleted_split_ids, |index| {
             index.delete_splits(request.split_ids.clone())?;
             Ok(MutationOccurred::Yes(EmptyResponse {}))
         })
