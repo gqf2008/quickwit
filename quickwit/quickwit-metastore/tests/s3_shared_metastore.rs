@@ -44,8 +44,9 @@ use quickwit_metastore::{
     MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState, StageSplitsRequestExt,
 };
 use quickwit_proto::metastore::{
-    CreateIndexRequest, DeleteIndexRequest, ListSplitsRequest, MetastoreService,
-    PublishSplitsRequest, StageSplitsRequest,
+    CreateIndexRequest, DeleteIndexRequest, IndexMetadataRequest, LastDeleteOpstampRequest,
+    ListDeleteTasksRequest, ListSplitsRequest, MetastoreService, PublishSplitsRequest,
+    StageSplitsRequest,
 };
 use quickwit_proto::types::IndexUid;
 use quickwit_storage::{ObjectVersion, S3CompatibleObjectStorage, Storage, StorageErrorKind};
@@ -673,6 +674,141 @@ async fn test_manifest_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
         other_split_ids.is_empty(),
         "a window outside the segment must be pruned"
     );
+
+    metastore
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    Ok(())
+}
+
+/// What the reads that need no split data cost on a real endpoint, cold and warm.
+///
+/// The meta question behind the manifest layout is how much of an index a read has to touch. A
+/// windowed query touches the window, which the other measurement covers; the metadata, the delete
+/// tasks, the last delete opstamp and the shards have no window, and today they are served by
+/// materialising the index — root, manifests, segments and WAL tail — which is what a node pays
+/// once per reload and what a fresh node pays at startup. This measures that, cold (a metastore
+/// that has just been built, as at startup) and warm (the same metastore again).
+///
+/// Opt-in with `QW_TEST_S3_MEASURE=1`, like the cost measurement next to it. `QW_TEST_S3_SPLITS`
+/// sets how many splits the index holds (default 4 000, in batches of 1 000).
+#[tokio::test]
+async fn test_manifest_layout_metadata_read_cost_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() || std::env::var("QW_TEST_S3_MEASURE").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "skipping test_manifest_layout_metadata_read_cost_on_s3_endpoint: set QW_S3_ENDPOINT \
+             and QW_TEST_S3_MEASURE=1"
+        );
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/manifest-metadata-read", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let index_id = append_random_suffix("manifest-metadata-read-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let num_splits: usize = std::env::var("QW_TEST_S3_SPLITS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4_000);
+    let splits_per_batch = 1_000;
+    let index_uid = {
+        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 32,
+        });
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+            .await?
+            .index_uid()
+            .clone();
+        // One hour of a day of splits, so a windowed read has something to prune.
+        let now = 1_700_000_000i64;
+        for batch_start in (0..num_splits).step_by(splits_per_batch) {
+            let batch_end = (batch_start + splits_per_batch).min(num_splits);
+            let splits_metadata: Vec<SplitMetadata> = (batch_start..batch_end)
+                .map(|index| {
+                    let start = now + (index as i64 % 24) * 3_600;
+                    SplitMetadata {
+                        footer_offsets: 0..10,
+                        split_id: format!("split-{index}").into(),
+                        num_docs: 1,
+                        time_range: Some(start..=start + 60),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let staged_split_ids: Vec<String> = splits_metadata
+                .iter()
+                .map(|split_metadata| split_metadata.split_id.to_string())
+                .collect();
+            metastore
+                .stage_splits(StageSplitsRequest::try_from_splits_metadata(
+                    index_uid.clone(),
+                    splits_metadata,
+                )?)
+                .await?;
+            metastore
+                .publish_splits(PublishSplitsRequest {
+                    index_uid: Some(index_uid.clone()),
+                    staged_split_ids,
+                    ..Default::default()
+                })
+                .await?;
+        }
+        index_uid
+    };
+    let index_prefix = object_snapshot(&*storage, Path::new(&index_id)).await?;
+    eprintln!(
+        "manifest index with {num_splits} splits holds {} objects",
+        index_prefix.len()
+    );
+
+    // A metastore that has just been built, as a node starting up has: nothing is cached.
+    let metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    let window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(1_700_000_000)
+        .with_time_range_end_lt(1_700_000_000 + 3_600);
+    for round in ["cold", "warm"] {
+        let started = std::time::Instant::now();
+        metastore
+            .index_metadata(IndexMetadataRequest {
+                index_uid: Some(index_uid.clone()),
+                ..Default::default()
+            })
+            .await?;
+        let index_metadata = started.elapsed();
+        let started = std::time::Instant::now();
+        metastore
+            .last_delete_opstamp(LastDeleteOpstampRequest {
+                index_uid: Some(index_uid.clone()),
+            })
+            .await?;
+        let last_delete_opstamp = started.elapsed();
+        let started = std::time::Instant::now();
+        metastore
+            .list_delete_tasks(ListDeleteTasksRequest {
+                index_uid: Some(index_uid.clone()),
+                opstamp_start: 0,
+            })
+            .await?;
+        let list_delete_tasks = started.elapsed();
+        let started = std::time::Instant::now();
+        let windowed_splits = metastore
+            .list_splits(ListSplitsRequest::try_from_list_splits_query(&window)?)
+            .await?
+            .collect_split_ids()
+            .await?;
+        let windowed_read = started.elapsed();
+        eprintln!(
+            "{round} reads on R2 ({num_splits} splits): index_metadata {index_metadata:?}, \
+             last_delete_opstamp {last_delete_opstamp:?}, list_delete_tasks \
+             {list_delete_tasks:?}, windowed list_splits {windowed_read:?} ({} splits)",
+            windowed_splits.len()
+        );
+    }
 
     metastore
         .delete_index(DeleteIndexRequest {
