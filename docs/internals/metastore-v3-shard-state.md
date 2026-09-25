@@ -38,9 +38,10 @@ The three `Publisher` faults need three conditions together, and all three hold:
    budget (16 attempts, backoff capped at 2 s) lost every time; an attempt wins a few percent of the
    time, so a budget that is reliable is minutes long, which the ingest pipeline cannot pay. And the
    write is not even conditional on a change: `store_root` skips the compare-and-swap only when the
-   serialized bytes are identical to the ones it read, and the state it serializes contains hash maps
-   whose iteration order differs between processes, so the same state from two nodes looks different.
-   Making that serialization deterministic is a cheap win of its own; it does not remove this
+   serialized bytes are identical to the ones it read, and the state it serialized used to contain hash
+   maps whose iteration order differs between processes, so the same state from two nodes looked
+   different and every node wrote. That serialization is deterministic now (sources, the shards map and
+   the parquet split metadata's sets included); it is a win of its own, but it does not remove this
    condition, because an ordinary publish does change the checkpoint.
 
 The single-object and sharded layouts do not have this failure: their publish and their checkpoint go
