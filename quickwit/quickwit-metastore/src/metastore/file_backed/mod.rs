@@ -1186,6 +1186,15 @@ impl FileBackedMetastore {
                     tokio::time::sleep(distributed_retry_backoff(attempt)).await;
                     continue;
                 }
+                // Giving up on the index metadata is the case an operator has to be able to see:
+                // the splits of this mutation are committed by now (they commit
+                // before the root), so the caller's retry can no longer finish it —
+                // publishing an already published split is refused by contract.
+                // Leaving this uncounted is what let a real 5-node run exhaust
+                // the budget with `cas_conflicts_exhausted_total` still at zero.
+                if is_manifest_conflict(&error) {
+                    record_cas_conflict(true);
+                }
                 self.discard_cached_index(index_id).await;
                 return Err(error);
             }
@@ -2915,6 +2924,79 @@ mod tests {
         assert!(
             matches!(error, MetastoreError::FailedPrecondition { .. }),
             "publishing a published split outside a replay must still fail: {error:?}"
+        );
+    }
+
+    /// A root that never commits has to be counted as an exhausted budget.
+    ///
+    /// The manifest layout commits the splits of a mutation before it commits the index metadata,
+    /// so when the metadata is what keeps losing, the caller's retry cannot finish the
+    /// mutation: publishing a split that is already published is refused by contract. This is
+    /// the failure a real five-node run against a bucket 0.81 s away hit, and the counter
+    /// stayed at zero because only the split path recorded its exhaustion.
+    #[tokio::test]
+    async fn test_a_root_that_never_commits_is_counted_as_exhausted() {
+        use quickwit_config::{SourceConfig, SourceParams};
+
+        use crate::metastore::file_backed::manifest_layout::test_hooks;
+        use crate::metastore::file_backed::metrics::CAS_CONFLICTS_EXHAUSTED_TOTAL;
+
+        // Process-global counters and parallel tests: the assertion is a lower bound.
+        let exhausted_before = CAS_CONFLICTS_EXHAUSTED_TOTAL.get();
+
+        let index_id = "test-root-exhaustion";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let source_id = "test-source";
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 4,
+        });
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-0"));
+        let index_uid = metastore
+            .create_index(
+                CreateIndexRequest::try_from_index_and_source_configs(
+                    &index_config,
+                    &[SourceConfig::for_test(source_id, SourceParams::void())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Every commit of the index metadata fails, the way a mesh of writers at a high round trip
+        // keeps winning the race; the splits themselves commit.
+        test_hooks::fail_next_root_commits(DISTRIBUTED_MAX_ATTEMPTS as u32 + 4);
+        let checkpoint_delta = IndexCheckpointDelta::for_test(source_id, 0..10);
+        let error = metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid),
+                staged_split_ids: vec![split_metadata.split_id.to_string()],
+                index_checkpoint_delta_json_opt: Some(
+                    serde_json::to_string(&checkpoint_delta).unwrap(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "an index metadata that never commits must report the conflict: {error:?}"
+        );
+        assert!(
+            CAS_CONFLICTS_EXHAUSTED_TOTAL.get() - exhausted_before >= 1,
+            "giving up on the index metadata has to be visible to operators"
         );
     }
 

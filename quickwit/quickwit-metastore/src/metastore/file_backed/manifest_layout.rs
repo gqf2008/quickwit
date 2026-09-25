@@ -80,10 +80,27 @@ pub(crate) mod test_hooks {
     use std::sync::Mutex;
 
     static FAIL_NEXT_COMMIT_FOR_STRIPE: Mutex<Option<usize>> = Mutex::new(None);
+    static FAIL_NEXT_ROOT_COMMIT: Mutex<u32> = Mutex::new(0);
 
     /// Fails the next manifest commit of `stripe`, once.
     pub(crate) fn fail_next_commit_for_stripe(stripe: usize) {
         *FAIL_NEXT_COMMIT_FOR_STRIPE.lock().unwrap() = Some(stripe);
+    }
+
+    /// Fails the next `attempts` commits of the root, so a test can drive the index-metadata
+    /// compare-and-swap (the one shared object) into exhausting its replay budget.
+    pub(crate) fn fail_next_root_commits(attempts: u32) {
+        *FAIL_NEXT_ROOT_COMMIT.lock().unwrap() = attempts;
+    }
+
+    pub(super) fn take_root_commit_failure() -> bool {
+        let mut guard = FAIL_NEXT_ROOT_COMMIT.lock().unwrap();
+        if *guard > 0 {
+            *guard -= 1;
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn take_failure_for(stripe: usize) -> bool {
@@ -440,6 +457,15 @@ impl ManifestLayout {
         let root_bytes = root_bytes?;
         if root_bytes.as_slice() == previous_root_bytes.as_slice() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if test_hooks::take_root_commit_failure() {
+            return Err(MetastoreError::FailedPrecondition {
+                entity: quickwit_proto::metastore::EntityKind::Index {
+                    index_id: self.index_id.clone(),
+                },
+                message: "injected index metadata conflict".to_string(),
+            });
         }
         storage
             .put_if_version_matches(&self.root_path(), Box::new(root_bytes), version)
