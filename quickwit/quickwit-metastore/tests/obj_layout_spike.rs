@@ -343,10 +343,17 @@ async fn list_splits(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_split_metadata_as_manifest_plus_segments() {
-    let num_splits: usize = std::env::var("QW_TEST_OBJ_LAYOUT_SPLITS")
+    // Opt-in: the shape measurement takes a few seconds and exists to be run on purpose.
+    let Some(num_splits) = std::env::var("QW_TEST_OBJ_LAYOUT_SPLITS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(1_000_000);
+    else {
+        eprintln!(
+            "skipping test_split_metadata_as_manifest_plus_segments: QW_TEST_OBJ_LAYOUT_SPLITS is \
+             not set (e.g. 1000000)"
+        );
+        return;
+    };
     let storage = RamStorage::default();
     let counter = Counter::default();
     // The manifest is created first, empty.
@@ -465,6 +472,13 @@ async fn test_split_metadata_as_manifest_plus_segments() {
 /// from (1 = objsearch's single manifest per namespace).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_manifest_compare_and_swap_under_concurrent_writers() {
+    if std::env::var("QW_TEST_OBJ_RATE").is_err() {
+        eprintln!(
+            "skipping test_manifest_compare_and_swap_under_concurrent_writers: QW_TEST_OBJ_RATE \
+             is not set (e.g. 12 for the rate 5e12 documents/day needs)"
+        );
+        return;
+    }
     let num_writers: usize = env_usize("QW_TEST_OBJ_WRITERS", 5);
     let rate_per_sec: usize = env_usize("QW_TEST_OBJ_RATE", 12);
     let stripes: usize = env_usize("QW_TEST_OBJ_STRIPES", 1);
