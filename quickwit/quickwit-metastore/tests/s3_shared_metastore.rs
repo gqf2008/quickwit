@@ -554,3 +554,141 @@ async fn test_manifest_layout_on_s3_endpoint() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// What the manifest layout costs on a real endpoint, in the units that do not lie about it: the
+/// wall-clock of a publish and of a windowed read, and the bytes a publish writes.
+///
+/// Opt-in with `QW_TEST_S3_MEASURE=1`, and it says what the numbers mean: a publish is three
+/// storage calls (read the manifest, write the WAL object, commit the manifest), so on a bucket
+/// whose round trip is R a single writer publishes about once per 3R, and the layout wants its
+/// nodes next to the bucket for the write rate a 5·10^12 documents/day index needs.
+#[tokio::test]
+async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() || std::env::var("QW_TEST_S3_MEASURE").is_err() {
+        eprintln!(
+            "skipping test_manifest_layout_cost_on_s3_endpoint: QW_S3_ENDPOINT or \
+             QW_TEST_S3_MEASURE is not set"
+        );
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/manifest-cost", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    metastore.set_index_layout(IndexLayout::ManifestSegments {
+        bucket_secs: 3_600,
+        num_stripes: 8,
+    });
+    let index_id = append_random_suffix("manifest-cost-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid: IndexUid = metastore
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    // Bytes a single publish writes, from the objects that changed.
+    let mut publish_latencies = Vec::new();
+    let mut bytes_written_per_publish = Vec::new();
+    for round in 0..6 {
+        let before = object_snapshot(&*storage, Path::new(&index_id)).await?;
+        let split_id = format!("split-{round:03}");
+        let start = std::time::Instant::now();
+        stage_and_publish_split(&metastore, &index_uid, &split_id).await?;
+        publish_latencies.push(start.elapsed());
+        let after = object_snapshot(&*storage, Path::new(&index_id)).await?;
+        let written: u64 = after
+            .iter()
+            .filter(|(path, (version, _))| {
+                before
+                    .get(*path)
+                    .map(|(previous_version, _)| previous_version != version)
+                    .unwrap_or(true)
+            })
+            .map(|(_, (_, size))| size)
+            .sum();
+        bytes_written_per_publish.push(written);
+    }
+    publish_latencies.sort();
+    eprintln!(
+        "publish one split on R2: p50 {:?}, p95 {:?}, {} bytes written per publish",
+        publish_latencies[publish_latencies.len() / 2],
+        publish_latencies[publish_latencies.len() * 95 / 100],
+        bytes_written_per_publish.iter().sum::<u64>() / bytes_written_per_publish.len() as u64,
+    );
+
+    // A windowed read: what a search asks for.
+    let query = ListSplitsQuery::for_index(index_uid.clone()).with_time_range_start_gte(0);
+    let mut read_latencies = Vec::new();
+    for _ in 0..4 {
+        let start = std::time::Instant::now();
+        let splits = metastore
+            .list_splits(ListSplitsRequest::try_from_list_splits_query(&query)?)
+            .await?
+            .collect_splits()
+            .await?;
+        read_latencies.push(start.elapsed());
+        assert_eq!(splits.len(), 6);
+    }
+    read_latencies.sort();
+    eprintln!(
+        "list_splits on R2: p50 {:?}, p95 {:?}",
+        read_latencies[read_latencies.len() / 2],
+        read_latencies[read_latencies.len() * 95 / 100],
+    );
+
+    // Four writers publishing concurrently: what the striped manifests are for.
+    let start = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for writer in 0..4 {
+        let metastore = metastore.clone();
+        let index_uid = index_uid.clone();
+        handles.push(tokio::spawn(async move {
+            for round in 0..5 {
+                stage_and_publish_split(
+                    &metastore,
+                    &index_uid,
+                    &format!("writer-{writer}-{round}"),
+                )
+                .await
+                .unwrap();
+            }
+        }));
+    }
+    futures::future::try_join_all(handles).await?;
+    let elapsed = start.elapsed();
+    eprintln!(
+        "4 writers x 5 publishes on R2: {} publishes in {:?} ({:.2}/s)",
+        20,
+        elapsed,
+        20.0 / elapsed.as_secs_f64(),
+    );
+
+    metastore
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Size and version of every object under `prefix`, keyed by path: the version tells what a step
+/// rewrote, the size how much.
+async fn object_snapshot(
+    storage: &dyn Storage,
+    prefix: &Path,
+) -> anyhow::Result<std::collections::HashMap<PathBuf, (Option<String>, u64)>> {
+    let mut snapshot = std::collections::HashMap::new();
+    let mut pages = storage.list(prefix);
+    while let Some(page) = futures::StreamExt::next(&mut pages).await {
+        for metadata in page? {
+            snapshot.insert(
+                metadata.path,
+                (
+                    metadata.object_version.map(|version| version.to_string()),
+                    metadata.size.as_u64(),
+                ),
+            );
+        }
+    }
+    Ok(snapshot)
+}

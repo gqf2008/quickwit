@@ -835,26 +835,54 @@ impl ManifestLayout {
         to: i64,
     ) -> MetastoreResult<Vec<Split>> {
         let mut splits = BTreeMap::new();
-        for stripe in 0..self.num_stripes {
-            let (manifest, _) = self.read_manifest(storage, stripe).await?;
+        // One round trip per stripe is the floor of this layout, so they are fetched together:
+        // eight manifests in sequence turn a windowed read into eight times the bucket's
+        // round trip.
+        let manifests = futures::future::try_join_all(
+            (0..self.num_stripes).map(|stripe| self.read_manifest(storage, stripe)),
+        )
+        .await?;
+        // Everything the manifests name is fetched in parallel too: sequentially, a windowed read
+        // would cost one bucket round trip per object it touches.
+        let mut segment_keys: Vec<String> = Vec::new();
+        let mut wal_keys: Vec<String> = Vec::new();
+        for (manifest, _) in &manifests {
             for segment_ref in manifest.segments.values() {
-                if !segment_overlaps_window(segment_ref, from, to) {
-                    continue;
-                }
-                let segment = self.read_segment(storage, &segment_ref.key).await?;
-                for split in segment.splits {
-                    splits.insert(split.split_id().clone(), split);
+                if segment_overlaps_window(segment_ref, from, to)
+                    && !segment_keys.contains(&segment_ref.key)
+                {
+                    segment_keys.push(segment_ref.key.clone());
                 }
             }
-            for wal_key in &manifest.wal {
+            wal_keys.extend(manifest.wal.iter().cloned());
+        }
+        let segments = futures::future::try_join_all(
+            segment_keys
+                .iter()
+                .map(|segment_key| self.read_segment(storage, segment_key)),
+        )
+        .await?;
+        for segment in segments {
+            for split in segment.splits {
+                splits.insert(split.split_id().clone(), split);
+            }
+        }
+        // The WAL tail is applied in the order the manifests name it: it holds the newest version
+        // of everything published since the last fold, and a removal has to win over an
+        // older add.
+        let wal_batches =
+            futures::future::try_join_all(wal_keys.iter().map(|wal_key| async move {
                 let bytes = storage
                     .get_all(Path::new(wal_key))
                     .await
                     .map_err(|error| map_storage_error(&self.index_id, error))?;
                 let wal: WalBatch = serde_utils::from_json_bytes(&bytes)?;
-                for op in wal.ops {
-                    apply_op(&mut splits, op);
-                }
+                Ok::<_, MetastoreError>(wal)
+            }))
+            .await?;
+        for wal in wal_batches {
+            for op in wal.ops {
+                apply_op(&mut splits, op);
             }
         }
         Ok(splits
