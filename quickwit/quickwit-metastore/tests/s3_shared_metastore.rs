@@ -555,6 +555,133 @@ async fn test_manifest_layout_on_s3_endpoint() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The fold path on a real endpoint. Folding is what writes the segments and what collects the ones
+/// it supersedes, so it is the part of this layout that has to be seen against a bucket and not
+/// only against RAM.
+///
+/// A stripe folds once its WAL tail holds a thousand operations, so one batch of a thousand splits
+/// folds the single stripe of this index: the segment has to land under the stripe's own directory,
+/// the splits have to be readable from it, and the folds that follow have to collect the
+/// generations outside the grace period.
+#[tokio::test]
+async fn test_manifest_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!("skipping test_manifest_layout_fold_on_s3_endpoint: QW_S3_ENDPOINT is not set");
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/manifest-fold", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    // One stripe: every split of the batch hashes into it, so the batch itself is what makes the
+    // stripe fold.
+    metastore.set_index_layout(IndexLayout::ManifestSegments {
+        bucket_secs: 3_600,
+        num_stripes: 1,
+    });
+    let index_id = append_random_suffix("manifest-fold-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid = metastore
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    const ROUNDS: usize = 3;
+    const SPLITS_PER_ROUND: usize = 1_000;
+    for round in 0..ROUNDS {
+        let splits_metadata: Vec<SplitMetadata> = (0..SPLITS_PER_ROUND)
+            .map(|index| SplitMetadata {
+                footer_offsets: 0..10,
+                split_id: format!("manifest-fold-{round}-{index}").into(),
+                num_docs: 1,
+                time_range: Some(1_700_000_000..=1_700_000_060),
+                ..Default::default()
+            })
+            .collect();
+        let staged_split_ids: Vec<String> = splits_metadata
+            .iter()
+            .map(|split_metadata| split_metadata.split_id.to_string())
+            .collect();
+        metastore
+            .stage_splits(StageSplitsRequest::try_from_splits_metadata(
+                index_uid.clone(),
+                splits_metadata,
+            )?)
+            .await?;
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids,
+                ..Default::default()
+            })
+            .await?;
+    }
+
+    // The segments of the stripe, and only those: one per fold, and two kept once the collection
+    // has run — the generations inside the grace period.
+    let segments =
+        object_snapshot(&*storage, Path::new(&format!("{index_id}/v3/segments"))).await?;
+    assert!(
+        segments
+            .keys()
+            .all(|path| path.starts_with(Path::new(&index_id).join("v3/segments/000"))),
+        "a segment must live under the stripe that wrote it: {:?}",
+        segments.keys()
+    );
+    assert_eq!(
+        segments.len(),
+        2,
+        "the folds write one segment each, and the collection keeps the two the grace period \
+         covers: {:?}",
+        segments.keys()
+    );
+    // The WAL objects those folds took over are collected the same way.
+    let wal_objects =
+        object_snapshot(&*storage, Path::new(&format!("{index_id}/v3/wal-000"))).await?;
+    assert!(
+        wal_objects.len() <= 2,
+        "the folded wal objects must be collected: {:?}",
+        wal_objects.keys()
+    );
+
+    // Every split is still readable, from the segments the folds wrote.
+    let window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(1_699_999_000)
+        .with_time_range_end_lt(1_700_010_000);
+    let split_ids = metastore
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(&window)?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert_eq!(
+        split_ids.len(),
+        ROUNDS * SPLITS_PER_ROUND,
+        "the splits must survive the folds"
+    );
+    // A window the splits cannot fall in is pruned from the segment's own time range.
+    let other_window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(0)
+        .with_time_range_end_lt(3_600);
+    let other_split_ids = metastore
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(
+            &other_window,
+        )?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert!(
+        other_split_ids.is_empty(),
+        "a window outside the segment must be pruned"
+    );
+
+    metastore
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    Ok(())
+}
+
 /// What the manifest layout costs on a real endpoint, in the units that do not lie about it: the
 /// wall-clock of a publish and of a windowed read, and the bytes a publish writes.
 ///

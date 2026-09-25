@@ -161,7 +161,8 @@ struct StripeManifest {
     /// Segments and WAL objects are named after *this* and not after `epoch`: the grace that keeps
     /// them alive for a reader is a number of folds, and one commit is not a useful unit for it
     /// (at 11.6 writes/s two commits are a sixth of a second, while a reader a bucket away
-    /// needs seconds to fetch what a manifest names).
+    /// needs seconds to fetch what a manifest names). Both are collected against the generation of
+    /// their own stripe, since that is the manifest a reader would have taken them from.
     #[serde(default)]
     fold_generation: u64,
     /// Segment currently serving each time bucket.
@@ -278,23 +279,31 @@ impl ManifestLayout {
         self.prefix().join(format!("manifest-{stripe:03}.json"))
     }
 
-    fn wal_path(&self, stripe: usize, epoch: u64, object_id: &str) -> PathBuf {
+    fn wal_path(&self, stripe: usize, generation: u64, object_id: &str) -> PathBuf {
         self.wal_prefix(stripe)
-            .join(format!("{epoch:020}-{object_id}.json"))
+            .join(format!("{generation:020}-{object_id}.json"))
     }
 
     fn wal_prefix(&self, stripe: usize) -> PathBuf {
         self.prefix().join(format!("wal-{stripe:03}"))
     }
 
-    fn segment_path(&self, bucket: i64, epoch: u64, object_id: &str) -> PathBuf {
-        self.prefix()
-            .join(format!("segments/{bucket:012}"))
+    /// Segments are named under the stripe that wrote them.
+    ///
+    /// The stripe is part of the path because the only state a segment needs to be collected
+    /// against is the fold generation of its own stripe: a reader holds the manifests of every
+    /// stripe, so the age that matters for one stripe's segment is how many times *that* stripe has
+    /// folded since. Keeping them together would force one watermark on stripes that fold at
+    /// different rates — either collecting what a slow stripe is still reading, or never collecting
+    /// anything because some stripe of the index has never folded at all.
+    fn segment_path(&self, stripe: usize, bucket: i64, epoch: u64, object_id: &str) -> PathBuf {
+        self.segment_stripe_prefix(stripe)
+            .join(format!("{bucket:012}"))
             .join(format!("{epoch:020}-{object_id}.json"))
     }
 
-    fn segments_prefix(&self) -> PathBuf {
-        self.prefix().join("segments")
+    fn segment_stripe_prefix(&self, stripe: usize) -> PathBuf {
+        self.prefix().join("segments").join(format!("{stripe:03}"))
     }
 
     /// Bucket a split belongs to.
@@ -601,9 +610,12 @@ impl ManifestLayout {
         }
         let (mut manifest, version) = self.read_manifest(storage, stripe).await?;
         let object_id = Uuid::new_v4().to_string();
-        // The object is named after the epoch that will reference it, which is what lets the
-        // garbage collection of a later fold tell an old WAL object from a live one.
-        let wal_epoch = manifest.epoch + 1;
+        // The object is named after the fold generation that will take it over, which is what lets
+        // the collection of a later fold tell an old WAL object from a live one. It is *not* the
+        // commit counter: the grace a reader gets is counted in folds, and a stripe commits once
+        // per publish but folds once per 32 of them, so commit-named objects never reach a
+        // fold-counted watermark and are never collected.
+        let wal_generation = manifest.fold_generation + 1;
         let num_ops = ops.len();
         let wal = WalBatch {
             format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
@@ -611,13 +623,13 @@ impl ManifestLayout {
         };
         storage
             .put(
-                &self.wal_path(stripe, wal_epoch, &object_id),
+                &self.wal_path(stripe, wal_generation, &object_id),
                 Box::new(serde_utils::to_json_bytes(&wal)?),
             )
             .await
             .map_err(|error| map_storage_error(&self.index_id, error))?;
         manifest.wal.push(
-            self.wal_path(stripe, wal_epoch, &object_id)
+            self.wal_path(stripe, wal_generation, &object_id)
                 .to_string_lossy()
                 .to_string(),
         );
@@ -742,7 +754,8 @@ impl ManifestLayout {
                 num_splits: splits.len(),
             };
             let object_id = Uuid::new_v4().to_string();
-            let segment_key = self.segment_path(bucket, manifest.fold_generation + 1, &object_id);
+            let segment_key =
+                self.segment_path(stripe, bucket, manifest.fold_generation + 1, &object_id);
             let segment = SplitSegment {
                 format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
                 bucket,
@@ -777,7 +790,7 @@ impl ManifestLayout {
             .await
             .map_err(|error| map_storage_error(&self.index_id, error))?;
         super::metrics::MANIFEST_FOLDS_TOTAL.inc();
-        self.garbage_collect(storage, commit_epoch).await;
+        self.garbage_collect(storage, stripe, commit_epoch).await;
         self.garbage_collect_wal(storage, stripe, commit_epoch)
             .await;
         Ok(true)
@@ -785,22 +798,22 @@ impl ManifestLayout {
 
     /// Deletes segments no reader can still need: those the manifests no longer name and whose
     /// generation is older than the grace period.
-    async fn garbage_collect(&self, storage: &dyn Storage, epoch: u64) {
-        let (live, slowest_generation) = match self.live_segments(storage).await {
+    ///
+    /// One stripe at a time, and against that stripe's own generation: its segments are in its own
+    /// directory, its manifest is the only thing that names them, and the reader the grace protects
+    /// is the one holding an older manifest *of this stripe*.
+    async fn garbage_collect(&self, storage: &dyn Storage, stripe: usize, epoch: u64) {
+        let Some(delete_before) = epoch.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
+            return;
+        };
+        let live = match self.live_segments(storage, stripe).await {
             Ok(live) => live,
             Err(error) => {
                 warn!(index_id = %self.index_id, %error, "failed to list live segments for gc");
                 return;
             }
         };
-        // `epoch` is this stripe's own generation; the watermark is the slowest stripe's, because a
-        // generation names objects on every stripe's own timeline. A slow stripe only makes garbage
-        // live longer, which is the safe direction.
-        let watermark = epoch.min(slowest_generation);
-        let Some(delete_before) = watermark.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
-            return;
-        };
-        let mut pages = storage.list(&self.segments_prefix());
+        let mut pages = storage.list(&self.segment_stripe_prefix(stripe));
         loop {
             let page = match pages.try_next().await {
                 Ok(Some(page)) => page,
@@ -841,15 +854,9 @@ impl ManifestLayout {
     /// the segments get, and for the same reason: a reader holding an older manifest may still
     /// be fetching what it names.
     async fn garbage_collect_wal(&self, storage: &dyn Storage, stripe: usize, epoch: u64) {
-        let slowest_generation = match self.slowest_fold_generation(storage).await {
-            Ok(generation) => generation,
-            Err(error) => {
-                warn!(index_id = %self.index_id, %error, "failed to read the fold generations for gc");
-                return;
-            }
-        };
-        let watermark = epoch.min(slowest_generation);
-        let Some(delete_before) = watermark.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
+        // The WAL objects of a stripe are in that stripe's own directory and are named by its own
+        // fold generation, so they are collected against it, exactly like its segments.
+        let Some(delete_before) = epoch.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
             return;
         };
         let prefix = self.wal_prefix(stripe);
@@ -883,37 +890,23 @@ impl ManifestLayout {
         }
     }
 
-    /// Segments the manifests name, plus the fold generation of the stripe that has folded least
-    /// recently.
+    /// Segments the manifest of this stripe names.
     async fn live_segments(
         &self,
         storage: &dyn Storage,
-    ) -> MetastoreResult<(BTreeSet<String>, u64)> {
+        stripe: usize,
+    ) -> MetastoreResult<BTreeSet<String>> {
         let mut live = BTreeSet::new();
-        let mut slowest_generation = u64::MAX;
-        for stripe in 0..self.num_stripes {
-            let (manifest, _) = self.read_manifest(storage, stripe).await?;
-            live.extend(
-                manifest
-                    .segments
-                    .values()
-                    .map(|segment| segment.key.clone()),
-            );
-            slowest_generation = slowest_generation.min(manifest.fold_generation);
-            // A fold that has written its segments but not yet committed them leaves them
-            // unreferenced; they are younger than the grace period and survive.
-        }
-        Ok((live, slowest_generation))
-    }
-
-    /// Fold generation of the stripe that has folded least recently.
-    async fn slowest_fold_generation(&self, storage: &dyn Storage) -> MetastoreResult<u64> {
-        let mut slowest_generation = u64::MAX;
-        for stripe in 0..self.num_stripes {
-            let (manifest, _) = self.read_manifest(storage, stripe).await?;
-            slowest_generation = slowest_generation.min(manifest.fold_generation);
-        }
-        Ok(slowest_generation)
+        let (manifest, _) = self.read_manifest(storage, stripe).await?;
+        live.extend(
+            manifest
+                .segments
+                .values()
+                .map(|segment| segment.key.clone()),
+        );
+        // A fold that has written its segments but not yet committed them leaves them
+        // unreferenced; they are younger than the grace period and survive.
+        Ok(live)
     }
 
     async fn read_segment(
@@ -1219,12 +1212,12 @@ mod tests {
                 })
                 .collect();
             publish_and_fold(&layout, &storage, splits).await;
-            num_wal_objects += count_objects(&storage, "wal").await;
+            num_wal_objects += count_objects(&storage, "wal-000").await;
         }
         // Four folds, each collecting the WAL of the fold before it: what is left is the most
         // recent generation (and the one before it, inside the grace), never everything
         // ever written.
-        let remaining = count_objects(&storage, "wal").await;
+        let remaining = count_objects(&storage, "wal-000").await;
         assert!(
             remaining <= 4,
             "wal objects are piling up: {remaining} left after {num_wal_objects} published"
@@ -1240,15 +1233,68 @@ mod tests {
         );
     }
 
+    /// A fold collects the WAL objects it took over, and the grace that decides when is a number of
+    /// *folds*.
+    ///
+    /// The WAL objects of a stripe have to be named in the same unit as the collection compares
+    /// them against. Named after the commit counter instead — a stripe commits once per publish and
+    /// folds once per 32 of them — they never reach a watermark counted in folds, so every fold
+    /// clears the manifest's list while leaving all the objects behind and the layout grows with
+    /// its writes again.
+    #[tokio::test]
+    async fn test_folding_collects_wal_objects_when_publishes_outnumber_folds() {
+        let layout = ManifestLayout::new("test-index", BUCKET_SECS, 1);
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        // 40 publishes per round: the 32nd folds the stripe, so the rounds are folds that each took
+        // over far more objects than they left.
+        const ROUNDS: usize = 4;
+        const BATCHES_PER_ROUND: usize = 40;
+        for round in 0..ROUNDS {
+            for batch in 0..BATCHES_PER_ROUND {
+                let split = split(
+                    &format!("split-{round}-{batch}"),
+                    Some(1_700_000_000..=1_700_000_060),
+                );
+                layout
+                    .publish_ops(
+                        &storage,
+                        vec![SplitOp {
+                            split_id: split.split_id().clone(),
+                            split: Some(split),
+                        }],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let remaining = count_objects(&storage, "wal-000").await;
+        assert!(
+            remaining <= 3 * BATCHES_PER_ROUND,
+            "wal objects are piling up: {remaining} left after {} publishes and {ROUNDS} folds",
+            ROUNDS * BATCHES_PER_ROUND
+        );
+        let splits = layout
+            .list_splits(&storage, 1_699_999_000, 1_700_010_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            splits.len(),
+            ROUNDS * BATCHES_PER_ROUND,
+            "the splits themselves must survive the collection"
+        );
+    }
+
     /// A stripe that folds often must not collect what a stripe that folds rarely may still have
     /// readers fetching.
     ///
-    /// Segments of every stripe live in the same bucket directory, so a watermark taken from the
-    /// folding stripe's own generation deletes a slow stripe's segments — which its readers,
-    /// holding a manifest that names them, are still fetching. The watermark is the slowest
-    /// stripe's.
+    /// A stripe's segments are written, named and collected by that stripe: they are in the
+    /// stripe's own directory, and its own generation is what the grace counts. A watermark taken
+    /// across stripes, or the folding stripe's generation applied to every stripe's directory,
+    /// deletes a slow stripe's segments — which its readers, holding a manifest that names them,
+    /// are still fetching.
     #[tokio::test]
-    async fn test_gc_watermark_follows_the_slowest_stripe() {
+    async fn test_a_fast_stripe_does_not_collect_a_slow_stripe() {
         let layout = layout();
         let storage = RamStorage::default();
         layout.create(&storage).await.unwrap();
@@ -1287,11 +1333,74 @@ mod tests {
         }
         let segments = count_objects(&storage, "segments").await;
         assert_eq!(
-            segments, 8,
-            "the slow stripe's generations must survive the fast stripe's folds"
+            segments, 4,
+            "each stripe collects its own superseded segments and keeps two generations"
+        );
+        // The state that actually matters, and the one a shared watermark breaks: what a manifest
+        // names has to be there.
+        for stripe in 0..layout.num_stripes {
+            let (manifest, _) = layout.read_manifest(&storage, stripe).await.unwrap();
+            for segment in manifest.segments.values() {
+                if let Err(error) = storage.get_all(Path::new(&segment.key)).await {
+                    panic!(
+                        "stripe {stripe} names a segment that was collected: {} ({error})",
+                        segment.key
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collection must not depend on every stripe folding.
+    ///
+    /// `num_stripes` is 32 by default and a small index publishes into a handful of them: the rest
+    /// never fold and keep generation 0. A watermark taken across stripes is then 0, the collection
+    /// never runs, and every fold of a busy stripe leaves a segment behind that nothing will ever
+    /// delete — the index grows with its writes again, which is what this layout exists to stop.
+    #[tokio::test]
+    async fn test_a_stripe_that_never_folds_does_not_stop_the_collection() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        // Only stripe 0 is written to; stripe 1 stays at its initial generation.
+        for round in 0..6 {
+            let split = (0..)
+                .map(|candidate| {
+                    split(
+                        &format!("split-{round}-{candidate}"),
+                        Some(1_700_000_000..=1_700_000_060),
+                    )
+                })
+                .find(|split| layout.stripe_of(split.split_id().as_str()) == 0)
+                .unwrap();
+            let ops = vec![SplitOp {
+                split_id: split.split_id().clone(),
+                split: Some(split),
+            }];
+            layout.publish_ops(&storage, ops).await.unwrap();
+            layout.fold(&storage, 0).await.unwrap();
+        }
+        assert_eq!(
+            count_objects(&storage, "segments").await,
+            2,
+            "six folds of one stripe must leave two generations, not six segments"
+        );
+        let splits = layout
+            .list_splits(&storage, 1_699_999_000, 1_700_010_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            splits.len(),
+            6,
+            "the splits themselves must survive the collection"
         );
     }
 
+    /// Objects under a prefix of this test's storage, for the tests that count them.
+    ///
+    /// The prefix has to name a directory of the layout exactly: `RamStorage::list` matches whole
+    /// path components, so `"wal"` counts nothing of `wal-000/` — which is how a test that meant to
+    /// assert the WAL was collected passed without looking at anything.
     async fn count_objects(storage: &RamStorage, prefix: &str) -> usize {
         let mut pages = storage.list(Path::new(&format!("test-index/v3/{prefix}")));
         let mut count = 0;

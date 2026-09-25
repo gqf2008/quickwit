@@ -112,7 +112,11 @@ and runs the same mutation closure as the other layouts). The rest of this plan 
 
 1. **Layout module** (`file_backed/manifest_layout.rs`): manifest, WAL objects, per-time-bucket segments,
    fold, and the windowed read — essentially the spike, hardened (format version, GC of superseded
-   segments, torn-write handling as in `LESSON_条件写失败后不得清理自己写的对象.md`).
+   segments, torn-write handling as in `LESSON_条件写失败后不得清理自己写的对象.md`). Segments and
+   WAL objects belong to the stripe that wrote them, in its own directory, and are collected against
+   that stripe's own fold generation: stripes fold at different rates, so a shared watermark either
+   collects what a slow stripe is still reading or never collects at all while one stripe of the
+   index has not folded yet.
 2. **Split operations** (`file_backed/`): `stage_splits`, `publish_splits`, `mark_splits_for_deletion`,
    `delete_splits` become WAL appends plus one manifest CAS in the sharded/distributed path, with the
    existing bounded replay. `FileBackedIndex` stays as the single-node, in-memory model.

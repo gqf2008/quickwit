@@ -198,9 +198,19 @@ built for large indexes:
 ```
 <index_id>/v3/manifest-<stripe>.json              mutable: references only, one compare-and-swap
 <index_id>/v3/wal-<stripe>/<id>.json              immutable: one object per published batch
-<index_id>/v3/segments/<bucket>/<epoch>-<id>.json immutable: one per time bucket
+<index_id>/v3/segments/<stripe>/<bucket>/<generation>-<id>.json immutable: one per time bucket
 <index_id>/v3/root.json                           metadata, sources, checkpoints, delete tasks
 ```
+
+Segments and WAL objects live under the stripe that wrote them and are collected against that
+stripe's own fold generation: a stripe keeps the two generations after its latest fold, which is the
+window a reader that lost a race needs to finish fetching what the manifest it holds names. A stripe
+that folds often therefore cannot collect what a stripe that folds rarely is still reading, and a
+stripe that has never folded does not stop the stripes that have from collecting theirs.
+
+Nodes sharing a prefix have to agree on what those generations mean: a node that counted them
+differently would collect objects another node is still reading, so an index in this layout follows
+the mixed-version rule above and is served by one revision at a time.
 
 A publish appends one WAL object and commits one manifest: it costs what it touches, not what the
 index holds. **Size the stripe count at or above the number of nodes that publish into one index**
