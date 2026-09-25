@@ -276,14 +276,23 @@ impl ManifestLayout {
     }
 
     /// Creates the empty manifests of an index. Fails if one already exists.
+    ///
+    /// The manifests are created together: one round trip per stripe in sequence would make
+    /// creating an index cost as many round trips as it has stripes (32 of them by default),
+    /// which on a bucket that is a round trip away is the difference between instant and half a
+    /// minute.
     pub(crate) async fn create(&self, storage: &dyn Storage) -> MetastoreResult<()> {
-        for stripe in 0..self.num_stripes {
-            let body = serde_utils::to_json_bytes(&StripeManifest::new(self.bucket_secs))?;
-            storage
-                .put_if_absent(&self.manifest_path(stripe), Box::new(body))
-                .await
-                .map_err(|error| map_storage_error(&self.index_id, error))?;
-        }
+        let body = serde_utils::to_json_bytes(&StripeManifest::new(self.bucket_secs))?;
+        futures::future::try_join_all((0..self.num_stripes).map(|stripe| {
+            let body = body.clone();
+            async move {
+                storage
+                    .put_if_absent(&self.manifest_path(stripe), Box::new(body))
+                    .await
+                    .map_err(|error| map_storage_error(&self.index_id, error))
+            }
+        }))
+        .await?;
         Ok(())
     }
 

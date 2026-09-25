@@ -214,12 +214,13 @@ five publishes each:
 | 32 | **1 / 60** | **0.02** | **2.18 publishes/s** |
 
 Four writers saw no conflict at all with eight stripes, so the rule is a margin over the writer count
-rather than a constant. More stripes cost nothing on the read side: all the manifests of an index are
-fetched in parallel, so they share one round trip. A read loads the manifests, prunes the time buckets the query cannot touch, and fetches
-only the segments that remain plus the WAL tail, so it costs the query's window. `num_stripes` (8 by
-default here) is not an optimisation: the spike measured one manifest per index failing to sustain the
-write rate a 5·10¹² documents/day index needs once the round trip stops being same-zone, and eight
-stripes reaching it with no conflicts at all.
+rather than a constant. More stripes cost no *extra round trip* on the read side — a read loads the
+manifests (in parallel, so they share one), prunes the time buckets the query cannot touch, and fetches
+only the segments that remain plus the WAL tail, so it costs the query's window rather than the index —
+but they do multiply the number of requests a read makes, and creating an index puts one (also
+parallel) object per stripe. With a *single* manifest the spike measured the write rate a
+5·10¹² documents/day index needs failing once the round trip stops being same-zone, which is why the
+count is sized from the writers rather than left at a constant.
 
 Measured through the metastore API at 50 000 splits over 30 days, one hour queried, on RAM storage so
 the numbers are the metastore's own work (2026-09, same machine as the other layouts):

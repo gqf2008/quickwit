@@ -642,7 +642,12 @@ async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
 
     // Concurrent writers, the only place where contention shows up as something other than latency.
     // `QW_TEST_S3_WRITERS` drives the count so the stripe count can be checked against it: writers
-    // that hash to the same stripe contend, and eight stripes are only enough for eight writers.
+    // that hash to the same stripe contend.
+    //
+    // Caveat on the reader's side of this number: the split ids here are `writer-N-M`, which do not
+    // hash like real ULIDs, so the conflicts below are a lower bound on what a deployment with the
+    // same writer count would see. The rule it checks (stripes at or above the writer count) is
+    // what matters, and a deployment should recheck it with its own ids.
     let num_writers: usize = std::env::var("QW_TEST_S3_WRITERS")
         .ok()
         .and_then(|value| value.parse().ok())
