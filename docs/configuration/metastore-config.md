@@ -114,10 +114,12 @@ per node grows with the index.
 immutable segments referenced by striped manifests, so a read costs the query's window rather than the
 index, and a write costs the splits it touches rather than the splits the index holds
 ([measured](../operating/shared-metastore.md#splits-as-manifests-segments-and-a-wal-tail): a publish at
-50 000 splits drops from 1.32 s to 29 ms and a windowed read from 749 ms to 154 ms). Past a few gigabytes of split metadata — a few million splits —
-**use PostgreSQL** (see [Sharded metastore
-sizing](../operating/shared-metastore.md#sizing-when-this-layout-is-the-wrong-tool)): it updates one
-row per split, and a search reads only the rows of its time window.
+50 000 splits drops from 1.43 s to 22 ms and a windowed read from 743 ms to 99 ms). Past a few
+gigabytes of split metadata — a few million splits — the whole-index layouts stop fitting; this is
+the object-storage answer, and it has one condition: **the nodes have to sit next to the bucket**
+(see [Sizing: which backend to
+use](../operating/shared-metastore.md#sizing-which-backend-to-use-and-when-to-stop-using-this-one)
+for the round-trip arithmetic and for when PostgreSQL is the better answer).
 
 #### Monitoring a shared metastore
 

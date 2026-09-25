@@ -141,54 +141,63 @@ read reloads from the object store and sees every writer's splits, at the cost o
 write-then-read pair on top of the read the write itself needs. A node that only reads still needs
 `#polling_interval` to notice other nodes' work, which is the contract it always had.
 
-### Sizing: when this layout is the wrong tool
+### Sizing: which backend to use, and when to stop using this one
 
-The layout fixes *how much a write writes*. It does not change how much a read reads: the file-backed
-metastore keeps the split map of an index in memory on every node, and reloads it in full before
-every mutation. Both are `O(splits in the index)`, so a 15 M-split index means a ~12 GB in-memory
-split map per node and a full reload per write, whatever the layout.
+The default and sharded layouts fix *how much a write writes*. They do not change how much a read
+reads: the file-backed metastore keeps the split map of an index in memory on every node, and reloads
+it in full before every mutation. Both are `O(splits in the index)`, so a 15 M-split index means a
+~12 GB in-memory split map per node and a full reload per write, whatever the layout. **The manifest
+layout is the one that breaks that**: a read costs the query's window, a write only the splits it
+touches. What it costs instead is the round trip to the bucket — three of them per publish — so for a
+large index the question is not "object storage or a database" in the abstract, it is where the nodes
+are.
 
-Measured on this machine (2026-09), comparing the two backends at the scale each is used at —
-PostgreSQL over loopback, the file-backed metastore on RAM so that the numbers are the metastore's
-own work rather than the network:
+Measured on this machine (2026-09-25): the three object-storage layouts on RAM at 50 000 splits over
+30 days, one hour queried (RAM so the numbers are the metastore's own work and not the network), and
+PostgreSQL over loopback at 1 000 000 splits.
 
-| Workload | File-backed, 50 000 splits | PostgreSQL, 1 000 000 splits |
-| -------- | -------------------------- | ---------------------------- |
-| publish one split into the index | 1.25–1.35 s (reload and rewrite of the whole index) | **8.4 ms** (one row update) |
-| `list_splits` for one hour of a 30-day index | 7 ms, served from the in-memory copy of the whole index | **57 ms**, 776 KB read from the database |
-| `list_splits` for the whole index | the node already holds it, and holds it for good | streams: first chunk in 4 ms, 37 s for all 1 M rows |
-| Memory per node | the whole split map (~38 MB at 50 k splits, ~12 GB at 15 M) | none |
+| Workload | Single object | Sharded (256 slots) | Manifest | PostgreSQL |
+| -------- | ------------- | ------------------- | -------- | ---------- |
+| `list_splits` for one hour of a 30-day index | 743 ms | 1 910 ms | **99 ms** | **57 ms**, 776 KB |
+| publish one split into the index | 1 427 ms | 1 839 ms | **22 ms** | **8.4 ms** |
+| staging throughput | 2 747/s | 2 817/s | **6 957/s** | ~18 000/s |
+| Memory per node | the whole split map (~12 GB at 15 M) | the whole split map | none | none |
+| `list_splits` for the whole index | the in-memory copy | the in-memory copy | the window's metadata | streams: 4 ms to the first chunk, 37 s for 1 M rows |
 
-Both runs are in the repository (`quickwit-metastore/tests/file_backed_scale.rs` and
-`quickwit-metastore/tests/postgres_scale.rs`); rerun them with `QW_TEST_SCALE_SPLITS` and
-`QW_TEST_POSTGRES_URI`.
+The same run at 200 000 splits — 4× the index, same machine and harness — says what the last two
+columns buy. The manifest layout's windowed read is **74 ms** and its single publish **14 ms**: the
+same numbers as at 50 000, because neither operation loads the index. Only its bulk paths grow, and
+less than the index does (staging 9 033/s and publishing all of them 6 424/s, 3.1–3.3× the time for 4×
+the splits), while the other two layouts grow on every number (single object: a 3.16 s windowed read
+and a 5.89 s publish; sharded: 4.59 s and 4.57 s).
+
+Both runs are in the repository (`quickwit-metastore/tests/file_backed_scale.rs` measures all three
+layouts in one run, `quickwit-metastore/tests/postgres_scale.rs` the database); rerun them with
+`QW_TEST_SCALE_SPLITS` (50 000 or 200 000) and `QW_TEST_POSTGRES_URI`.
 
 For a 5·10¹² documents/day index (500 000 splits/day, ~15 M splits at 30 days of retention) the
-conclusion is that **PostgreSQL is the backend to use**: a publish touches one row, and a search reads
-the rows of its time window through an index, independently of how many splits the index holds. The
-object-storage metastore is the right tool when the point is to avoid operating a database and the
-metadata stays in the single-digit-gigabyte range; past that it needs a split map that is queried and
-mutated per time bucket instead of loaded whole, which is a different design rather than a setting.
+backend to use follows the locality of its nodes:
 
-The database part of that windowed read is small — `EXPLAIN (ANALYZE, BUFFERS)` on the 1 M-split index
-shows a bitmap index scan over the window (3 112 index entries, 70 shared buffers) executing in
-**0.2 ms**; the 57 ms above is the metastore serializing and the client decoding the 776 KB of split
-metadata those rows carry. That is what "reads only the window" means in practice: the window's
-metadata, not the index's.
+- **Nodes next to the bucket (same region, tens of milliseconds away): object storage, in the
+  manifest layout.** It is the layout whose read and write cost does not grow with the index, it needs
+  no second component to run, back up and keep highly available, and the round trip allows the rate:
+  a publish is three storage calls, so ~16 publishes/s per node at a 20 ms round trip, and the spike
+  sustained 12/s with five writers on eight stripes and no conflicts.
+- **Nodes away from the bucket: PostgreSQL, or move the nodes.** At the 0.81 s round trip the real
+  bucket below measures from this machine those same three calls are ~2.4 s, so one node publishes
+  0.4/s and twelve writers reach 3.8/s — under the 5.8 publishes/s this shape asks for. A database
+  answers in one round trip because the server owns the storage, and the database part of a windowed
+  read is small: `EXPLAIN (ANALYZE, BUFFERS)` on the 1 M-split index shows a bitmap index scan over
+  the window (3 112 index entries, 70 shared buffers) executing in **0.2 ms**, so the 57 ms above is
+  the metastore serializing and the client decoding 776 KB of split metadata.
 
-Choosing PostgreSQL is not free — it is another component to run, back up and upgrade, and at this
-scale it is a single point of failure unless it is itself made highly available. What the numbers
-above say is narrower and firmer: an index whose metadata no longer fits the object-storage
-metastore's whole-index model needs the query-and-row model, and PostgreSQL already implements it.
-
-Sizing it from the same measurement: 1 M splits took 1.5 GB of table *and* indexes, so the 15 M
-splits of that 30-day index are ~23 GB in the database — plan storage for the metadata of every index
-you keep, and prefer retention (or one index per period) over a single index that lives forever.
-Throughput is not the constraint: the index above accepted splits at ~18 000/s in batches, needs
-5.8 publishes/s at 5·10¹² documents/day, and a single publish takes 8 ms, so one connection has
-orders of magnitude of headroom. Watch the connection count instead: every node holds
-`max_connections` connections (`metastore.postgresql` in the node config), so a large cluster wants
-its `max_connections` per node kept small or a pooler in front.
+The 15 M splits of that index are ~23 GB in PostgreSQL (1 M splits took 1.5 GB of table *and*
+indexes), so plan storage for the metadata of every index you keep and prefer retention, or one index
+per period, over a single index that lives forever. On object storage the same metadata is the index's
+segments and WAL objects in the bucket it already uses. If the choice is PostgreSQL, watch the
+connection count rather than the throughput: every node holds `max_connections` connections
+(`metastore.postgresql` in the node config), so a large cluster wants that kept small or a pooler in
+front.
 
 ## Splits as manifests, segments and a WAL tail
 
@@ -237,17 +246,14 @@ parallel) object per stripe. With a *single* manifest the spike measured the wri
 count is sized from the writers rather than left at a constant.
 
 Measured through the metastore API at 50 000 splits over 30 days, one hour queried, on RAM storage so
-the numbers are the metastore's own work (2026-09, same machine as the other layouts):
-
-| | Single object | Sharded (256 slots) | Manifest layout |
-| --- | ------------- | ------------------- | --------------- |
-| `list_splits` (last hour) | 749 ms | 1 822 ms | **154 ms** |
-| publish one split | 1.32 s | 1.37 s | **29 ms** |
-| staging throughput | 2 799/s | 3 056/s | **8 119/s** |
-
-Both of the first two layouts grow with the index; this one grows with the query and with what a
-write touches, which is why the same 4× more splits cost it 2.4–2.9× rather than 4× in a rerun of the
-measurement. What it does *not* change is the round trip to the bucket: a publish is still three storage
+the numbers are the metastore's own work (2026-09-25): a windowed read takes **99 ms**, publishing one
+split **22 ms**, and staging runs at **6 957 splits/s** — against 743 ms, 1.43 s and 2 747/s for the
+default layout in the same run. The three-way comparison, and what it means for a large index, is
+[below](#sizing-which-backend-to-use-and-when-to-stop-using-this-one). It is also the layout that does
+not grow with the index: 4× the splits (200 000 against 50 000) leave a windowed read and a single
+publish at the same cost — 74 ms and 14 ms — because neither loads the index, and only its bulk paths
+grow, 3.1–3.3× for 4× the splits. What it does *not* change is the round trip to the bucket: a publish
+is still three storage
 calls plus the lookups of the splits it changes, so an index served from this layout wants its nodes
 next to the bucket, like every other layout here.
 

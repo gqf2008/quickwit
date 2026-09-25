@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation: how to upgrade and roll back a cluster that shares an object-storage metastore (including the
   lost-update hazard of mixing versions), and what a metadata write costs in requests and latency.
   (walgit: `qw-metastore-rollback-drill`, `qw-metastore-perf-bench`)
+- Documentation: for an index at the scale where the whole-index layouts stop fitting, the choice between
+  the object-storage metastore and PostgreSQL is now written as a locality decision — object storage in the
+  manifest layout when the nodes sit next to the bucket, PostgreSQL (or move the nodes) when they do not —
+  with the round-trip arithmetic and the measured numbers behind it. (walgit: `qw-metastore-backend-guidance`)
 
 ### Fixed
 - Metastore: a create that is replayed after losing a manifest race no longer answers `already exists` for the
