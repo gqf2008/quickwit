@@ -18,6 +18,9 @@ use quickwit_proto::metastore::{EntityKind, MetastoreError, MetastoreResult, ser
 use quickwit_storage::{ObjectVersion, Storage, StorageError, StorageErrorKind};
 
 use crate::metastore::file_backed::file_backed_index::FileBackedIndex;
+use crate::metastore::file_backed::manifest_layout::{
+    ManifestLayout, ManifestWriteContext, SplitOp,
+};
 use crate::metastore::file_backed::sharded_layout::{
     SLOT_FOLD_THRESHOLD as DEFAULT_FOLD_THRESHOLD, ShardedWriteContext, create_sharded_index,
     delete_sharded_index, load_sharded_index, sharded_index_exists, store_sharded_index,
@@ -79,6 +82,17 @@ pub enum IndexLayout {
         /// Number of slots the split map is spread over.
         num_slots: u32,
     },
+    /// Splits live in immutable segments, referenced by striped manifests.
+    ///
+    /// This is the layout that keeps a read's cost proportional to the query's window rather than
+    /// to the index: see [`super::manifest_layout`] and
+    /// `docs/internals/metastore-v3-manifest-and-segments.md`.
+    ManifestSegments {
+        /// Width of a time bucket, in seconds; one segment serves each bucket.
+        bucket_secs: i64,
+        /// Number of manifests, each with its own compare-and-swap point.
+        num_stripes: usize,
+    },
 }
 
 /// Version of an index, in whichever layout it lives.
@@ -87,6 +101,8 @@ pub(super) enum IndexVersion {
     SingleObject(ObjectVersion),
     /// Carries what the sharded layout needs to write the index back without re-reading it.
     Sharded(Box<ShardedWriteContext>),
+    /// Carries what the manifest layout needs to write the index back.
+    ManifestSegments(Box<ManifestWriteContext>),
 }
 
 pub(super) async fn load_index_with_version(
@@ -121,6 +137,13 @@ pub(super) async fn load_index_state(
                 }
                 return Ok((index, Some(IndexVersion::Sharded(Box::new(context)))));
             }
+            if let Some((index, context)) = load_manifest_index_if_exists(storage, index_id).await?
+            {
+                return Ok((
+                    index,
+                    Some(IndexVersion::ManifestSegments(Box::new(context))),
+                ));
+            }
             return Err(convert_error(index_id, storage_error));
         }
         Err(storage_error) => return Err(convert_error(index_id, storage_error)),
@@ -154,6 +177,10 @@ pub(super) async fn put_index_if_version_matches(
         store_sharded_index(storage, index, context).await?;
         return Ok(None);
     }
+    if let IndexVersion::ManifestSegments(context) = version {
+        store_manifest_index(storage, index, context).await?;
+        return Ok(None);
+    }
     let IndexVersion::SingleObject(version) = version else {
         unreachable!("handled above");
     };
@@ -179,6 +206,14 @@ pub(super) async fn create_index_file(
         IndexLayout::SingleObject => put_index_if_absent(storage, index).await,
         IndexLayout::Sharded { num_slots } => {
             create_sharded_index(storage, index, num_slots, DEFAULT_FOLD_THRESHOLD).await?;
+            Ok(None)
+        }
+        IndexLayout::ManifestSegments {
+            bucket_secs,
+            num_stripes,
+        } => {
+            let manifest_layout = ManifestLayout::new(index.index_id(), bucket_secs, num_stripes);
+            manifest_layout.create_index(storage, index).await?;
             Ok(None)
         }
     }
@@ -214,6 +249,9 @@ pub(super) async fn load_index(
                 let (index, _) = load_sharded_index(storage, index_id).await?;
                 return Ok(index);
             }
+            if let Some((index, _)) = load_manifest_index_if_exists(storage, index_id).await? {
+                return Ok(index);
+            }
             return Err(convert_error(index_id, storage_error));
         }
         Err(storage_error) => return Err(convert_error(index_id, storage_error)),
@@ -242,7 +280,12 @@ pub(super) async fn index_exists(storage: &dyn Storage, index_id: &str) -> Metas
     if exists {
         return Ok(true);
     }
-    sharded_index_exists(storage, index_id).await
+    if sharded_index_exists(storage, index_id).await? {
+        return Ok(true);
+    }
+    Ok(load_manifest_index_if_exists(storage, index_id)
+        .await?
+        .is_some())
 }
 
 /// Serializes the `Index` object and stores the data on the storage.
@@ -273,6 +316,78 @@ pub(super) async fn put_index(
     put_index_given_index_id(storage, index, index.index_id()).await
 }
 
+/// Loads an index stored in the manifest layout, when it exists.
+///
+/// Returns `None` when there is no root at `<index_id>/v3/root.json`, so a caller can fall through
+/// to the layouts that came before.
+pub(super) async fn load_manifest_index_if_exists(
+    storage: &dyn Storage,
+    index_id: &str,
+) -> MetastoreResult<Option<(FileBackedIndex, ManifestWriteContext)>> {
+    // The root is the one object every manifest-layout index has, so it is what a reader probes.
+    let probe = ManifestLayout::new(index_id, DEFAULT_BUCKET_SECS, 1);
+    if !probe.exists(storage).await? {
+        return Ok(None);
+    }
+    let (root_info, root_version, root_bytes) = probe.load_root(storage).await?;
+    // The layout parameters travel with the index, so a node reads an index another node created
+    // with settings it does not share.
+    let layout = ManifestLayout::new(index_id, root_info.bucket_secs, root_info.num_stripes);
+    let mut index = root_info.index;
+    let splits = layout.load_split_map(storage).await?;
+    let mut split_map = std::collections::HashMap::with_capacity(splits.len());
+    for split in splits {
+        split_map.insert(split.split_id().clone(), split);
+    }
+    index.put_splits(split_map);
+    if index.index_id() != index_id {
+        return Err(MetastoreError::Internal {
+            message: "inconsistent manifest: index_id mismatch".to_string(),
+            cause: format!(
+                "expected index_id `{index_id}`, but found `{}`",
+                index.index_id()
+            ),
+        });
+    }
+    let context = ManifestWriteContext {
+        layout,
+        root_version,
+        root_bytes,
+    };
+    Ok(Some((index, context)))
+}
+
+/// Default bucket width for a new index: one segment per hour, so a 30-day index keeps ~720
+/// segments and a query for one hour fetches one of them.
+const DEFAULT_BUCKET_SECS: i64 = 3_600;
+
+/// Writes an index back in the manifest layout.
+///
+/// The split map is not rewritten: only the splits the mutation touched are published, as an
+/// immutable WAL object per stripe, using the compare-and-swap of that stripe's manifest. The rest
+/// of the index (metadata, sources, checkpoints, delete tasks) keeps a small single-object commit.
+pub(super) async fn store_manifest_index(
+    storage: &dyn Storage,
+    index: &mut FileBackedIndex,
+    context: &ManifestWriteContext,
+) -> MetastoreResult<()> {
+    let layout = &context.layout;
+    let touched_split_ids = index.take_touched_split_ids();
+    let ops: Vec<SplitOp> = touched_split_ids
+        .into_iter()
+        .map(|split_id| SplitOp {
+            split: index.split_opt(&split_id).cloned(),
+            split_id,
+        })
+        .collect();
+    if !ops.is_empty() {
+        layout.publish_ops(storage, ops).await?;
+    }
+    layout
+        .store_root(storage, index, &context.root_bytes, &context.root_version)
+        .await
+}
+
 /// Serializes the Index and stores the data on the storage.
 pub(super) async fn delete_index(storage: &dyn Storage, index_id: &str) -> MetastoreResult<()> {
     let metastore_filepath = metastore_filepath(index_id);
@@ -287,6 +402,9 @@ pub(super) async fn delete_index(storage: &dyn Storage, index_id: &str) -> Metas
         // root, a view, the slot files and the segments.
         if sharded_index_exists(storage, index_id).await? {
             return delete_sharded_index(storage, index_id).await;
+        }
+        if let Some((_, context)) = load_manifest_index_if_exists(storage, index_id).await? {
+            return context.layout.delete(storage).await;
         }
         return Err(MetastoreError::NotFound(EntityKind::Index {
             index_id: index_id.to_string(),

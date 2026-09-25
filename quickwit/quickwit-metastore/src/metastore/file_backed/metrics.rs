@@ -71,3 +71,33 @@ pub(super) static SHARD_STALE_VIEW_RETRIES_TOTAL: LazyCounter = lazy_counter!(
                   restarted from the top.",
     subsystem: "metastore",
 );
+
+/// Number of reads of a manifest-layout index that caught a stripe moving and restarted.
+///
+/// The manifests of that layout are striped and each write commits one stripe; a read that lands
+/// between a stripe's read and its commit restarts rather than mixing two epochs.
+pub(super) static MANIFEST_STALE_READS_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_manifest_stale_reads_total",
+    description: "Number of reads of a manifest-layout index that caught a stripe moving and \
+                  restarted. Occasional restarts are normal under concurrent writes.",
+    subsystem: "metastore",
+);
+
+/// Number of folds of a manifest-layout stripe.
+pub(super) static MANIFEST_FOLDS_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_manifest_folds_total",
+    description: "Number of manifest-layout stripes folded into a segment. Folding is what keeps a \
+                  read's segment list short and the WAL tail small.",
+    subsystem: "metastore",
+);
+
+/// Number of folds of a manifest-layout stripe that failed and were left for the next write.
+///
+/// The publish that triggered the fold is already durable, so this is maintenance falling behind:
+/// a rising rate with the fold counter standing still means WAL tails and read costs are growing.
+pub(super) static MANIFEST_FOLD_FAILURES_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_manifest_fold_failures_total",
+    description: "Number of folds of a manifest-layout stripe that failed and were left for the \
+                  next write to retry.",
+    subsystem: "metastore",
+);

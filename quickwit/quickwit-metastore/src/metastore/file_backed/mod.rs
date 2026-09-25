@@ -22,6 +22,7 @@ mod index_id_matcher;
 mod index_template_matcher;
 mod lazy_file_backed_index;
 pub(crate) mod manifest;
+mod manifest_layout;
 mod metrics;
 mod sharded_layout;
 mod state;
@@ -30,6 +31,7 @@ mod store_operations;
 use core::fmt;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,12 +104,34 @@ pub const ALLOW_UNSAFE_STORAGE_ENV_KEY: &str = "QW_METASTORE_ALLOW_UNSAFE_STORAG
 /// [`sharded_layout`](crate::metastore::file_backed::sharded_layout).
 pub const SHARDED_LAYOUT_ENV_KEY: &str = "QW_METASTORE_SHARDED_LAYOUT";
 
+/// Environment variable that makes this node create indexes in the manifest layout.
+///
+/// That layout keeps the split map out of the mutable object: splits live in immutable segments,
+/// referenced by striped manifests, so a read costs the query's window and a write costs the
+/// batches it publishes (see [`manifest_layout`](crate::metastore::file_backed::manifest_layout)).
+/// Like the sharded layout it is opt-in and recorded in the objects, so a node reads an index
+/// whichever layout created it.
+pub const MANIFEST_LAYOUT_ENV_KEY: &str = "QW_METASTORE_MANIFEST_LAYOUT";
+
+/// Width of a time bucket, in seconds, for indexes created in the manifest layout.
+const MANIFEST_LAYOUT_BUCKET_SECS: i64 = 3_600;
+
+/// Number of manifests (compare-and-swap points) an index created in the manifest layout has.
+///
+/// Striping is a requirement, not an optimisation: the spike measured one manifest failing to
+/// sustain the write rate a 5·10¹² documents/day index needs away from a same-zone round trip, and
+/// eight stripes reaching it with no conflicts.
+const MANIFEST_LAYOUT_NUM_STRIPES: usize = 8;
+
 /// Environment variable that makes the metastore test suite run on the sharded layout.
 ///
 /// The suite is generic over the metastore implementation, so the layout cannot be a type parameter
 /// without a wrapper for every method. Running the same suite twice, once with this variable set,
 /// gives the sharded layout the same coverage as the historical one.
 pub const SHARDED_LAYOUT_TEST_ENV_KEY: &str = "QW_METASTORE_TEST_SHARDED_LAYOUT";
+
+/// Environment variable that makes the metastore test suite run on the manifest layout.
+pub const MANIFEST_LAYOUT_TEST_ENV_KEY: &str = "QW_METASTORE_TEST_MANIFEST_LAYOUT";
 
 /// Number of times a mutation is replayed before the metastore gives up on a compare-and-swap race.
 ///
@@ -148,6 +172,26 @@ fn record_cas_conflict(giving_up: bool) {
     if giving_up {
         metrics::CAS_CONFLICTS_EXHAUSTED_TOTAL.inc();
     }
+}
+
+/// Window to prune with, derived from a query's time bounds.
+///
+/// The metastore's predicate keeps a split when its time range overlaps the query's, so the window
+/// has to contain every such split and may contain more: the caller filters again afterwards.
+/// Bounds are inclusive on both sides in `FilterRange`, hence the off-by-one adjustments.
+fn pruning_window(query: &ListSplitsQuery) -> (i64, i64) {
+    let window_start = match query.time_range.start {
+        Bound::Unbounded => i64::MIN,
+        Bound::Included(start) => start,
+        // A split whose end is strictly after `start` has an end of at least `start + 1`.
+        Bound::Excluded(start) => start.saturating_add(1),
+    };
+    let window_end = match query.time_range.end {
+        Bound::Unbounded => i64::MAX,
+        Bound::Included(end) => end.saturating_add(1),
+        Bound::Excluded(end) => end,
+    };
+    (window_start, window_end)
 }
 
 /// Builds the error raised when the metastore storage cannot safely be shared.
@@ -429,19 +473,38 @@ impl FileBackedMetastore {
         // The sharded layout is built on conditional writes, so it only makes sense where the
         // distributed path runs; asking for it on a storage that cannot compare-and-swap would
         // publish indexes this node cannot write back.
-        let index_layout = if quickwit_common::get_bool_from_env(SHARDED_LAYOUT_ENV_KEY, false) {
+        let manifest_layout_requested =
+            quickwit_common::get_bool_from_env(MANIFEST_LAYOUT_ENV_KEY, false);
+        let sharded_layout_requested =
+            quickwit_common::get_bool_from_env(SHARDED_LAYOUT_ENV_KEY, false);
+        if manifest_layout_requested && sharded_layout_requested {
+            return Err(MetastoreError::Internal {
+                message: "two metastore layouts were requested at once".to_string(),
+                cause: format!(
+                    "{MANIFEST_LAYOUT_ENV_KEY} and {SHARDED_LAYOUT_ENV_KEY} cannot both be true"
+                ),
+            });
+        }
+        let index_layout = if manifest_layout_requested || sharded_layout_requested {
             if !distributed {
                 return Err(MetastoreError::Internal {
-                    message: "the sharded metastore layout requires conditional writes".to_string(),
+                    message: "this metastore layout requires conditional writes".to_string(),
                     cause: format!(
-                        "{SHARDED_LAYOUT_ENV_KEY}=true but `{}` does not support the \
+                        "a split layout was requested but `{}` does not support the \
                          compare-and-swap this layout is built on",
                         storage.uri()
                     ),
                 });
             }
-            IndexLayout::Sharded {
-                num_slots: DEFAULT_NUM_SLOTS,
+            if manifest_layout_requested {
+                IndexLayout::ManifestSegments {
+                    bucket_secs: MANIFEST_LAYOUT_BUCKET_SECS,
+                    num_stripes: MANIFEST_LAYOUT_NUM_STRIPES,
+                }
+            } else {
+                IndexLayout::Sharded {
+                    num_slots: DEFAULT_NUM_SLOTS,
+                }
             }
         } else {
             IndexLayout::SingleObject
@@ -925,6 +988,20 @@ impl FileBackedMetastore {
     ) -> MetastoreResult<Vec<Split>> {
         let mut splits_per_index = Vec::with_capacity(index_id_with_incarnation_id_opts.len());
         for (index_id, incarnation_id_opt) in index_id_with_incarnation_id_opts {
+            // An index stored in the manifest layout is read from its segments, pruned by the
+            // query's window, instead of being materialised: that is the whole point of the layout.
+            match self
+                .manifest_layout_list_splits(index_id, *incarnation_id_opt, &list_splits_query)
+                .await
+            {
+                Ok(Some(splits)) => {
+                    splits_per_index.push(splits);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(MetastoreError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            }
             match self
                 .read_any(index_id, *incarnation_id_opt, |index| {
                     index.list_splits(&list_splits_query)
@@ -953,6 +1030,51 @@ impl FileBackedMetastore {
             .collect();
 
         Ok(merged_results)
+    }
+
+    /// Reads the splits of a manifest-layout index straight from its segments and WAL tail.
+    ///
+    /// Returns `Ok(None)` when the index is not stored in that layout, so the caller falls back to
+    /// the in-memory path. The window passed to the layout is a superset of what the query can
+    /// return: it is derived from the query's time bounds, and splits without a time range live in
+    /// a bucket no window prunes.
+    async fn manifest_layout_list_splits(
+        &self,
+        index_id: &str,
+        incarnation_id_opt: Option<Ulid>,
+        list_splits_query: &ListSplitsQuery,
+    ) -> MetastoreResult<Option<Vec<Split>>> {
+        let probe = manifest_layout::ManifestLayout::new(
+            index_id,
+            MANIFEST_LAYOUT_BUCKET_SECS,
+            MANIFEST_LAYOUT_NUM_STRIPES,
+        );
+        if !probe.exists(&*self.storage).await? {
+            return Ok(None);
+        }
+        let (root_info, _, _) = probe.load_root(&*self.storage).await?;
+        if let Some(incarnation_id) = incarnation_id_opt
+            && root_info.index.index_uid().incarnation_id != incarnation_id
+        {
+            return Err(MetastoreError::NotFound(EntityKind::Index {
+                index_id: index_id.to_string(),
+            }));
+        }
+        let layout = manifest_layout::ManifestLayout::new(
+            index_id,
+            root_info.bucket_secs,
+            root_info.num_stripes,
+        );
+        let (window_start, window_end) = pruning_window(list_splits_query);
+        let splits = layout
+            .list_splits(&*self.storage, window_start, window_end)
+            .await?;
+        let mut splits: Vec<Split> = splits
+            .into_iter()
+            .filter(|split| file_backed_index::split_query_predicate(&split, list_splits_query))
+            .collect();
+        splits.sort_unstable_by(|left, right| list_splits_query.sort_by.compare(left, right));
+        Ok(Some(splits))
     }
 
     /// Returns the list of splits for the given request.
@@ -2288,6 +2410,13 @@ impl crate::tests::DefaultForTest for FileBackedMetastore {
         if quickwit_common::get_bool_from_env(SHARDED_LAYOUT_TEST_ENV_KEY, false) {
             metastore.set_distributed(true);
             metastore.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
+        }
+        if quickwit_common::get_bool_from_env(MANIFEST_LAYOUT_TEST_ENV_KEY, false) {
+            metastore.set_distributed(true);
+            metastore.set_index_layout(IndexLayout::ManifestSegments {
+                bucket_secs: MANIFEST_LAYOUT_BUCKET_SECS,
+                num_stripes: MANIFEST_LAYOUT_NUM_STRIPES,
+            });
         }
         metastore
     }

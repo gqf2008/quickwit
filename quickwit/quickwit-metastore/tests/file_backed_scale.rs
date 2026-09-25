@@ -208,4 +208,12 @@ async fn test_file_backed_metastore_scale() {
         "sharded (256 slots)",
     )
     .await;
+    measure_layout(
+        IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 8,
+        },
+        "manifest segments (8 stripes, 1 h buckets)",
+    )
+    .await;
 }

@@ -1280,7 +1280,7 @@ impl Debug for Stamper {
     }
 }
 
-fn split_query_predicate(split: &&Split, query: &ListSplitsQuery) -> bool {
+pub(super) fn split_query_predicate(split: &&Split, query: &ListSplitsQuery) -> bool {
     if !query.included_split_ids.is_empty()
         && !query
             .included_split_ids
