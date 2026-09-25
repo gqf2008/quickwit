@@ -316,6 +316,27 @@ pub async fn test_metastore_publish_splits<
             .await
             .expect("a replayed publish must finish the mutation it replays");
 
+        // And the state it leaves behind is the state the first attempt wanted: the split it
+        // publishes stays published, and the split it replaces stays marked for deletion. Switching
+        // on the current state instead of the caller's role would mark the published one for
+        // deletion — which PostgreSQL's single update statement did until this assertion existed.
+        let list_splits_query = ListSplitsQuery::for_index(index_uid.clone())
+            .with_split_states([SplitState::Published]);
+        let list_splits_request =
+            ListSplitsRequest::try_from_list_splits_query(&list_splits_query).unwrap();
+        let published_split_ids = metastore
+            .list_splits(list_splits_request)
+            .await
+            .unwrap()
+            .collect_split_ids()
+            .await
+            .unwrap();
+        assert_eq!(
+            published_split_ids,
+            vec![split_id_1.clone()],
+            "a replayed publish must leave the split it publishes published"
+        );
+
         cleanup_index(&mut metastore, index_uid).await;
     }
 

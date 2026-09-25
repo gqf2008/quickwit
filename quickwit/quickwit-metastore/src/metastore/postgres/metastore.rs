@@ -896,10 +896,13 @@ impl MetastoreService for PostgresqlMetastore {
                     )
             ),
             -- Publish the staged splits and mark the published splits for deletion.
+            -- Which transition a row gets is decided by the *role* the caller asked it to play, not by
+            -- its current state: on a replay a split the caller publishes may already be published,
+            -- and switching on the current state would mark it for deletion instead.
             updated_splits AS (
                 UPDATE splits
                 SET
-                    split_state = CASE split_state
+                    split_state = CASE input_splits.expected_split_state
                         WHEN 'Staged' THEN 'Published'
                         ELSE 'MarkedForDeletion'
                     END,
