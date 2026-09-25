@@ -354,6 +354,7 @@ pub(super) async fn load_sharded_index(
         attempt += 1;
         match load_sharded_index_once(storage, index_id).await {
             Err(MetastoreError::FailedPrecondition { .. }) if attempt < LOAD_MAX_ATTEMPTS => {
+                super::metrics::SHARD_STALE_VIEW_RETRIES_TOTAL.inc();
                 continue;
             }
             result => return result,
@@ -628,6 +629,7 @@ pub(super) async fn store_sharded_index(
         {
             // The write itself is durable. Folding is maintenance: failing the metastore operation
             // here would make the caller replay a mutation that is already applied.
+            super::metrics::SHARD_FOLD_FAILURES_TOTAL.inc();
             warn!(
                 index_id = %index_id,
                 slot,
@@ -717,6 +719,7 @@ async fn fold_slot(
         // which only deletes segments a generation out of date.
         return Err(convert_error(index_id, error));
     }
+    super::metrics::SHARD_FOLDS_TOTAL.inc();
     garbage_collect_segments(storage, index_id, slot, new_generation).await;
     Ok(())
 }

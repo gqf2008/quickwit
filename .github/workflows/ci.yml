@@ -113,6 +113,15 @@ jobs:
         if: always() && steps.modified.outputs.rust_src == 'true'
         run: cargo nextest run --features=postgres,metrics --retries 1
         working-directory: ./quickwit
+      # The metastore test suite is generic over the metastore, so running it once more with the
+      # sharded split layout selected is what keeps that layout on the same footing as the
+      # single-object one. Without this step it is only ever exercised by hand.
+      - name: cargo nextest (sharded split layout)
+        if: always() && steps.modified.outputs.rust_src == 'true'
+        run: >-
+          QW_METASTORE_TEST_SHARDED_LAYOUT=true cargo nextest run -p quickwit-metastore
+          --features=postgres,metrics --retries 1 -E 'test(file_backed)'
+        working-directory: ./quickwit
       - name: Install python packages
         if: always() && steps.modified.outputs.rust_src == 'true'
         run: |

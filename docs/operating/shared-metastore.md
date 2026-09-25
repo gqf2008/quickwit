@@ -100,6 +100,15 @@ tries `<index_id>/metastore.json` first and only looks for a sharded root when t
 mixed fleets keep working and an index can be migrated by creating it again in the new layout.
 It needs conditional writes; a node refuses to start with this layout on a storage that has none.
 
+The shared metastore test suite is generic over the metastore, so CI runs it twice: once on the
+single-object layout and once with `QW_METASTORE_TEST_SHARDED_LAYOUT=true`, which makes the test
+helper (`FileBackedMetastore::default_for_test`) create its indexes in the sharded layout. Locally:
+
+```sh
+cd quickwit
+QW_METASTORE_TEST_SHARDED_LAYOUT=true cargo nextest run -p quickwit-metastore -E 'test(file_backed)'
+```
+
 | Layout | Bytes rewritten by a publish | Measured |
 | ------ | ---------------------------- | -------- |
 | single object | all splits of the index | 6.5 KB → 123.9 KB while an index grows from 3 to 180 splits |

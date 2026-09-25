@@ -121,6 +121,9 @@ A shared metastore exposes two counters on the `/metrics` endpoint:
 | ------ | ------- |
 | `quickwit_metastore_file_backed_cas_conflicts_total` | Metadata writes that lost a compare-and-swap race (`412 Precondition Failed`) and were replayed against the fresh file. A conflict is normal and harmless: it only says another node wrote first. |
 | `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (16 attempts, doubling from 10 ms up to a 2 s cap — under 20 s in total). The mutation was **not** applied. |
+| `quickwit_metastore_file_backed_shard_folds_total` | Split slots of the [sharded layout](#very-large-indexes-sharded-splits) folded into a segment. Folding is what keeps a slot file bounded, so this should grow slowly but steadily on an index being written to. |
+| `quickwit_metastore_file_backed_shard_fold_failures_total` | Folds that failed and were left for the next write to retry. The write itself was already durable, so this is maintenance falling behind: a rate that keeps rising while `..._shard_folds_total` stands still means slot files are growing. |
+| `quickwit_metastore_file_backed_shard_stale_view_retries_total` | Reads that caught a fold moving the split view and restarted. Occasional retries are normal; a rate that tracks the read rate means reads keep landing on a view that is already obsolete. |
 
 Suggested alerts:
 

@@ -37,3 +37,37 @@ pub(super) static CAS_CONFLICTS_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
                   contention and should be paged on.",
     subsystem: "metastore",
 );
+
+/// Number of split slots folded into a segment.
+///
+/// Folding is what keeps a slot file bounded: it only ever holds the entries written since the last
+/// fold. A sharded index whose writes keep flowing but whose fold counter stands still has slot
+/// files growing without bound, which is the one maintenance failure of the layout.
+pub(super) static SHARD_FOLDS_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_shard_folds_total",
+    description: "Number of split slots of the sharded layout folded into a segment.",
+    subsystem: "metastore",
+);
+
+/// Number of folds that failed and will be retried by the next write to the slot.
+///
+/// The write that triggered the fold is already durable, so this is maintenance falling behind
+/// rather than data loss — but a counter that keeps rising with `..._shard_folds_total` standing
+/// still means slot files are growing.
+pub(super) static SHARD_FOLD_FAILURES_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_shard_fold_failures_total",
+    description: "Number of folds of a sharded split slot that failed and were left for the next \
+                  write to retry. Sustained growth without folds means slot files are growing.",
+    subsystem: "metastore",
+);
+
+/// Number of reads that caught the split view moving and restarted.
+///
+/// A fold racing a reader is normal; a rate that tracks the read rate means reads keep landing on a
+/// view that is already obsolete, which is a latency problem rather than a correctness one.
+pub(super) static SHARD_STALE_VIEW_RETRIES_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_shard_stale_view_retries_total",
+    description: "Number of reads of a sharded index that caught the split view moving and \
+                  restarted from the top.",
+    subsystem: "metastore",
+);
