@@ -118,10 +118,18 @@ const MANIFEST_LAYOUT_BUCKET_SECS: i64 = 3_600;
 
 /// Number of manifests (compare-and-swap points) an index created in the manifest layout has.
 ///
-/// Striping is a requirement, not an optimisation: the spike measured one manifest failing to
-/// sustain the write rate a 5·10¹² documents/day index needs away from a same-zone round trip, and
-/// eight stripes reaching it with no conflicts.
-const MANIFEST_LAYOUT_NUM_STRIPES: usize = 8;
+/// Striping is a requirement, not an optimisation: with one manifest the spike measured the write
+/// rate a 5·10¹² documents/day index needs failing away from a same-zone round trip, and two
+/// conflicts per publish. The count is also a sizing rule, measured on a real bucket: writers that
+/// hash to the same stripe contend, so with eight stripes four writers saw 0 conflicts per publish,
+/// eight writers 0.25, and twelve writers 0.58 — each conflict costing a replay of the publish. The
+/// default leaves room for a burst of writers over the stripe count, because a read fetches all the
+/// manifests at once and pays for them in one round trip, not one per stripe.
+const MANIFEST_LAYOUT_NUM_STRIPES: usize = 32;
+
+/// Environment variable that sets the stripe count of indexes this node creates in the manifest
+/// layout. Keep it at or above the number of nodes that publish into one index.
+pub const MANIFEST_LAYOUT_STRIPES_ENV_KEY: &str = "QW_METASTORE_MANIFEST_STRIPES";
 
 /// Environment variable that makes the metastore test suite run on the sharded layout.
 ///
@@ -172,6 +180,15 @@ fn record_cas_conflict(giving_up: bool) {
     if giving_up {
         metrics::CAS_CONFLICTS_EXHAUSTED_TOTAL.inc();
     }
+}
+
+/// Stripe count for indexes this node creates: the default, or what the operator asked for.
+fn manifest_layout_num_stripes() -> usize {
+    std::env::var(MANIFEST_LAYOUT_STRIPES_ENV_KEY)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|num_stripes| *num_stripes > 0)
+        .unwrap_or(MANIFEST_LAYOUT_NUM_STRIPES)
 }
 
 /// Window to prune with, derived from a query's time bounds.
@@ -510,7 +527,7 @@ impl FileBackedMetastore {
             if manifest_layout_requested {
                 IndexLayout::ManifestSegments {
                     bucket_secs: MANIFEST_LAYOUT_BUCKET_SECS,
-                    num_stripes: MANIFEST_LAYOUT_NUM_STRIPES,
+                    num_stripes: manifest_layout_num_stripes(),
                 }
             } else {
                 IndexLayout::Sharded {

@@ -203,7 +203,19 @@ built for large indexes:
 ```
 
 A publish appends one WAL object and commits one manifest: it costs what it touches, not what the
-index holds. A read loads the manifests, prunes the time buckets the query cannot touch, and fetches
+index holds. **Size the stripe count at or above the number of nodes that publish into one index**
+(`QW_METASTORE_MANIFEST_STRIPES`, default 32): writers that hash to the same stripe contend, and each
+conflict costs a full replay of that publish. Measured on a real bucket with 12 concurrent writers and
+five publishes each:
+
+| Stripes | Conflicts | Conflicts per publish | Throughput |
+| ------- | --------- | --------------------- | ---------- |
+| 8 | 35 / 60 | 0.58 | 0.85 publishes/s |
+| 32 | **1 / 60** | **0.02** | **2.18 publishes/s** |
+
+Four writers saw no conflict at all with eight stripes, so the rule is a margin over the writer count
+rather than a constant. More stripes cost nothing on the read side: all the manifests of an index are
+fetched in parallel, so they share one round trip. A read loads the manifests, prunes the time buckets the query cannot touch, and fetches
 only the segments that remain plus the WAL tail, so it costs the query's window. `num_stripes` (8 by
 default here) is not an optimisation: the spike measured one manifest per index failing to sustain the
 write rate a 5·10¹² documents/day index needs once the round trip stops being same-zone, and eight

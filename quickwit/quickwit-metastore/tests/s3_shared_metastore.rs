@@ -574,9 +574,13 @@ async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
     let bucket_uri = append_random_suffix(&format!("{}/manifest-cost", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
     let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    let num_stripes: usize = std::env::var("QW_TEST_S3_STRIPES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32);
     metastore.set_index_layout(IndexLayout::ManifestSegments {
         bucket_secs: 3_600,
-        num_stripes: 8,
+        num_stripes,
     });
     let index_id = append_random_suffix("manifest-cost-index");
     let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
@@ -636,16 +640,22 @@ async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
         read_latencies[read_latencies.len() * 95 / 100],
     );
 
-    // Four writers publishing concurrently: what the striped manifests are for, and the only place
-    // where contention shows up as something other than latency.
+    // Concurrent writers, the only place where contention shows up as something other than latency.
+    // `QW_TEST_S3_WRITERS` drives the count so the stripe count can be checked against it: writers
+    // that hash to the same stripe contend, and eight stripes are only enough for eight writers.
+    let num_writers: usize = std::env::var("QW_TEST_S3_WRITERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4);
+    let publishes_per_writer = 5;
     let conflicts_before = metastore.cas_conflicts_total();
     let start = std::time::Instant::now();
     let mut handles = Vec::new();
-    for writer in 0..4 {
+    for writer in 0..num_writers {
         let metastore = metastore.clone();
         let index_uid = index_uid.clone();
         handles.push(tokio::spawn(async move {
-            for round in 0..5 {
+            for round in 0..publishes_per_writer {
                 stage_and_publish_split(
                     &metastore,
                     &index_uid,
@@ -659,12 +669,13 @@ async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
     futures::future::try_join_all(handles).await?;
     let elapsed = start.elapsed();
     let conflicts = metastore.cas_conflicts_total() - conflicts_before;
+    let num_publishes = num_writers * publishes_per_writer;
     eprintln!(
-        "4 writers x 5 publishes on R2: {} publishes in {:?} ({:.2}/s), {conflicts} conflicts          ({:.2} per publish)",
-        20,
-        elapsed,
-        20.0 / elapsed.as_secs_f64(),
-        conflicts as f64 / 20.0,
+        "{num_writers} writers x {publishes_per_writer} publishes on R2 ({num_stripes} stripes): \
+         {num_publishes} publishes in {elapsed:?} ({:.2}/s), {conflicts} conflicts ({:.2} per \
+         publish)",
+        num_publishes as f64 / elapsed.as_secs_f64(),
+        conflicts as f64 / num_publishes as f64,
     );
 
     metastore
