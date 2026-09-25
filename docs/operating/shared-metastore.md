@@ -137,8 +137,8 @@ the same index almost always collide, so the loser replays and its cached copy o
 refreshed as a side effect. With the sharded layout writers usually do not collide — winning the
 compare-and-swap no longer proves that nobody else wrote in between — so a successful distributed
 mutation drops the node's cached view instead of caching the snapshot it happened to hold. The next
-read reloads from the object store and sees every writer's splits, at the cost of one reload after a
-write (the write already reloads to compare-and-swap). A node that only reads still needs
+read reloads from the object store and sees every writer's splits, at the cost of one full read per
+write-then-read pair on top of the read the write itself needs. A node that only reads still needs
 `#polling_interval` to notice other nodes' work, which is the contract it always had.
 
 ### Sizing: when this layout is the wrong tool
