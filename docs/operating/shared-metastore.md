@@ -70,6 +70,17 @@ acknowledged while a merge is in flight; the number to compare against the ackno
 index's static state, which the row's two numbers are (33 published splits holding 54,240 documents
 in that run). The other rows are from the same kind of run and the same harness.
 
+The manifest layout prunes the reads that carry a time window. The reads that carry none — the index
+metadata, the delete tasks, the last delete opstamp and the shards — are served by materialising the
+index, and a node that has not touched the index pays for all of it once: measured on the same R2
+bucket with 4 000 splits (289 objects across the root, 32 manifests, the WAL tail and the segments),
+the first `index_metadata` after a fresh start takes **2.96 s**, and the same call once the index is
+in memory takes 135 µs. Those microsecond reads are cheap because the node now holds the index's
+whole split map — for an index of that size, the memory the layout exists to avoid at query time, and
+the thing to watch when sizing the control plane and the janitor, which read the metadata of every
+index. `QW_TEST_S3_MEASURE=1 QW_TEST_S3_SPLITS=<n>` reproduces the measurement
+(`tests/s3_shared_metastore.rs`, `test_manifest_layout_metadata_read_cost_on_s3_endpoint`).
+
 ## Known limits
 
 - Cross-region latency dominates: one round trip to the bucket used for these measurements was
