@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use itertools::Itertools;
 use quickwit_config::{IndexConfig, SourceConfig};
 use quickwit_proto::types::IndexUid;
 use serde::{self, Deserialize, Serialize};
@@ -52,7 +53,15 @@ impl TryFrom<VersionedIndexMetadata> for IndexMetadata {
 
 impl From<IndexMetadata> for IndexMetadataV0_8 {
     fn from(index_metadata: IndexMetadata) -> Self {
-        let sources: Vec<SourceConfig> = index_metadata.sources.values().cloned().collect();
+        // Sorted, because this list is part of what a writer compares byte for byte to decide
+        // whether its compare-and-swap has anything to do: the same set of sources has to
+        // serialize the same way on every node.
+        let sources: Vec<SourceConfig> = index_metadata
+            .sources
+            .values()
+            .cloned()
+            .sorted_by_key(|source| source.source_id.clone())
+            .collect();
         Self {
             index_uid: index_metadata.index_uid,
             index_config: index_metadata.index_config,

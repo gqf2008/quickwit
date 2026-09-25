@@ -14,7 +14,7 @@
 
 //! Unified parquet split metadata definitions for both metrics and sketch splits.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::time::SystemTime;
 
@@ -243,9 +243,14 @@ struct ParquetSplitMetadataSerde {
     time_range: TimeRange,
     num_rows: u64,
     size_bytes: u64,
-    metric_names: HashSet<String>,
-    low_cardinality_tags: HashMap<String, HashSet<String>>,
-    high_cardinality_tag_keys: HashSet<String>,
+    // Ordered containers, not the `HashSet`s and `HashMap`s the metadata itself keeps: these
+    // fields are part of the bytes the file-backed metastore stores, and it compares those bytes
+    // to decide whether a write changed anything and can skip its compare-and-swap. A hash set's
+    // order differs between processes, so leaving them here made two nodes holding the same index
+    // write different bytes for metrics and sketch splits.
+    metric_names: BTreeSet<String>,
+    low_cardinality_tags: BTreeMap<String, BTreeSet<String>>,
+    high_cardinality_tag_keys: BTreeSet<String>,
     created_at: SystemTime,
     #[serde(default)]
     maturity: ParquetSplitMaturity,
@@ -268,8 +273,8 @@ struct ParquetSplitMetadataSerde {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     row_keys_proto: Option<Vec<u8>>,
 
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    zonemap_regexes: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    zonemap_regexes: BTreeMap<String, String>,
 
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     rg_partition_prefix_len: u32,
@@ -293,9 +298,13 @@ impl From<ParquetSplitMetadataSerde> for ParquetSplitMetadata {
             time_range: s.time_range,
             num_rows: s.num_rows,
             size_bytes: s.size_bytes,
-            metric_names: s.metric_names,
-            low_cardinality_tags: s.low_cardinality_tags,
-            high_cardinality_tag_keys: s.high_cardinality_tag_keys,
+            metric_names: s.metric_names.into_iter().collect(),
+            low_cardinality_tags: s
+                .low_cardinality_tags
+                .into_iter()
+                .map(|(tag_key, tag_values)| (tag_key, tag_values.into_iter().collect()))
+                .collect(),
+            high_cardinality_tag_keys: s.high_cardinality_tag_keys.into_iter().collect(),
             created_at: s.created_at,
             maturity: s.maturity,
             parquet_file: s.parquet_file,
@@ -303,7 +312,7 @@ impl From<ParquetSplitMetadataSerde> for ParquetSplitMetadata {
             sort_fields: s.sort_fields,
             num_merge_ops: s.num_merge_ops,
             row_keys_proto: s.row_keys_proto,
-            zonemap_regexes: s.zonemap_regexes,
+            zonemap_regexes: s.zonemap_regexes.into_iter().collect(),
             rg_partition_prefix_len: s.rg_partition_prefix_len,
         }
     }
@@ -323,9 +332,13 @@ impl From<ParquetSplitMetadata> for ParquetSplitMetadataSerde {
             time_range: m.time_range,
             num_rows: m.num_rows,
             size_bytes: m.size_bytes,
-            metric_names: m.metric_names,
-            low_cardinality_tags: m.low_cardinality_tags,
-            high_cardinality_tag_keys: m.high_cardinality_tag_keys,
+            metric_names: m.metric_names.into_iter().collect(),
+            low_cardinality_tags: m
+                .low_cardinality_tags
+                .into_iter()
+                .map(|(tag_key, tag_values)| (tag_key, tag_values.into_iter().collect()))
+                .collect(),
+            high_cardinality_tag_keys: m.high_cardinality_tag_keys.into_iter().collect(),
             created_at: m.created_at,
             maturity: m.maturity,
             parquet_file: m.parquet_file,
@@ -334,7 +347,7 @@ impl From<ParquetSplitMetadata> for ParquetSplitMetadataSerde {
             sort_fields: m.sort_fields,
             num_merge_ops: m.num_merge_ops,
             row_keys_proto: m.row_keys_proto,
-            zonemap_regexes: m.zonemap_regexes,
+            zonemap_regexes: m.zonemap_regexes.into_iter().collect(),
             rg_partition_prefix_len: m.rg_partition_prefix_len,
         }
     }
