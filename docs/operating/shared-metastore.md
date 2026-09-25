@@ -216,17 +216,18 @@ A publish appends one WAL object and commits one manifest: it costs what it touc
 index holds. **Size the stripe count at or above the number of nodes that publish into one index**
 (`QW_METASTORE_MANIFEST_STRIPES`, default 32): writers that hash to the same stripe contend, and each
 conflict costs a full replay of that publish. Measured on a real bucket with 12 concurrent writers and
-five publishes each:
+five publishes each (2026-09-25):
 
 | Stripes | Conflicts | Conflicts per publish | Throughput |
 | ------- | --------- | --------------------- | ---------- |
-| 8 | 35 / 60 | 0.58 | 0.85 publishes/s |
-| 32 | **1 / 60** | **0.02** | **2.18 publishes/s** |
+| 8 | 41 / 60 | 0.68 | 1.36 publishes/s |
+| 32 | **2 / 60** | **0.03** | **3.81 publishes/s** |
 
-Four writers saw no conflict at all with eight stripes, so the rule is a margin over the writer count
-rather than a constant. More stripes cost no *extra round trip* on the read side — a read loads the
-manifests (in parallel, so they share one), prunes the time buckets the query cannot touch, and fetches
-only the segments that remain plus the WAL tail, so it costs the query's window rather than the index —
+Four writers saw no conflict at all with eight stripes (0 in 20 publishes), so the rule is a margin
+over the writer count rather than a constant. More stripes cost no *extra round trip* on the read side —
+a read loads the manifests (in parallel, so they share one), prunes the time buckets the query cannot
+touch, and fetches only the segments that remain plus the WAL tail, so it costs the query's window
+rather than the index —
 but they do multiply the number of requests a read makes, and creating an index puts one (also
 parallel) object per stripe. With a *single* manifest the spike measured the write rate a
 5·10¹² documents/day index needs failing once the round trip stops being same-zone, which is why the
@@ -247,14 +248,19 @@ measurement. What it does *not* change is the round trip to the bucket: a publis
 calls plus the lookups of the splits it changes, so an index served from this layout wants its nodes
 next to the bucket, like every other layout here.
 
-On a real R2 bucket whose round trip is 0.81 s from this machine (2026-09), the same layout measures:
-a publish writes **1 360 bytes** and takes p50 4.0 s for a stage+publish pair, a windowed read is p50
-2.8 s, and four concurrent writers publish 0.74/s. Writing is no longer the problem — the old layout
-rewrites the whole index, ~12 GB per publish at 15 M splits — the round trips are: a publish is three
-storage calls plus the lookups of the splits it changes, and a read is one per object it touches (its
-manifests, segments and WAL objects are fetched in parallel). Five publishes/s on a bucket like this
-one wants either nodes placed next to it or a handful of writers, exactly as the sizing section above
-says. The measurement is opt-in: `QW_TEST_S3_MEASURE=1 cargo test -p quickwit-metastore
+On a real R2 bucket whose round trip is 0.81 s from this machine (2026-09-25), the same layout
+measures: a publish writes **1 380 bytes** and takes p50 2.2 s to 6.1 s for a stage+publish pair (the
+spread is the bucket's latency between runs, not the layout), and a read with only a start bound — so
+nothing is pruned and it touches every bucket — is p50 0.7 s to 1.5 s. Writing is no longer the
+problem — the old layout rewrites the whole index, ~12 GB per publish at 15 M splits — the round trips
+are: a publish is three storage calls plus the lookups of the splits it changes, and a read is one per
+object it touches (its manifests, segments and WAL objects are fetched in parallel).
+
+That latency bounds the rate a single node can publish: three round trips per publish is ~2.4 s here,
+so the 11.6 publishes/s that a 5·10¹² documents/day index implies needs either nodes next to the
+bucket or ~28 writes in flight, and the 12 writers above reached 3.8/s from this machine. The
+measurement is opt-in and prints both the numbers and the writer count it used:
+`QW_TEST_S3_MEASURE=1 QW_TEST_S3_STRIPES=<n> QW_TEST_S3_WRITERS=<n> cargo test -p quickwit-metastore
 --features ci-test --test s3_shared_metastore -- --nocapture`.
 
 The layout is opt-in per node and recorded in the objects, so a node reads an index whichever layout

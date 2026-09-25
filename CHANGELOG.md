@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `quickwit_metastore_file_backed_cas_conflicts_total` (writes that lost a compare-and-swap race and were
   replayed) and `..._exhausted_total` (mutations dropped after the replay budget ran out), so contention and
   dropped writes are visible from Prometheus. (walgit: `qw-metastore-cas-observability`)
+- **Metastore: a third layout for very large indexes, where the manifest holds references instead of the
+  split map.** `QW_METASTORE_MANIFEST_LAYOUT=true` makes a node create indexes with one manifest per stripe
+  (`v3/manifest-<stripe>.json`), an immutable WAL object per published batch and one segment per time bucket,
+  so a read fetches the query's time window rather than the whole index and a publish rewrites only the splits
+  it changes. The layout is recorded in the objects, so a node reads an index whichever layout created it, and
+  the stripe count is sized from the writer count (`QW_METASTORE_MANIFEST_STRIPES`, default 32). Measured on a
+  real R2 bucket: a publish writes 1 380 bytes, and 12 writers reach 3.8 publishes/s with 0.03 conflicts per
+  publish on 32 stripes (1.4/s and 0.68 on eight). Segments and WAL objects are collected per stripe against
+  that stripe's own fold generation, and a publish replayed after a partial commit finishes; one revision at a
+  time has to serve a prefix in this layout, as for the shared metastore as a whole.
+  (walgit: `qw-metastore-manifest-layout`, `qw-metastore-manifest-r2-cost`, `qw-metastore-manifest-fold-removal`,
+  `qw-metastore-manifest-publish-replay`, `qw-metastore-manifest-gc-collection`)
 
 ### Changed
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the file
