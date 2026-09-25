@@ -224,6 +224,16 @@ measurement. What it does *not* change is the round trip to the bucket: a publis
 calls plus the lookups of the splits it changes, so an index served from this layout wants its nodes
 next to the bucket, like every other layout here.
 
+On a real R2 bucket whose round trip is 0.81 s from this machine (2026-09), the same layout measures:
+a publish writes **1 360 bytes** and takes p50 4.0 s for a stage+publish pair, a windowed read is p50
+2.8 s, and four concurrent writers publish 0.74/s. Writing is no longer the problem — the old layout
+rewrites the whole index, ~12 GB per publish at 15 M splits — the round trips are: a publish is three
+storage calls plus the lookups of the splits it changes, and a read is one per object it touches (its
+manifests, segments and WAL objects are fetched in parallel). Five publishes/s on a bucket like this
+one wants either nodes placed next to it or a handful of writers, exactly as the sizing section above
+says. The measurement is opt-in: `QW_TEST_S3_MEASURE=1 cargo test -p quickwit-metastore
+--features ci-test --test s3_shared_metastore -- --nocapture`.
+
 The layout is opt-in per node and recorded in the objects, so a node reads an index whichever layout
 created it, and `QW_METASTORE_TEST_MANIFEST_LAYOUT=true` runs the shared metastore suite on it locally
 (CI runs it next to the other two).
