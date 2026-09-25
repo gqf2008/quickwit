@@ -934,7 +934,12 @@ mod tests {
         let deleted_split_id = SplitId::from("split-000005".to_string());
         let (mut index, _) = load_sharded_index(&*storage, INDEX_ID).await.unwrap();
         index
-            .mark_splits_for_deletion([deleted_split_id.as_str()], &[SplitState::Staged], true)
+            .mark_splits_for_deletion(
+                [deleted_split_id.as_str()],
+                &[SplitState::Staged],
+                true,
+                false,
+            )
             .unwrap();
         index.delete_splits([deleted_split_id.as_str()]).unwrap();
         store_sharded_index(&*storage, &mut index, &context)

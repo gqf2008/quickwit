@@ -1642,6 +1642,9 @@ impl MetastoreService for FileBackedMetastore {
                         SplitState::MarkedForDeletion,
                     ],
                     false,
+                    // The states this call accepts already include the marked one, so it is
+                    // idempotent without the replay tolerance.
+                    false,
                 )
                 .map(MutationOccurred::from)
         })
@@ -2997,6 +3000,109 @@ mod tests {
         assert!(
             CAS_CONFLICTS_EXHAUSTED_TOTAL.get() - exhausted_before >= 1,
             "giving up on the index metadata has to be visible to operators"
+        );
+    }
+
+    /// A merge marks the splits it replaced and publishes the split that replaces them. When the
+    /// first attempt commits the marking and loses the publication, the replay has to be able to
+    /// finish: the replaced split is already marked, which is exactly the state the replay asks
+    /// for.
+    ///
+    /// The real five-node run met this as a `MergePublisher` fault,
+    /// `precondition failed for splits <id>: splits are not deletable`: the marking step refused an
+    /// already marked split *before* the branch that skips one, so the replay could never finish
+    /// and the pipeline restarted instead.
+    #[tokio::test]
+    async fn test_a_publish_that_marked_a_replaced_split_and_lost_the_other_stripe_replays() {
+        use crate::metastore::file_backed::manifest_layout::{ManifestLayout, test_hooks};
+
+        let index_id = "test-replaced-split-replay";
+        let num_stripes = 8;
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes,
+        });
+        let layout = ManifestLayout::new(index_id, 3_600, num_stripes);
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+
+        // One split per stripe, in ascending stripe order: the first attempt commits the marking of
+        // the replaced split before it reaches the stripe of the split that replaces it.
+        let split_for_stripe = |prefix: &str, stripe: usize| {
+            (0..)
+                .map(|candidate| {
+                    SplitMetadata::for_test(SplitId::from(format!("{prefix}-{candidate}")))
+                })
+                .find(|split_metadata| layout.stripe_of(split_metadata.split_id.as_str()) == stripe)
+                .unwrap()
+        };
+        let replaced_split = split_for_stripe("replaced", 0);
+        let new_split = split_for_stripe("new", 1);
+        for split_metadata in [&replaced_split, &new_split] {
+            metastore
+                .stage_splits(
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), split_metadata)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        // The split a merge replaces has to be published first.
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![replaced_split.split_id.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Lose the publication of the new split: the marking of the replaced one is already
+        // committed when the replay runs.
+        test_hooks::fail_next_commit_for_stripe(layout.stripe_of(new_split.split_id.as_str()));
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![new_split.split_id.to_string()],
+                replaced_split_ids: vec![replaced_split.split_id.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("the replay has to finish the publication the first attempt started");
+
+        assert_eq!(
+            list_published_split_ids_with(&metastore, &index_uid)
+                .await
+                .unwrap(),
+            vec![new_split.split_id.to_string()],
+            "the replacing split is the published one"
+        );
+        use crate::ListSplitsQuery;
+        let marked = metastore
+            .list_splits(
+                ListSplitsRequest::try_from_list_splits_query(
+                    &ListSplitsQuery::for_index(index_uid)
+                        .with_split_states([SplitState::MarkedForDeletion]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collect_split_ids()
+            .await
+            .unwrap();
+        assert_eq!(
+            marked,
+            vec![replaced_split.split_id.to_string()],
+            "the replaced split stays marked for deletion"
         );
     }
 

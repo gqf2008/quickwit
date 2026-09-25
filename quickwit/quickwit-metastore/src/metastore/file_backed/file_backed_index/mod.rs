@@ -389,6 +389,7 @@ impl FileBackedIndex {
         split_ids: impl IntoIterator<Item = impl AsRef<str>>,
         deletable_split_states: &[SplitState],
         return_error_on_splits_not_found: bool,
+        tolerate_already_marked: bool,
     ) -> MetastoreResult<bool> {
         let mut mutation_occurred = false;
         let mut split_not_found_ids = Vec::new();
@@ -405,11 +406,18 @@ impl FileBackedIndex {
                     continue;
                 }
             };
-            if !deletable_split_states.contains(&metadata.split_state) {
+            // A mutation replayed after part of its own commit leaves the splits it replaced
+            // already marked; that is the state this call is asking for, so a replay stops there
+            // instead of reporting them as not deletable. Which states are deletable at all is
+            // still the caller's call, and a *fresh* request keeps the strict contract.
+            let already_marked = metadata.split_state == SplitState::MarkedForDeletion;
+            let deletable = deletable_split_states.contains(&metadata.split_state)
+                || (already_marked && tolerate_already_marked);
+            if !deletable {
                 non_deletable_split_ids.push(split_id_ref.to_string());
                 continue;
             };
-            if metadata.split_state == SplitState::MarkedForDeletion {
+            if already_marked {
                 // If the split is already marked for deletion, This is fine, we just skip it.
                 continue;
             }
@@ -552,7 +560,12 @@ impl FileBackedIndex {
             }
         }
         self.mark_splits_as_published_helper(staged_split_ids, tolerate_already_published)?;
-        self.mark_splits_for_deletion(replaced_split_ids, &[SplitState::Published], true)?;
+        self.mark_splits_for_deletion(
+            replaced_split_ids,
+            &[SplitState::Published],
+            true,
+            tolerate_already_published,
+        )?;
         Ok(())
     }
 
