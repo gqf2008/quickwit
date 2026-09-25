@@ -63,12 +63,31 @@ answers in one round trip because the server owns the storage. That is the trade
 earlier sizing note recommends PostgreSQL for a deployment that cannot put its nodes next to the
 bucket.
 
-Two things the spike does **not** settle, and that a production port has to:
+## The one compare-and-swap, measured at the target rate
 
-1. **Contention on the one compare-and-swap.** At 5·10¹² documents/day the index sees ~11.6 metadata
-   writes/s. One manifest per index is one CAS point; `objsearch` handles the same shape with group
-   commit (one WAL object per window, `SPEC §6.2-6.4`). The port needs either that, or manifests
-   striped per writer, plus a measurement of conflicts under N writers.
+5·10¹² documents/day is ~11.6 metadata writes/s into one index, and an object store has no server to
+serialise writers: the manifest compare-and-swap is the only ordering primitive. `objsearch` uses
+one manifest per namespace, so the spike measured whether that carries the rate, and whether
+striping the manifest across writers fixes it if it does not. Five writers offer 12 publishes/s
+against an artificial round trip:
+
+| Round trip | 1 manifest | 8 striped manifests |
+| ---------- | ---------- | ------------------- |
+| 20 ms (in-region) | 12.0/s published, **240 conflicts / 120 publishes** (2 per publish, 9 storage calls each) | **12.0/s, 0 conflicts, 3.0 storage calls per publish** |
+| 200 ms | **1.6/s published** (target 12/s), 74 conflicts, **4 writes exhausted their replay budget** | 8.3/s, **0 conflicts**, 3.0 storage calls per publish |
+
+So one manifest per index is *not* enough for this workload away from a same-zone bucket — it does
+not reach the rate, and it starts dropping writes when the replay budget runs out — while eight
+stripes hit the rate with no conflicts at all, at the minimum of three storage calls per publish
+(read the manifest, write the WAL object, commit the manifest). Striping is therefore a requirement
+of the port, not an optimisation; `objsearch`'s group commit is the alternative for a single-writer
+process, and it is not available to independent Quickwit nodes.
+
+Two things the spike still does **not** settle, and that a production port has to:
+
+1. **How many stripes**, and how a reader finds them: eight was enough for five writers at 12/s, but
+   the count has to be a function of the writer count and the round trip, and a reader has to
+   discover the stripes cheaply (one `list`, or a fixed count known from the manifest).
 2. **The metastore above the storage.** `mutate_distributed` today loads the whole index, applies a
    closure and writes it back; `list_splits` collects everything matching. Those two call sites are
    what force `O(index)` — the layout alone does not remove them. The port has to turn the split

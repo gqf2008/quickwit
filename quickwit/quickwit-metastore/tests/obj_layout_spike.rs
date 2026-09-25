@@ -36,6 +36,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -449,4 +450,209 @@ async fn test_split_metadata_as_manifest_plus_segments() {
          trips for {} segments",
         manifest.segments.len()
     );
+}
+
+/// Can one manifest compare-and-swap carry the write rate a 5·10¹² documents/day index needs?
+///
+/// An object store has no server to serialise writers, so the only ordering primitive is the
+/// compare-and-swap on the manifest. Concurrent writers will conflict; the question is whether the
+/// retries stay bounded at the rate the workload actually needs (~11.6 publishes/s at
+/// 5·10¹² documents/day), and whether striping the manifest across writers fixes it if they do not.
+///
+/// `QW_TEST_OBJ_RTT_MS` adds an artificial round trip to every storage call (an in-region bucket is
+/// tens of milliseconds; the cross-region one measured earlier is ~810 ms), `QW_TEST_OBJ_RATE` sets
+/// the offered publishes/s, and `QW_TEST_OBJ_STRIPES` the number of manifests a writer may choose
+/// from (1 = objsearch's single manifest per namespace).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_manifest_compare_and_swap_under_concurrent_writers() {
+    let num_writers: usize = env_usize("QW_TEST_OBJ_WRITERS", 5);
+    let rate_per_sec: usize = env_usize("QW_TEST_OBJ_RATE", 12);
+    let stripes: usize = env_usize("QW_TEST_OBJ_STRIPES", 1);
+    let duration = std::time::Duration::from_secs(env_usize("QW_TEST_OBJ_SECS", 10) as u64);
+    let round_trip = std::time::Duration::from_millis(env_usize("QW_TEST_OBJ_RTT_MS", 20) as u64);
+    let storage = Arc::new(DelayedRamStorage {
+        inner: RamStorage::default(),
+        round_trip,
+        conflicts: AtomicU64::new(0),
+        exhausted: AtomicU64::new(0),
+        calls: AtomicU64::new(0),
+    });
+    for stripe in 0..stripes {
+        storage
+            .inner
+            .put(
+                Path::new(&manifest_path_for(stripe)),
+                Box::new(serde_utils::to_json_bytes(&SpikeManifest::default()).unwrap()),
+            )
+            .await
+            .unwrap();
+    }
+
+    let per_writer_interval =
+        std::time::Duration::from_secs_f64(num_writers as f64 / rate_per_sec as f64);
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for writer in 0..num_writers {
+        let storage = storage.clone();
+        handles.push(tokio::spawn(async move {
+            let stripe = if stripes == 1 { 0 } else { writer % stripes };
+            let mut published = 0;
+            let mut next_publish = Instant::now();
+            while start.elapsed() < duration {
+                let split = SpikeSplit {
+                    split_id: format!("writer-{writer}-split-{published:08}"),
+                    time_range_start: BASE_TIMESTAMP + published as i64,
+                    time_range_end: BASE_TIMESTAMP + published as i64 + 60,
+                };
+                let mut published_this_one = false;
+                for attempt in 0..16 {
+                    match publish_delayed(&storage, stripe, std::slice::from_ref(&split)).await {
+                        Ok(()) => {
+                            published_this_one = true;
+                            break;
+                        }
+                        Err(ContentionError::Conflict) if attempt < 15 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if published_this_one {
+                    published += 1;
+                } else {
+                    storage.exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+                next_publish += per_writer_interval;
+                let now = Instant::now();
+                if next_publish > now {
+                    tokio::time::sleep(next_publish - now).await;
+                } else {
+                    next_publish = now;
+                }
+            }
+            published
+        }));
+    }
+    let published: Vec<usize> = futures::future::try_join_all(handles).await.unwrap();
+    let elapsed = start.elapsed();
+    let total_published: u64 = published.iter().map(|count| *count as u64).sum();
+    let calls = storage.calls.load(Ordering::Relaxed);
+    eprintln!(
+        "{num_writers} writers, {stripes} manifest(s), offered {rate_per_sec}/s, {round_trip:?} \
+         round trip, {:?}: {total_published} published ({:.1}/s), {} conflicts, {} exhausted, \
+         {:.2} storage calls per publish",
+        elapsed,
+        total_published as f64 / elapsed.as_secs_f64(),
+        storage.conflicts.load(Ordering::Relaxed),
+        storage.exhausted.load(Ordering::Relaxed),
+        calls as f64 / total_published.max(1) as f64,
+    );
+    assert_eq!(
+        storage.exhausted.load(Ordering::Relaxed),
+        0,
+        "a writer ran out of its replay budget"
+    );
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[derive(Debug)]
+enum ContentionError {
+    Conflict,
+    Fatal(String),
+}
+
+impl std::fmt::Display for ContentionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContentionError::Conflict => write!(f, "conflict"),
+            ContentionError::Fatal(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+/// The real storage with an artificial round trip and conflict counters, so the contention
+/// experiment can run at a realistic latency without waiting for a real bucket.
+struct DelayedRamStorage {
+    inner: RamStorage,
+    round_trip: std::time::Duration,
+    conflicts: AtomicU64,
+    exhausted: AtomicU64,
+    calls: AtomicU64,
+}
+
+async fn publish_delayed(
+    storage: &DelayedRamStorage,
+    stripe: usize,
+    splits: &[SpikeSplit],
+) -> Result<(), ContentionError> {
+    storage.calls.fetch_add(1, Ordering::Relaxed);
+    tokio::time::sleep(storage.round_trip).await;
+    let (bytes, version_opt) = storage
+        .inner
+        .get_all_with_version(Path::new(&manifest_path_for(stripe)))
+        .await
+        .map_err(|error| ContentionError::Fatal(error.to_string()))?;
+    let version = version_opt
+        .ok_or_else(|| ContentionError::Fatal("the spike needs versioned objects".to_string()))?;
+    let mut manifest: SpikeManifest = serde_utils::from_json_bytes(&bytes)
+        .map_err(|error| ContentionError::Fatal(error.to_string()))?;
+    let seq = manifest.next_seq;
+    storage.calls.fetch_add(1, Ordering::Relaxed);
+    tokio::time::sleep(storage.round_trip).await;
+    storage
+        .inner
+        .put(
+            Path::new(&wal_path_for(stripe, seq)),
+            Box::new(
+                serde_utils::to_json_bytes(&splits)
+                    .map_err(|error| ContentionError::Fatal(error.to_string()))?,
+            ),
+        )
+        .await
+        .map_err(|error| ContentionError::Fatal(error.to_string()))?;
+    manifest.next_seq += 1;
+    manifest.wal.push(wal_path_for(stripe, seq));
+    manifest.epoch += 1;
+    storage.calls.fetch_add(1, Ordering::Relaxed);
+    tokio::time::sleep(storage.round_trip).await;
+    match storage
+        .inner
+        .put_if_version_matches(
+            Path::new(&manifest_path_for(stripe)),
+            Box::new(
+                serde_utils::to_json_bytes(&manifest)
+                    .map_err(|error| ContentionError::Fatal(error.to_string()))?,
+            ),
+            &version,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            storage.conflicts.fetch_add(1, Ordering::Relaxed);
+            Err(ContentionError::Conflict)
+        }
+    }
+}
+
+fn manifest_path_for(stripe: usize) -> String {
+    if stripe == 0 {
+        manifest_path()
+    } else {
+        format!("{}/manifest-{stripe:03}.json", index_prefix())
+    }
+}
+
+fn wal_path_for(stripe: usize, seq: u64) -> String {
+    if stripe == 0 {
+        wal_path(seq)
+    } else {
+        format!("{}/wal-{stripe:03}/{seq:020}.json", index_prefix())
+    }
 }
