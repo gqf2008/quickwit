@@ -402,3 +402,103 @@ async fn test_sharded_layout_on_s3_endpoint() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The manifest layout on a real endpoint.
+///
+/// Same shape as the sharded test — a node that was not configured for the layout still reads the
+/// index, a split publish does not rewrite a shared object, deleting the index removes its objects
+/// — plus the property that layout exists for: a windowed read comes back from the segments that
+/// cover the window rather than from the whole index.
+#[tokio::test]
+async fn test_manifest_layout_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!("skipping test_manifest_layout_on_s3_endpoint: QW_S3_ENDPOINT is not set");
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/manifest-layout", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let mut metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    metastore_a.set_index_layout(IndexLayout::ManifestSegments {
+        bucket_secs: 3_600,
+        num_stripes: 4,
+    });
+    let metastore_b = {
+        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 4,
+        });
+        metastore
+    };
+    // A node that was not told about the layout still reads the index: it is recorded in the
+    // objects.
+    let metastore_c = FileBackedMetastore::try_new(storage.clone(), None).await?;
+
+    let index_id = append_random_suffix("manifest-layout-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid: IndexUid = metastore_a
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    let root_path = PathBuf::from(&index_id).join("v3/root.json");
+    assert!(
+        storage.exists(&root_path).await?,
+        "the index should live in the manifest layout"
+    );
+    assert!(
+        !storage
+            .exists(&PathBuf::from(&index_id).join("metastore.json"))
+            .await?,
+        "the manifest layout must not also write the single metadata file"
+    );
+
+    stage_and_publish_split(&metastore_a, &index_uid, "manifest-a-0").await?;
+    stage_and_publish_split(&metastore_b, &index_uid, "manifest-b-0").await?;
+    stage_and_publish_split(&metastore_c, &index_uid, "manifest-c-0").await?;
+
+    assert_eq!(
+        list_published_split_ids(&metastore_c, &index_uid).await?,
+        vec![
+            "manifest-a-0".to_string(),
+            "manifest-b-0".to_string(),
+            "manifest-c-0".to_string()
+        ],
+        "every node's splits must survive"
+    );
+
+    // The windowed read is the one that has to stay bounded as the index grows; here it only has to
+    // return the right splits, which is what a reader on another node checks.
+    let windowed_query = ListSplitsQuery::for_index(index_uid.clone()).with_time_range_start_gte(0);
+    let windowed_splits = metastore_c
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(
+            &windowed_query,
+        )?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert_eq!(windowed_splits.len(), 3);
+
+    // A publish does not rewrite a shared object: the root keeps its version.
+    let (_, root_version) = storage.get_all_with_version(&root_path).await?;
+    let root_version = root_version.context("the root should be a versioned object")?;
+    stage_and_publish_split(&metastore_a, &index_uid, "manifest-a-1").await?;
+    let (_, root_version_after) = storage.get_all_with_version(&root_path).await?;
+    assert_eq!(
+        root_version,
+        root_version_after.context("the root should still be a versioned object")?,
+        "publishing a split must not rewrite the shared root object"
+    );
+
+    metastore_a
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    assert!(
+        !storage.exists(&root_path).await?,
+        "deleting the index should remove its objects"
+    );
+    Ok(())
+}

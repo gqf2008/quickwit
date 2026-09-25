@@ -1,7 +1,15 @@
 # Split metadata on object storage: manifest plus segments
 
-> Status: measured spike (batch-26). The layout is implemented in
-> `quickwit-metastore/tests/obj_layout_spike.rs` and measured; the metastore does not use it yet.
+> Status: implemented (batch-27) as the third layout of the file-backed metastore
+> (`QW_METASTORE_MANIFEST_LAYOUT=true`,
+> `quickwit-metastore/src/metastore/file_backed/manifest_layout.rs`). Reads are pruned by the query's
+> window and the five split mutations read and write only the splits they touch; the shared metastore
+> suite passes on it, and CI runs it next to the other two layouts. Still open: the real-bucket
+> measurement of the port, sizing the stripe count in production, and the migration of an index that
+> was created in an older layout.
+>
+> The original spike, kept for the numbers and the shape, is
+> `quickwit-metastore/tests/obj_layout_spike.rs`.
 
 ## The question
 
@@ -97,7 +105,11 @@ Two things the spike still does **not** settle, and that a production port has t
 
 ## Porting plan
 
-1. **Layout module** (`file_backed/obj_layout.rs`): manifest, WAL objects, per-time-bucket segments,
+Landed in batch-27: the layout module, the pruned read path, and the subset mutation path (a
+publish/can stage/mark/delete reads only the splits it names, through the id ranges the manifests carry,
+and runs the same mutation closure as the other layouts). The rest of this plan is what is left.
+
+1. **Layout module** (`file_backed/manifest_layout.rs`): manifest, WAL objects, per-time-bucket segments,
    fold, and the windowed read — essentially the spike, hardened (format version, GC of superseded
    segments, torn-write handling as in `LESSON_条件写失败后不得清理自己写的对象.md`).
 2. **Split operations** (`file_backed/`): `stage_splits`, `publish_splits`, `mark_splits_for_deletion`,

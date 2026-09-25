@@ -108,7 +108,13 @@ write amplification.
 
 That setting bounds what a write writes, not what a node holds: the file-backed metastore keeps an
 index's entire split map in memory and reloads it before every mutation, so its cost per write and
-per node grows with the index. Past a few gigabytes of split metadata — a few million splits —
+per node grows with the index.
+
+`QW_METASTORE_MANIFEST_LAYOUT=true` selects a third layout built for large indexes: splits live in
+immutable segments referenced by striped manifests, so a read costs the query's window and a write
+costs the batches it publishes
+([measured](../operating/shared-metastore.md#splits-as-manifests-segments-and-a-wal-tail): a publish at
+50 000 splits drops from 1.32 s to 29 ms and a windowed read from 749 ms to 154 ms). Past a few gigabytes of split metadata — a few million splits —
 **use PostgreSQL** (see [Sharded metastore
 sizing](../operating/shared-metastore.md#sizing-when-this-layout-is-the-wrong-tool)): it updates one
 row per split, and a search reads only the rows of its time window.

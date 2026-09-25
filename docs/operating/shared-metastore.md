@@ -189,3 +189,40 @@ Throughput is not the constraint: the index above accepted splits at ~18 000/s i
 orders of magnitude of headroom. Watch the connection count instead: every node holds
 `max_connections` connections (`metastore.postgresql` in the node config), so a large cluster wants
 its `max_connections` per node kept small or a pooler in front.
+
+## Splits as manifests, segments and a WAL tail
+
+`QW_METASTORE_MANIFEST_LAYOUT=true` makes a node create indexes in a third layout, which is the one
+built for large indexes:
+
+```
+<index_id>/v3/manifest-<stripe>.json              mutable: references only, one compare-and-swap
+<index_id>/v3/wal-<stripe>/<id>.json              immutable: one object per published batch
+<index_id>/v3/segments/<bucket>/<epoch>-<id>.json immutable: one per time bucket
+<index_id>/v3/root.json                           metadata, sources, checkpoints, delete tasks
+```
+
+A publish appends one WAL object and commits one manifest: it costs what it touches, not what the
+index holds. A read loads the manifests, prunes the time buckets the query cannot touch, and fetches
+only the segments that remain plus the WAL tail, so it costs the query's window. `num_stripes` (8 by
+default here) is not an optimisation: the spike measured one manifest per index failing to sustain the
+write rate a 5·10¹² documents/day index needs once the round trip stops being same-zone, and eight
+stripes reaching it with no conflicts at all.
+
+Measured through the metastore API at 50 000 splits over 30 days, one hour queried, on RAM storage so
+the numbers are the metastore's own work (2026-09, same machine as the other layouts):
+
+| | Single object | Sharded (256 slots) | Manifest layout |
+| --- | ------------- | ------------------- | --------------- |
+| `list_splits` (last hour) | 749 ms | 1 822 ms | **154 ms** |
+| publish one split | 1.32 s | 1.37 s | **29 ms** |
+| staging throughput | 2 799/s | 3 056/s | **8 119/s** |
+
+Both of the first two layouts grow with the index; this one grows with the query and with what a write
+touches. What it does *not* change is the round trip to the bucket: a publish is still three storage
+calls plus the lookups of the splits it changes, so an index served from this layout wants its nodes
+next to the bucket, like every other layout here.
+
+The layout is opt-in per node and recorded in the objects, so a node reads an index whichever layout
+created it, and `QW_METASTORE_TEST_MANIFEST_LAYOUT=true` runs the shared metastore suite on it locally
+(CI runs it next to the other two).
