@@ -24,8 +24,16 @@
 //! never become a silent no-op.
 //!
 //! ```sh
+//! # a throwaway instance, so nothing on the machine has to change
+//! initdb -D /tmp/pgscale -U quickwit --auth=trust
+//! pg_ctl -D /tmp/pgscale -o "-p 5433 -c listen_addresses=127.0.0.1" -l /tmp/pgscale/log start
+//! createdb -h 127.0.0.1 -p 5433 -U quickwit quickwit_scale
+//!
 //! export QW_TEST_POSTGRES_URI="postgres://quickwit@127.0.0.1:5433/quickwit_scale"
 //! export QW_TEST_POSTGRES_SPLITS=1000000
+//! cargo test -p quickwit-metastore --features postgres --test postgres_scale -- --nocapture
+//! # rerun the measurements against the index the first run left behind, in seconds
+//! export QW_TEST_POSTGRES_INDEX_ID=<index_id printed above>
 //! cargo test -p quickwit-metastore --features postgres --test postgres_scale -- --nocapture
 //! ```
 
