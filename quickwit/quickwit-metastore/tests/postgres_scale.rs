@@ -195,10 +195,16 @@ async fn test_postgres_metastore_scale() -> anyhow::Result<()> {
     // "splits whose end is at or after the window start", so it also picks up the few that overlap
     // the beginning of the window.
     let expected_windowed = num_splits / (NUM_DAYS as usize * 24);
+    // Splits left behind by previous runs of this test share the window: only the seeded ones
+    // count.
+    let windowed_seeded = windowed_splits
+        .iter()
+        .filter(|split| split.split_id().as_str().starts_with("split-0"))
+        .count();
     assert!(
-        windowed_splits.len().abs_diff(expected_windowed) <= 50,
+        windowed_seeded.abs_diff(expected_windowed) <= 50,
         "expected about {expected_windowed} splits in the last hour, got {}",
-        windowed_splits.len()
+        windowed_seeded
     );
     assert!(num_full_splits >= num_splits);
 

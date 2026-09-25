@@ -159,3 +159,14 @@ the rows of its time window through an index, independently of how many splits t
 object-storage metastore is the right tool when the point is to avoid operating a database and the
 metadata stays in the single-digit-gigabyte range; past that it needs a split map that is queried and
 mutated per time bucket instead of loaded whole, which is a different design rather than a setting.
+
+The database part of that windowed read is small — `EXPLAIN (ANALYZE, BUFFERS)` on the 1 M-split index
+shows a bitmap index scan over the window (3 112 index entries, 70 shared buffers) executing in
+**0.2 ms**; the 57 ms above is the metastore serializing and the client decoding the 776 KB of split
+metadata those rows carry. That is what "reads only the window" means in practice: the window's
+metadata, not the index's.
+
+Choosing PostgreSQL is not free — it is another component to run, back up and upgrade, and at this
+scale it is a single point of failure unless it is itself made highly available. What the numbers
+above say is narrower and firmer: an index whose metadata no longer fits the object-storage
+metastore's whole-index model needs the query-and-row model, and PostgreSQL already implements it.

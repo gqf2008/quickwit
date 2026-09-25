@@ -158,6 +158,14 @@ async fn measure_layout(index_layout: IndexLayout, layout_name: &str) {
         windowed_elapsed,
         serde_json::to_vec(&windowed_splits).unwrap().len()
     );
+    // Sanity check on the measurement itself: one hour of a 30-day window is 1/720 of the splits
+    // (plus the couple that overlap the beginning of the window).
+    let expected_windowed = num_splits / (NUM_DAYS as usize * 24);
+    assert!(
+        windowed_splits.len().abs_diff(expected_windowed) <= 20,
+        "expected about {expected_windowed} splits in the last hour, got {}",
+        windowed_splits.len()
+    );
 
     // A publish while the index is that big.
     let extra_split_metadata = SplitMetadata {
