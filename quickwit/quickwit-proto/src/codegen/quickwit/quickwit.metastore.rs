@@ -231,6 +231,16 @@ pub struct PublishSplitsRequest {
     >,
     #[prost(string, optional, tag = "5")]
     pub publish_token_opt: ::core::option::Option<::prost::alloc::string::String>,
+    /// Set by a caller that is *replaying* a publish it has already sent: the splits it is publishing
+    /// may already be published, and the splits it replaces may already be marked for deletion, because
+    /// the attempt it is replaying did part of its work before it failed. Publishing is monotonic, so
+    /// the replayed request finishes the mutation instead of failing on the steps that already ran.
+    ///
+    /// A first attempt must leave this false (the default): a caller that publishes a split that is
+    /// already published without being a replay is confused about the state of the index, and the
+    /// metastore refuses it rather than advancing a checkpoint on its behalf.
+    #[prost(bool, tag = "6")]
+    pub is_replay: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

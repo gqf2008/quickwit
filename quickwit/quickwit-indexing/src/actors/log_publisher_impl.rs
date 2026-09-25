@@ -88,7 +88,7 @@ impl Handler<SplitsUpdate> for Publisher {
             );
             return Ok(());
         };
-        let publish_result = publish_with_retry(ctx, "publish splits", || {
+        let publish_result = publish_with_retry(ctx, "publish splits", |attempt| {
             // Move the request construction in the closure so that fresh values are captured
             // on each retry, such as the publish token updating
             let metastore = self.metastore.clone();
@@ -102,6 +102,10 @@ impl Handler<SplitsUpdate> for Publisher {
                     .load()
                     .as_deref()
                     .map(|publish_token| publish_token.to_string()),
+                // From the second try on, this is a replay of a request that may have committed
+                // while its response was lost: the splits it publishes may already be published,
+                // and the splits it replaces may already be marked for deletion.
+                is_replay: attempt > 0,
             };
             async move { metastore.publish_splits(publish_splits_request).await }
         })

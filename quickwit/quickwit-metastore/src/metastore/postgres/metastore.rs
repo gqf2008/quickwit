@@ -843,8 +843,27 @@ impl MetastoreService for PostgresqlMetastore {
             const PUBLISH_SPLITS_QUERY: &str = r#"
             -- Select the splits to update, regardless of their state.
             -- The left join make it possible to identify the splits that do not exist.
+            -- `replayed` marks the two steps a caller that says it is replaying may find already
+            -- done: the splits it publishes may already be published, and the splits it replaces may
+            -- already be marked for deletion. Publishing is monotonic, so those are not conflicts.
             WITH input_splits AS (
-                SELECT input_splits.split_id, input_splits.expected_split_state, splits.actual_split_state
+                SELECT
+                    input_splits.split_id,
+                    input_splits.expected_split_state,
+                    splits.actual_split_state,
+                    (
+                        $5::boolean
+                        AND (
+                            (
+                                input_splits.expected_split_state = 'Staged'
+                                AND splits.actual_split_state = 'Published'
+                            )
+                            OR (
+                                input_splits.expected_split_state = 'Published'
+                                AND splits.actual_split_state = 'MarkedForDeletion'
+                            )
+                        )
+                    ) AS replayed
                 FROM (
                     SELECT split_id, 'Staged' AS expected_split_state
                     FROM UNNEST($3) AS staged_splits(split_id)
@@ -872,9 +891,9 @@ impl MetastoreService for PostgresqlMetastore {
                     AND NOT EXISTS (
                         SELECT 1
                         FROM input_splits
-                        WHERE
-                            actual_split_state != expected_split_state
-                        )
+                        WHERE actual_split_state != expected_split_state
+                          AND NOT replayed
+                    )
             ),
             -- Publish the staged splits and mark the published splits for deletion.
             updated_splits AS (
@@ -893,8 +912,8 @@ impl MetastoreService for PostgresqlMetastore {
                     AND NOT EXISTS (
                         SELECT 1
                         FROM input_splits
-                        WHERE
-                            actual_split_state != expected_split_state
+                        WHERE actual_split_state != expected_split_state
+                          AND NOT replayed
                     )
             )
             -- Report the outcome of the update query.
@@ -902,8 +921,8 @@ impl MetastoreService for PostgresqlMetastore {
                 COUNT(1) FILTER (WHERE actual_split_state = 'Staged' AND expected_split_state = 'Staged'),
                 COUNT(1) FILTER (WHERE actual_split_state = 'Published' AND expected_split_state = 'Published'),
                 COALESCE(ARRAY_AGG(split_id) FILTER (WHERE actual_split_state IS NULL), ARRAY[]::TEXT[]),
-                COALESCE(ARRAY_AGG(split_id) FILTER (WHERE actual_split_state != 'Staged' AND expected_split_state = 'Staged'), ARRAY[]::TEXT[]),
-                COALESCE(ARRAY_AGG(split_id) FILTER (WHERE actual_split_state != 'Published' AND expected_split_state = 'Published'), ARRAY[]::TEXT[])
+                COALESCE(ARRAY_AGG(split_id) FILTER (WHERE actual_split_state != 'Staged' AND expected_split_state = 'Staged' AND NOT replayed), ARRAY[]::TEXT[]),
+                COALESCE(ARRAY_AGG(split_id) FILTER (WHERE actual_split_state != 'Published' AND expected_split_state = 'Published' AND NOT replayed), ARRAY[]::TEXT[])
                 FROM input_splits
         "#;
             let (
@@ -918,6 +937,7 @@ impl MetastoreService for PostgresqlMetastore {
                     .bind(index_metadata_json)
                     .bind(staged_split_ids)
                     .bind(replaced_split_ids)
+                    .bind(request.is_replay)
                     .fetch_one(tx.as_mut())
                     .await
                     .map_err(|sqlx_error| convert_sqlx_err(&index_uid.index_id, sqlx_error))?;

@@ -64,7 +64,7 @@ impl Handler<ParquetSplitsUpdate> for Publisher {
             return Ok(());
         };
         let publish_result = if quickwit_common::is_sketches_index(&index_uid.index_id) {
-            publish_with_retry(ctx, "publish sketch splits", || {
+            publish_with_retry(ctx, "publish sketch splits", |_attempt| {
                 let metastore = self.metastore.clone();
                 let publish_request = PublishSketchSplitsRequest {
                     index_uid: Some(index_uid.clone()),
@@ -81,7 +81,7 @@ impl Handler<ParquetSplitsUpdate> for Publisher {
             })
             .await
         } else {
-            publish_with_retry(ctx, "publish metrics splits", || {
+            publish_with_retry(ctx, "publish metrics splits", |_attempt| {
                 let metastore = self.metastore.clone();
                 let publish_request = PublishMetricsSplitsRequest {
                     index_uid: Some(index_uid.clone()),

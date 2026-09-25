@@ -817,6 +817,7 @@ mod test_setup_helper {
             staged_split_ids: vec![split_id.to_string()],
             replaced_split_ids: Vec::new(),
             publish_token_opt: None,
+            is_replay: false,
         };
         metastore
             .publish_splits(publish_splits_request)

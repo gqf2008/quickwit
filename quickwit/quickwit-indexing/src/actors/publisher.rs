@@ -168,7 +168,10 @@ pub(crate) async fn publish_with_retry<T, F, Fut>(
     mut publish: F,
 ) -> Result<(), ActorExitStatus>
 where
-    F: FnMut() -> Fut,
+    // The closure is told which attempt it is (zero on the first one), so a request can say that it
+    // is a replay: an attempt whose response was lost may have committed, and the metastore refuses
+    // to apply the steps it already applied unless the caller says so.
+    F: FnMut(usize) -> Fut,
     Fut: Future<Output = MetastoreResult<T>>,
 {
     let retry_delays = [
@@ -178,7 +181,7 @@ where
     ];
     let num_tries = retry_delays.len();
     for (attempt, retry_delay) in retry_delays.into_iter().enumerate() {
-        let Err(error) = ctx.protect_future(publish()).await else {
+        let Err(error) = ctx.protect_future(publish(attempt)).await else {
             return Ok(());
         };
         // A revoked publish token (the shard moved to another node) and a failed precondition (this

@@ -1,8 +1,9 @@
 # Splits as manifests, take two: getting the shard state out of the root
 
-> Status: design, revised after an independent design review; step 1 of it is implemented
-> (`test_a_publish_that_marked_a_replaced_split_and_lost_the_other_stripe_replays`). The rest is
-> tracked as `qw-metastore-manifest-root-contention`, whose issue carries the run and the logs.
+> Status: design, revised after an independent design review; steps 1 and 2 of it are implemented
+> (`test_a_publish_that_marked_a_replaced_split_and_lost_the_other_stripe_replays`, and the
+> `is_replay` field the publisher sets from its second attempt). Steps 3 and 4 are tracked as
+> `qw-metastore-manifest-root-contention`, whose issue carries the run and the logs.
 
 ## What the run found
 
@@ -51,15 +52,16 @@ into one compare-and-swap, so a lost race means *nothing* happened and the retry
    its own commit finds the splits it replaced already marked, which is the state it is asking for.
    A fresh request keeps the strict contract, and a split in any other non-deletable state is still
    an error.
-2. **Let the caller say it is a replay.** `publish_splits` already tolerates an already published
-   split within one request (attempt > 1). The publisher's retry is a *new* request and cannot say
-   so. A field on the request, defaulting to false and set by the pipeline from its second attempt,
-   carries that across requests, keeps the shared suite's assertion for everyone else (it does not
-   set the field), and is far smaller than moving state. It has to be honoured by *both* tolerances
-   — the already published split and the already marked replaced split — or a merge replay stops at
-   the second one. It is what makes a half-applied mutation *finishable*; on its own it does not help
-   while the root keeps losing, because the checkpoint is the payload of the commit that keeps
-   failing.
+2. **Let the caller say it is a replay** (done). `publish_splits` already tolerates an already
+   published split within one request (attempt > 1); the publisher's retry is a *new* request and
+   could not say so. `PublishSplitsRequest` now carries `is_replay`, false by default and set by the
+   pipeline from its second attempt, and the metastore honours it for *both* tolerances — the
+   already published split and the already marked replaced split — on every backend (the file-backed
+   layouts pass it into the mutation, PostgreSQL's publish query accepts the two transitions the
+   replay may already have made, and the shared suite keeps asserting the refusal for a first
+   attempt, which does not set the field). It is what makes a half-applied mutation *finishable*; on
+   its own it does not help while the root keeps losing, because the checkpoint is the payload of the
+   commit that keeps failing.
 3. **Measure the read cost of moving the state** on a real bucket before writing the code, and decide
    there whether a reader loads shard objects eagerly or on demand. Today the shard state rides along
    with the root, and the readers that pay for the root are: every read that materialises an index

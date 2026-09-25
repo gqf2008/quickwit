@@ -1116,13 +1116,15 @@ impl FileBackedMetastore {
         index_uid: &IndexUid,
         split_ids: &[SplitId],
         mutate_fn: impl Fn(&mut FileBackedIndex, bool) -> MetastoreResult<MutationOccurred<T>>,
+        caller_replay: bool,
     ) -> MetastoreResult<T> {
         let index_id = &index_uid.index_id;
         let Some(layout) = self.manifest_layout_of(index_id).await? else {
             // The other layouts write the whole index in one compare-and-swap, so a mutation never
-            // observes a partial commit of its own and keeps the strict contract.
+            // observes a partial commit of *itself*. A caller that says it is replaying still gets
+            // the same tolerance: its commit may have landed while the response was lost.
             return self
-                .mutate(index_uid, |index| mutate_fn(index, false))
+                .mutate(index_uid, |index| mutate_fn(index, caller_replay))
                 .await;
         };
         let mut attempt = 0;
@@ -1131,7 +1133,7 @@ impl FileBackedMetastore {
             // Attempt 2 onwards replays a mutation that got partway: this layout commits one stripe
             // at a time, so splits of the stripes already committed are published. The closure is
             // told, because refusing them would fail an RPC whose publication already happened.
-            let is_replay = attempt > 1;
+            let is_replay = attempt > 1 || caller_replay;
             let (root_info, root_version, root_bytes) = layout.load_root(&*self.storage).await?;
             let mut index = root_info.index;
             if index.index_uid() != index_uid {
@@ -1554,31 +1556,36 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_metadata| split_metadata.split_id.clone())
             .collect();
 
-        self.mutate_splits(&index_uid, &staged_split_ids, |index, _is_replay| {
-            let mut failed_split_ids = Vec::new();
+        self.mutate_splits(
+            &index_uid,
+            &staged_split_ids,
+            |index, _is_replay| {
+                let mut failed_split_ids = Vec::new();
 
-            for split_metadata in splits_metadata.clone() {
-                match index.stage_split(split_metadata) {
-                    Ok(()) => {}
-                    Err(MetastoreError::FailedPrecondition {
-                        entity: EntityKind::Split { split_id },
-                        ..
-                    }) => {
-                        failed_split_ids.push(split_id);
-                    }
-                    Err(error) => return Err(error),
-                };
-            }
-            if !failed_split_ids.is_empty() {
-                let entity = EntityKind::Splits {
-                    split_ids: failed_split_ids,
-                };
-                let message = "splits are not staged".to_string();
-                Err(MetastoreError::FailedPrecondition { entity, message })
-            } else {
-                Ok(MutationOccurred::Yes(()))
-            }
-        })
+                for split_metadata in splits_metadata.clone() {
+                    match index.stage_split(split_metadata) {
+                        Ok(()) => {}
+                        Err(MetastoreError::FailedPrecondition {
+                            entity: EntityKind::Split { split_id },
+                            ..
+                        }) => {
+                            failed_split_ids.push(split_id);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                }
+                if !failed_split_ids.is_empty() {
+                    let entity = EntityKind::Splits {
+                        split_ids: failed_split_ids,
+                    };
+                    let message = "splits are not staged".to_string();
+                    Err(MetastoreError::FailedPrecondition { entity, message })
+                } else {
+                    Ok(MutationOccurred::Yes(()))
+                }
+            },
+            false,
+        )
         .await?;
         Ok(EmptyResponse {})
     }
@@ -1602,20 +1609,28 @@ impl MetastoreService for FileBackedMetastore {
                 .iter()
                 .map(|split_id| SplitId::from(split_id.as_str())),
         );
-        self.mutate_splits(&index_uid, &touched_split_ids, |index, is_replay| {
-            // Only a replay tolerates an already-published split: the manifest layout commits one
-            // stripe at a time, so a replay can find half of its own publication already done.
-            // A caller that simply publishes a split that is already published still gets the hard
-            // error it always got, on every layout.
-            index.publish_splits_with_retry_tolerance(
-                request.staged_split_ids.clone(),
-                request.replaced_split_ids.clone(),
-                index_checkpoint_delta.clone(),
-                request.publish_token_opt.clone().map(|token| token.into()),
-                is_replay,
-            )?;
-            Ok(MutationOccurred::Yes(()))
-        })
+        // A publish is replayed either inside this request (the manifest layout commits one stripe
+        // at a time, so its own retry can find half of its publication done) or by the caller,
+        // which says so on the request: its earlier attempt may have committed while its
+        // response was lost. Both tolerances below follow from that one flag. A caller that
+        // publishes a split that is already published *without* being a replay still gets
+        // the hard error it always got.
+        let caller_replay = request.is_replay;
+        self.mutate_splits(
+            &index_uid,
+            &touched_split_ids,
+            |index, is_replay| {
+                index.publish_splits_with_retry_tolerance(
+                    request.staged_split_ids.clone(),
+                    request.replaced_split_ids.clone(),
+                    index_checkpoint_delta.clone(),
+                    request.publish_token_opt.clone().map(|token| token.into()),
+                    is_replay,
+                )?;
+                Ok(MutationOccurred::Yes(()))
+            },
+            caller_replay,
+        )
         .await?;
         Ok(EmptyResponse {})
     }
@@ -1632,22 +1647,27 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_id| SplitId::from(split_id.as_str()))
             .collect();
 
-        self.mutate_splits(&index_uid, &marked_split_ids, |index, _is_replay| {
-            index
-                .mark_splits_for_deletion(
-                    request.split_ids.clone(),
-                    &[
-                        SplitState::Staged,
-                        SplitState::Published,
-                        SplitState::MarkedForDeletion,
-                    ],
-                    false,
-                    // The states this call accepts already include the marked one, so it is
-                    // idempotent without the replay tolerance.
-                    false,
-                )
-                .map(MutationOccurred::from)
-        })
+        self.mutate_splits(
+            &index_uid,
+            &marked_split_ids,
+            |index, _is_replay| {
+                index
+                    .mark_splits_for_deletion(
+                        request.split_ids.clone(),
+                        &[
+                            SplitState::Staged,
+                            SplitState::Published,
+                            SplitState::MarkedForDeletion,
+                        ],
+                        false,
+                        // The states this call accepts already include the marked one, so it is
+                        // idempotent without the replay tolerance.
+                        false,
+                    )
+                    .map(MutationOccurred::from)
+            },
+            false,
+        )
         .await?;
         Ok(EmptyResponse {})
     }
@@ -1661,10 +1681,15 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_id| SplitId::from(split_id.as_str()))
             .collect();
 
-        self.mutate_splits(&index_uid, &deleted_split_ids, |index, _is_replay| {
-            index.delete_splits(request.split_ids.clone())?;
-            Ok(MutationOccurred::Yes(EmptyResponse {}))
-        })
+        self.mutate_splits(
+            &index_uid,
+            &deleted_split_ids,
+            |index, _is_replay| {
+                index.delete_splits(request.split_ids.clone())?;
+                Ok(MutationOccurred::Yes(EmptyResponse {}))
+            },
+            false,
+        )
         .await?;
         Ok(EmptyResponse {})
     }
@@ -2026,16 +2051,21 @@ impl MetastoreService for FileBackedMetastore {
             .map(|split_id| SplitId::from(split_id.as_str()))
             .collect();
 
-        self.mutate_splits(index_uid, &opstamped_split_ids, |index, _is_replay| {
-            let split_ids_str = request
-                .split_ids
-                .iter()
-                .map(|split_id| split_id.as_str())
-                .collect::<Vec<_>>();
-            index
-                .update_splits_delete_opstamp(&split_ids_str, request.delete_opstamp)
-                .map(MutationOccurred::from)
-        })
+        self.mutate_splits(
+            index_uid,
+            &opstamped_split_ids,
+            |index, _is_replay| {
+                let split_ids_str = request
+                    .split_ids
+                    .iter()
+                    .map(|split_id| split_id.as_str())
+                    .collect::<Vec<_>>();
+                index
+                    .update_splits_delete_opstamp(&split_ids_str, request.delete_opstamp)
+                    .map(MutationOccurred::from)
+            },
+            false,
+        )
         .await?;
         Ok(UpdateSplitsDeleteOpstampResponse {})
     }
@@ -3089,7 +3119,7 @@ mod tests {
         let marked = metastore
             .list_splits(
                 ListSplitsRequest::try_from_list_splits_query(
-                    &ListSplitsQuery::for_index(index_uid)
+                    &ListSplitsQuery::for_index(index_uid.clone())
                         .with_split_states([SplitState::MarkedForDeletion]),
                 )
                 .unwrap(),
@@ -3104,6 +3134,32 @@ mod tests {
             vec![replaced_split.split_id.to_string()],
             "the replaced split stays marked for deletion"
         );
+
+        // The same request, sent again by the caller rather than replayed inside one request: the
+        // publisher does that when an attempt's response was lost. Without the flag the metastore
+        // refuses it (the split it publishes is already published); with it the replayed request is
+        // what finishes the mutation.
+        let replayed_request = PublishSplitsRequest {
+            index_uid: Some(index_uid.clone()),
+            staged_split_ids: vec![new_split.split_id.to_string()],
+            replaced_split_ids: vec![replaced_split.split_id.to_string()],
+            ..Default::default()
+        };
+        let error = metastore
+            .publish_splits(replayed_request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "a fresh publish of a published split must still fail: {error:?}"
+        );
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                is_replay: true,
+                ..replayed_request
+            })
+            .await
+            .expect("a replayed publish must finish the mutation it replays");
     }
 
     #[tokio::test]

@@ -794,6 +794,7 @@ mod tests {
             replaced_split_ids: vec![splits[0].split_metadata.split_id.to_string()],
             index_checkpoint_delta_json_opt: None,
             publish_token_opt: None,
+            is_replay: false,
         };
         metastore
             .publish_splits(publish_splits_request)

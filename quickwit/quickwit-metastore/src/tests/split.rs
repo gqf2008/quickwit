@@ -301,6 +301,21 @@ pub async fn test_metastore_publish_splits<
             }
         ));
 
+        // Unless the caller says it is replaying the publish it already sent. That is what a
+        // publisher does when an attempt's response was lost after it committed: without the flag
+        // the metastore refuses (above), with it the replayed request finishes instead of failing
+        // on the work that already happened.
+        let publish_splits_request = PublishSplitsRequest {
+            index_uid: Some(index_uid.clone()),
+            staged_split_ids: vec![split_id_1.clone()],
+            is_replay: true,
+            ..Default::default()
+        };
+        metastore
+            .publish_splits(publish_splits_request)
+            .await
+            .expect("a replayed publish must finish the mutation it replays");
+
         cleanup_index(&mut metastore, index_uid).await;
     }
 

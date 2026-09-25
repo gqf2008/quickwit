@@ -49,6 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the round-trip arithmetic and the measured numbers behind it. (walgit: `qw-metastore-backend-guidance`)
 
 ### Fixed
+- Metastore: a publish that the indexing pipeline replays — because an attempt's response was lost
+  after it committed, or because the manifest layout's own replay stopped partway — can now finish.
+  `PublishSplitsRequest` carries `is_replay`, set by the pipeline from its second attempt, and the
+  metastore applies the steps the earlier attempt already applied instead of failing on them
+  (a first attempt that publishes a published split still gets the precondition failure). On a
+  five-node index the pipeline no longer faults and restarts on such a replay.
+  (walgit: `qw-metastore-manifest-root-contention`)
 - Metastore: a create that is replayed after losing a manifest race no longer answers `already exists` for the
   index file it wrote itself. Two nodes creating indexes at the same time used to hit that in about 5% of the
   creations, failing an operation that had actually succeeded (real R2: 80/80 creations after the fix).
