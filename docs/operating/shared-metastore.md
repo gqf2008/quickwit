@@ -58,11 +58,17 @@ searchers need to notice indexes created by other nodes.
 | Scenario | Result |
 | -------- | ------ |
 | 3 nodes publishing into one index on R2, 2 minutes | 32,880 acknowledged = 32,880 searchable, zero actor faults |
-| **5 nodes publishing into one manifest-layout index on R2, 2 minutes** | **54,240 acknowledged = 54,240 searchable, zero actor faults, zero error lines** |
+| 5 nodes publishing into one manifest-layout index on R2, 2 minutes | 54,240 acknowledged = 54,240 searchable, zero actor faults, zero ERROR-level lines |
 | GC/retention load, 3 nodes, ~14 minutes | zero actor faults, delete tasks progressing on every node |
 | Metastore outage, 5 minutes, ingest continuing | 600/600 acknowledged during the outage, all 640 documents searchable 1.5 s after recovery |
 | Rollback drill with a pre-CAS binary | data readable both ways; mixed versions silently lose updates (documented) |
 | Metadata write latency, PostgreSQL vs R2 | delete p50 26 ms vs 2.14 s; publish p50 6.1 s vs 7.0 s; ingest 52 vs 63 acked/s (1 node) |
+
+The search count in the manifest-layout row is the one a node reports while the index is still being
+published and merged, and a node that polls a second later can count more documents than were
+acknowledged while a merge is in flight; the number to compare against the acknowledged one is the
+index's static state, which the row's two numbers are (33 published splits holding 54,240 documents
+in that run). The other rows are from the same kind of run and the same harness.
 
 ## Known limits
 
