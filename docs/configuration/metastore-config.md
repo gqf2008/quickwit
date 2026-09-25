@@ -115,7 +115,7 @@ row per split, and a search reads only the rows of its time window.
 
 #### Monitoring a shared metastore
 
-A shared metastore exposes two counters on the `/metrics` endpoint:
+A shared metastore exposes these counters on the `/metrics` endpoint:
 
 | Metric | Meaning |
 | ------ | ------- |

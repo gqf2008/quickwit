@@ -908,6 +908,7 @@ mod tests {
         create_index(&*storage, 1).await;
         let (_, context) = load_sharded_index(&*storage, INDEX_ID).await.unwrap();
         let num_splits = SLOT_FOLD_THRESHOLD + 100;
+        let folds_before = super::super::metrics::SHARD_FOLDS_TOTAL.get();
         write(&*storage, 0..num_splits, &context).await.unwrap();
 
         // Every split of a single-slot index lives in one file, so this write crossed the threshold
@@ -920,6 +921,12 @@ mod tests {
                 .values()
                 .all(|bookmark| bookmark.segment.is_some()),
             "the slot should have been folded into a segment"
+        );
+        // The counter is the only signal from outside that folding — the thing that keeps a slot
+        // file bounded — is actually happening. Other tests fold too, hence "more than before".
+        assert!(
+            super::super::metrics::SHARD_FOLDS_TOTAL.get() > folds_before,
+            "a successful fold has to be visible in the fold counter"
         );
         assert_eq!(list_split_ids(&*storage).await.len(), num_splits);
 
