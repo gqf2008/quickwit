@@ -553,7 +553,13 @@ impl FileBackedMetastore {
             };
             match put_index_if_version_matches(&*self.storage, &mut index, &version).await {
                 Ok(_) => {
-                    self.replace_cached_index(index_id, index).await;
+                    // The snapshot we wrote is ours, but winning the compare-and-swap does not
+                    // prove nobody else wrote in between: with the sharded layout in particular
+                    // two writers usually touch different slots and both win. Caching the snapshot
+                    // we happen to hold would then serve a view that is missing the other writer's
+                    // splits until the next poll. Drop it instead, so the next read reloads from
+                    // the storage, which is what the poller would have done anyway.
+                    self.discard_cached_index(index_id).await;
                     return Ok(value);
                 }
                 Err(MetastoreError::FailedPrecondition { .. })
