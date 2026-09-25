@@ -74,11 +74,12 @@ The manifest layout prunes the reads that carry a time window. The reads that ca
 metadata, the delete tasks, the last delete opstamp and the shards — all live in `root.json`, and a
 node reads the root for them instead of the whole index: measured on the same R2 bucket with 4 000
 splits (289 objects across the root, 32 manifests, the WAL tail and the segments), the first
-`index_metadata` after a fresh start takes **645 ms**, and **2.96 s** when it is made to materialise
-the index, as it used to; the reads after it take a few microseconds from the cached root. The point
-is what is *not* in memory: a node that only reads metadata — the control plane and the janitor read
-every index's — does not keep that index's split map, which the whole-index layouts do and which this
-layout exists to avoid. `QW_TEST_S3_MEASURE=1 QW_TEST_S3_SPLITS=<n>` reproduces the measurement
+`index_metadata` after a fresh start takes **645 ms**, against **2.96 s** for the same test before
+this change; on the same node the delete-task reads after it take a few microseconds, and a repeated
+`index_metadata` is 133 µs, both from the cached root. The point is what is *not* in memory: a node
+that only reads metadata — the control plane and the janitor read every index's — does not keep that
+index's split map, which the whole-index layouts do and which this layout exists to avoid.
+`QW_TEST_S3_MEASURE=1 QW_TEST_S3_SPLITS=<n>` reproduces the measurement
 (`tests/s3_shared_metastore.rs`, `test_manifest_layout_metadata_read_cost_on_s3_endpoint`).
 
 ## Known limits
