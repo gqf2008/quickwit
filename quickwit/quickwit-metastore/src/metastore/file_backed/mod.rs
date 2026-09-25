@@ -2977,7 +2977,7 @@ mod tests {
 
         // Every commit of the index metadata fails, the way a mesh of writers at a high round trip
         // keeps winning the race; the splits themselves commit.
-        test_hooks::fail_next_root_commits(DISTRIBUTED_MAX_ATTEMPTS as u32 + 4);
+        test_hooks::fail_next_root_commits(index_id, DISTRIBUTED_MAX_ATTEMPTS as u32);
         let checkpoint_delta = IndexCheckpointDelta::for_test(source_id, 0..10);
         let error = metastore
             .publish_splits(PublishSplitsRequest {

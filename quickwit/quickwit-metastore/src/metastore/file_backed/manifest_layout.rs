@@ -80,27 +80,33 @@ pub(crate) mod test_hooks {
     use std::sync::Mutex;
 
     static FAIL_NEXT_COMMIT_FOR_STRIPE: Mutex<Option<usize>> = Mutex::new(None);
-    static FAIL_NEXT_ROOT_COMMIT: Mutex<u32> = Mutex::new(0);
+    static FAIL_NEXT_ROOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
 
     /// Fails the next manifest commit of `stripe`, once.
     pub(crate) fn fail_next_commit_for_stripe(stripe: usize) {
         *FAIL_NEXT_COMMIT_FOR_STRIPE.lock().unwrap() = Some(stripe);
     }
 
-    /// Fails the next `attempts` commits of the root, so a test can drive the index-metadata
-    /// compare-and-swap (the one shared object) into exhausting its replay budget.
-    pub(crate) fn fail_next_root_commits(attempts: u32) {
-        *FAIL_NEXT_ROOT_COMMIT.lock().unwrap() = attempts;
+    /// Fails the next `attempts` commits of the root of `index_id`, so a test can drive the
+    /// index-metadata compare-and-swap (the one shared object) into exhausting its replay budget.
+    ///
+    /// The hook names the index it is armed for: the state is a process-global, so a runner that
+    /// keeps every test in one process (plain `cargo test`) would otherwise let another test's
+    /// mutation consume the injections.
+    pub(crate) fn fail_next_root_commits(index_id: &str, attempts: u32) {
+        *FAIL_NEXT_ROOT_COMMITS.lock().unwrap() = Some((index_id.to_string(), attempts));
     }
 
-    pub(super) fn take_root_commit_failure() -> bool {
-        let mut guard = FAIL_NEXT_ROOT_COMMIT.lock().unwrap();
-        if *guard > 0 {
-            *guard -= 1;
-            true
-        } else {
-            false
+    pub(super) fn take_root_commit_failure(index_id: &str) -> bool {
+        let mut guard = FAIL_NEXT_ROOT_COMMITS.lock().unwrap();
+        let Some((armed_index_id, attempts)) = guard.as_mut() else {
+            return false;
+        };
+        if armed_index_id != index_id || *attempts == 0 {
+            return false;
         }
+        *attempts -= 1;
+        true
     }
 
     pub(super) fn take_failure_for(stripe: usize) -> bool {
@@ -459,7 +465,7 @@ impl ManifestLayout {
             return Ok(());
         }
         #[cfg(test)]
-        if test_hooks::take_root_commit_failure() {
+        if test_hooks::take_root_commit_failure(&self.index_id) {
             return Err(MetastoreError::FailedPrecondition {
                 entity: quickwit_proto::metastore::EntityKind::Index {
                     index_id: self.index_id.clone(),
