@@ -270,8 +270,9 @@ are: a publish is three storage calls plus the lookups of the splits it changes,
 object it touches (its manifests, segments and WAL objects are fetched in parallel).
 
 That latency bounds the rate a single node can publish: three round trips per publish is ~2.4 s here,
-so the 11.6 publishes/s that a 5·10¹² documents/day index implies needs either nodes next to the
-bucket or ~28 writes in flight, and the 12 writers above reached 3.8/s from this machine. The
+so the 11.6 metadata writes/s that a 5·10¹² documents/day index implies (5.8 splits/s, staged and then
+published) needs either nodes next to the bucket or ~28 writes in flight, and the 12 writers above
+reached 3.8 publishes/s from this machine. The
 measurement is opt-in and prints both the numbers and the writer count it used:
 `QW_TEST_S3_MEASURE=1 QW_TEST_S3_STRIPES=<n> QW_TEST_S3_WRITERS=<n> cargo test -p quickwit-metastore
 --features ci-test --test s3_shared_metastore -- --nocapture`.
