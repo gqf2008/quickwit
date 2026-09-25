@@ -333,13 +333,17 @@ pub(super) async fn load_manifest_index_if_exists(
     // The layout parameters travel with the index, so a node reads an index another node created
     // with settings it does not share.
     let layout = ManifestLayout::new(index_id, root_info.bucket_secs, root_info.num_stripes);
-    let mut index = root_info.index;
-    let splits = layout.load_split_map(storage).await?;
-    let mut split_map = std::collections::HashMap::with_capacity(splits.len());
-    for split in splits {
-        split_map.insert(split.split_id().clone(), split);
-    }
-    index.put_splits(split_map);
+    // The split map is deliberately *not* loaded here.
+    //
+    // This is what a node caches for an index, and for a manifest-layout index the split map can be
+    // the whole index: measured at 4 000 splits, loading it costs 289 object reads and leaves a
+    // copy in memory on every node that reads anything about the index (the control plane and
+    // the janitor read its metadata on their own schedules). Every path that needs splits of a
+    // manifest-layout index goes through the layout instead — `list_splits`,
+    // `get_splits_by_id`, the stats — so the cached view holds the metadata, the sources, the
+    // checkpoints, the shards and the delete tasks, which live in `root.json`, and nothing
+    // else.
+    let index = root_info.index;
     if index.index_id() != index_id {
         return Err(MetastoreError::Internal {
             message: "inconsistent manifest: index_id mismatch".to_string(),

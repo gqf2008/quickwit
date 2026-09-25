@@ -208,6 +208,36 @@ enum DeleteSplitOutcome {
     Forbidden,
 }
 
+/// Stats of an index, from its splits.
+///
+/// Shared by the whole-index layouts, which compute them from the split map they hold, and by the
+/// manifest layout, whose cached view holds no split map and computes them from the layout.
+pub(crate) fn index_stats_from_splits<'split>(
+    index_uid: &IndexUid,
+    splits: impl IntoIterator<Item = &'split Split>,
+) -> IndexStats {
+    let mut staged_stats = SplitStats::default();
+    let mut published_stats = SplitStats::default();
+    let mut marked_for_deletion_stats = SplitStats::default();
+    for split in splits {
+        match split.split_state {
+            SplitState::Staged => staged_stats.add_split(split.split_metadata.footer_offsets.end),
+            SplitState::Published => {
+                published_stats.add_split(split.split_metadata.footer_offsets.end)
+            }
+            SplitState::MarkedForDeletion => {
+                marked_for_deletion_stats.add_split(split.split_metadata.footer_offsets.end)
+            }
+        }
+    }
+    IndexStats {
+        index_uid: Some(index_uid.clone()),
+        staged: Some(staged_stats),
+        published: Some(published_stats),
+        marked_for_deletion: Some(marked_for_deletion_stats),
+    }
+}
+
 impl FileBackedIndex {
     /// Constructor.
     #[allow(dead_code)]
@@ -655,30 +685,10 @@ impl FileBackedIndex {
 
     /// Gets IndexStats for this index
     pub(crate) fn get_stats(&self) -> MetastoreResult<IndexStats> {
-        let mut staged_stats = SplitStats::default();
-        let mut published_stats = SplitStats::default();
-        let mut marked_for_deletion_stats = SplitStats::default();
-
-        for split in self.splits.values() {
-            match split.split_state {
-                SplitState::Staged => {
-                    staged_stats.add_split(split.split_metadata.footer_offsets.end)
-                }
-                SplitState::Published => {
-                    published_stats.add_split(split.split_metadata.footer_offsets.end)
-                }
-                SplitState::MarkedForDeletion => {
-                    marked_for_deletion_stats.add_split(split.split_metadata.footer_offsets.end)
-                }
-            }
-        }
-
-        Ok(IndexStats {
-            index_uid: Some(self.index_uid().clone()),
-            staged: Some(staged_stats),
-            published: Some(published_stats),
-            marked_for_deletion: Some(marked_for_deletion_stats),
-        })
+        Ok(index_stats_from_splits(
+            self.index_uid(),
+            self.splits.values(),
+        ))
     }
 
     /// Adds a source.

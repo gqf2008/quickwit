@@ -52,8 +52,8 @@ use quickwit_proto::metastore::{
     DeleteTask, EmptyResponse, EntityKind, FindIndexTemplateMatchesRequest,
     FindIndexTemplateMatchesResponse, GetClusterIdentityRequest, GetClusterIdentityResponse,
     GetIndexTemplateRequest, GetIndexTemplateResponse, IndexMetadataFailure,
-    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexTemplateMatch,
-    IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
+    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexStats,
+    IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
     LastDeleteOpstampResponse, ListDeleteTasksRequest, ListDeleteTasksResponse,
     ListIndexStatsRequest, ListIndexStatsResponse, ListIndexTemplatesRequest,
     ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
@@ -1015,6 +1015,25 @@ impl FileBackedMetastore {
         Ok(index_metadata)
     }
 
+    /// Stats of one index.
+    ///
+    /// A manifest-layout index's cached view holds no split map, so its stats come from the
+    /// layout's splits; the other layouts compute them from the index the cache holds.
+    async fn index_stats_of(&self, index_id: &str) -> MetastoreResult<IndexStats> {
+        let Some(layout) = self.manifest_layout_of(index_id).await? else {
+            return self
+                .read_any(index_id, None, |index| index.get_stats())
+                .await;
+        };
+        let (root_info, _, _) = layout.load_root(&*self.storage).await?;
+        let index_uid = root_info.index.index_uid().clone();
+        let splits = layout.load_split_map(&*self.storage).await?;
+        Ok(file_backed_index::index_stats_from_splits(
+            &index_uid,
+            splits.iter(),
+        ))
+    }
+
     async fn list_splits_aux(
         &self,
         index_id_with_incarnation_id_opts: &[(IndexId, Option<Ulid>)],
@@ -1804,10 +1823,7 @@ impl MetastoreService for FileBackedMetastore {
 
         let mut index_read_futures = FuturesUnordered::new();
         for index_id in index_ids {
-            let index_read_future = async move {
-                self.read_any(&index_id, None, |index| index.get_stats())
-                    .await
-            };
+            let index_read_future = async move { self.index_stats_of(&index_id).await };
             index_read_futures.push(index_read_future);
         }
 
