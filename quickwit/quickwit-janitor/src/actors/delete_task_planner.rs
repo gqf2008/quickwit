@@ -369,8 +369,9 @@ impl DeleteTaskPlanner {
         let stale_splits_response = ctx
             .protect_future(self.metastore.list_stale_splits(list_stale_splits_request))
             .await?;
-        // Reading the stream is part of the same round trip: a slow bucket keeps the response
-        // arriving for as long as it takes to write.
+        // Deserializing the response is work this actor does on the blocking pool; a large
+        // stale-split list takes long enough for the heartbeat to tick, so it runs in the
+        // protected zone too.
         let stale_splits = ctx
             .protect_future(stale_splits_response.deserialize_splits())
             .await?;
@@ -451,6 +452,90 @@ mod tests {
     use quickwit_search::{MockSearchService, searcher_pool_for_test};
 
     use super::*;
+
+    /// The planner awaits calls it does not bound — the metastore's, the search service's — and the
+    /// progress watchdog kills an actor that goes quiet for a heartbeat. Those calls therefore run
+    /// in the protected zone; a real five-node run against a bucket 0.81 s away logged fourteen
+    /// `DeleteTaskPlanner stopped reporting progress` faults before they did.
+    ///
+    /// The mock's call takes three heartbeats and blocks the thread it runs on, which is what a
+    /// slow downstream call looks like from the actor's side. Without the protection the
+    /// supervisor's health check kills the planner while the call is still in flight.
+    ///
+    /// Nothing has to be sent: the planner starts planning from its own `initialize`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_task_planner_survives_a_slow_metastore() -> anyhow::Result<()> {
+        use quickwit_proto::metastore::{
+            LastDeleteOpstampResponse, ListSplitsResponse, MetastoreServiceClient,
+            MockMetastoreService,
+        };
+
+        quickwit_common::setup_logging_for_tests();
+        let test_sandbox = TestSandbox::create(
+            "test-slow-metastore",
+            r#"
+            field_mappings:
+              - name: body
+                type: text
+            "#,
+            r#"
+            merge_policy:
+                type: no_merge
+            "#,
+            &["body"],
+        )
+        .await?;
+        let slow_call = *quickwit_actors::HEARTBEAT * 3;
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_last_delete_opstamp()
+            .returning(move |_| {
+                std::thread::sleep(slow_call);
+                Ok(LastDeleteOpstampResponse {
+                    last_delete_opstamp: 0,
+                })
+            });
+        mock_metastore.expect_list_stale_splits().returning(|_| {
+            Ok(ListSplitsResponse {
+                splits_serialized_json: "[]".to_string(),
+            })
+        });
+
+        let universe = test_sandbox.universe();
+        let merge_scheduler_mailbox = universe.get_or_spawn_one();
+        let (merge_split_downloader_mailbox, _inbox) = universe.create_test_mailbox();
+        let search_job_placer = SearchJobPlacer::new(searcher_pool_for_test([]));
+        let doc_mapper = build_doc_mapper(
+            &serde_json::from_value(serde_json::json!({
+                "field_mappings": [{"name": "body", "type": "text"}]
+            }))?,
+            &Default::default(),
+        )?;
+        let delete_planner = DeleteTaskPlanner::new(
+            IndexUid::new_with_random_ulid("test-slow-metastore"),
+            Uri::from_str("ram:///indexes/test-slow-metastore")?,
+            serde_json::to_string(&doc_mapper)?,
+            MetastoreServiceClient::from_mock(mock_metastore),
+            search_job_placer,
+            merge_split_downloader_mailbox,
+            merge_scheduler_mailbox,
+        );
+        // Supervised on purpose: it is the supervisor's health check that kills an actor which
+        // stops reporting progress, and it restarts it — which is what the supervisor
+        // counts. Without the protection the health check sees an actor that has been quiet
+        // for a heartbeat and kills it while the call is in flight, so `num_kills` above
+        // zero is exactly the fault measured here.
+        let (_planner_mailbox, planner_handle) = universe.spawn_builder().supervise(delete_planner);
+        tokio::time::sleep(slow_call * 2).await;
+        let metrics = planner_handle.observe().await.metrics;
+        assert_eq!(
+            metrics.num_kills, 0,
+            "a call the actor does not bound must not get it killed and restarted"
+        );
+        assert_eq!(metrics.num_errors, 0);
+        test_sandbox.assert_quit().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_delete_task_planner() -> anyhow::Result<()> {
