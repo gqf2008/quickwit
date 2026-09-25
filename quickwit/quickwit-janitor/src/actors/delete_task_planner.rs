@@ -145,9 +145,19 @@ impl DeleteTaskPlanner {
             let last_delete_opstamp_request = LastDeleteOpstampRequest {
                 index_uid: Some(self.index_uid.clone()),
             };
-            let last_delete_opstamp = self
-                .metastore
-                .last_delete_opstamp(last_delete_opstamp_request)
+            // The calls below go to another actor (the metastore service, the search service) and
+            // their latency is not this actor's to bound: a metastore read of a large index, or a
+            // leaf search on a loaded node, can take longer than the progress heartbeat, and
+            // without protection the watchdog reads that as this actor having stopped.
+            // It is the downstream actor's failure to detect — which is what the
+            // protected zone means — and a real five-node run had fourteen
+            // `DeleteTaskPlanner stopped reporting progress` faults from exactly these
+            // calls.
+            let last_delete_opstamp = ctx
+                .protect_future(
+                    self.metastore
+                        .last_delete_opstamp(last_delete_opstamp_request),
+                )
                 .await?
                 .last_delete_opstamp;
             let stale_splits = self
@@ -299,9 +309,11 @@ impl DeleteTaskPlanner {
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<bool> {
         let search_job = SearchJob::from(&stale_split.split_metadata);
-        let mut search_client = self
-            .search_job_placer
-            .assign_job(search_job.clone(), &HashSet::new())
+        let mut search_client = ctx
+            .protect_future(
+                self.search_job_placer
+                    .assign_job(search_job.clone(), &HashSet::new()),
+            )
             .await?;
         for delete_task in delete_tasks {
             let delete_query = delete_task
@@ -330,7 +342,9 @@ impl DeleteTaskPlanner {
                 &search_indexes_metas,
                 vec![search_job.clone()],
             )?;
-            let response = search_client.leaf_search(leaf_search_request).await?;
+            let response = ctx
+                .protect_future(search_client.leaf_search(leaf_search_request))
+                .await?;
             ctx.record_progress();
             if response.num_hits > 0 {
                 return Ok(true);
@@ -352,10 +366,13 @@ impl DeleteTaskPlanner {
             delete_opstamp: last_delete_opstamp,
             num_splits: NUM_STALE_SPLITS_TO_FETCH as u64,
         };
-        let stale_splits = ctx
+        let stale_splits_response = ctx
             .protect_future(self.metastore.list_stale_splits(list_stale_splits_request))
-            .await?
-            .deserialize_splits()
+            .await?;
+        // Reading the stream is part of the same round trip: a slow bucket keeps the response
+        // arriving for as long as it takes to write.
+        let stale_splits = ctx
+            .protect_future(stale_splits_response.deserialize_splits())
             .await?;
         debug!(
             index_id = index_uid.index_id,
