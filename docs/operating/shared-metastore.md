@@ -224,7 +224,10 @@ five publishes each (2026-09-25):
 | 32 | **2 / 60** | **0.03** | **3.81 publishes/s** |
 
 Four writers saw no conflict at all with eight stripes (0 in 20 publishes), so the rule is a margin
-over the writer count rather than a constant. More stripes cost no *extra round trip* on the read side —
+over the writer count rather than a constant. The harness publishes split ids of its own shape
+(`writer-<n>-<round>`), which do not hash like the ULIDs a deployment uses, so these counts are a
+lower bound: size from the writer count, then recheck with the ids the index actually receives. More
+stripes cost no *extra round trip* on the read side —
 a read loads the manifests (in parallel, so they share one), prunes the time buckets the query cannot
 touch, and fetches only the segments that remain plus the WAL tail, so it costs the query's window
 rather than the index —
