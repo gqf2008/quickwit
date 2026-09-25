@@ -317,9 +317,10 @@ pub async fn test_metastore_publish_splits<
             .expect("a replayed publish must finish the mutation it replays");
 
         // And the state it leaves behind is the state the first attempt wanted: the split it
-        // publishes stays published, and the split it replaces stays marked for deletion. Switching
-        // on the current state instead of the caller's role would mark the published one for
-        // deletion — which PostgreSQL's single update statement did until this assertion existed.
+        // publishes stays published. Switching on the current state instead of the caller's role
+        // would mark that one for deletion — which PostgreSQL's single update statement did until
+        // this assertion existed. (This block replaces nothing, so only the publishing side is
+        // exercised here; the merge-side replay has its own test next to the manifest layout.)
         let list_splits_query = ListSplitsQuery::for_index(index_uid.clone())
             .with_split_states([SplitState::Published]);
         let list_splits_request =
