@@ -827,6 +827,9 @@ impl FileBackedMetastore {
                 Ok(()) | Err(MetastoreError::NotFound(EntityKind::Index { .. }))
             ) {
                 state_wlock_guard.indexes.remove(&index_id);
+                // The layout cache outlives the index otherwise, and an index recreated with the
+                // same id would be written with the dead one's parameters.
+                state_wlock_guard.manifest_layouts.remove(&index_id);
                 if let Err(error) = self
                     .save_manifest_cas(&state_wlock_guard, &mut manifest_version_opt, attempt)
                     .await
@@ -1961,8 +1964,13 @@ impl MetastoreService for FileBackedMetastore {
         request: UpdateSplitsDeleteOpstampRequest,
     ) -> MetastoreResult<UpdateSplitsDeleteOpstampResponse> {
         let index_uid = request.index_uid();
+        let opstamped_split_ids: Vec<SplitId> = request
+            .split_ids
+            .iter()
+            .map(|split_id| SplitId::from(split_id.as_str()))
+            .collect();
 
-        self.mutate(index_uid, |index| {
+        self.mutate_splits(index_uid, &opstamped_split_ids, |index| {
             let split_ids_str = request
                 .split_ids
                 .iter()
@@ -2618,6 +2626,24 @@ mod tests {
 
     metastore_test_suite!(crate::FileBackedMetastore);
 
+    async fn list_published_split_ids_with(
+        metastore: &FileBackedMetastore,
+        index_uid: &IndexUid,
+    ) -> MetastoreResult<Vec<String>> {
+        let query = ListSplitsQuery::for_index(index_uid.clone())
+            .with_split_state(crate::SplitState::Published);
+        let mut splits: Vec<String> = metastore
+            .list_splits(ListSplitsRequest::try_from_list_splits_query(&query).unwrap())
+            .await?
+            .collect_split_ids()
+            .await?
+            .into_iter()
+            .map(String::from)
+            .collect();
+        splits.sort();
+        Ok(splits)
+    }
+
     // Hook of the layout itself: the suite above runs on whichever layout the environment selects,
     // so this test pins that the selection actually reaches the storage.
     #[tokio::test]
@@ -2662,6 +2688,97 @@ mod tests {
             .await
             .unwrap();
         assert!(!metastore.index_exists(index_id).await.unwrap());
+    }
+
+    /// Hook of the manifest layout, plus the case the layout cache can get wrong: an index deleted
+    /// and recreated under the same id has to be written with the *new* layout parameters, not the
+    /// ones its predecessor had.
+    #[tokio::test]
+    async fn test_manifest_layout_is_used_when_configured() {
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+
+        let index_id = "test-manifest-layout";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        assert!(
+            storage
+                .exists(Path::new("test-manifest-layout/v3/root.json"))
+                .await
+                .unwrap(),
+            "the index should have been created in the manifest layout"
+        );
+
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-0"));
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec!["split-0".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            list_published_split_ids_with(&metastore, &index_uid)
+                .await
+                .unwrap(),
+            vec!["split-0".to_string()]
+        );
+
+        // Delete and recreate under the same id: the cached layout of the dead index must not be
+        // reused.
+        metastore
+            .delete_index(DeleteIndexRequest {
+                index_uid: Some(index_uid),
+            })
+            .await
+            .unwrap();
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec!["split-0".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            list_published_split_ids_with(&metastore, &index_uid)
+                .await
+                .unwrap(),
+            vec!["split-0".to_string()]
+        );
     }
 
     #[tokio::test]

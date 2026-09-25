@@ -120,7 +120,7 @@ jobs:
         if: always() && steps.modified.outputs.rust_src == 'true'
         run: >-
           QW_METASTORE_TEST_SHARDED_LAYOUT=true cargo nextest run -p quickwit-metastore
-          --features=postgres,metrics --retries 1 -E 'test(file_backed)'
+          --features=postgres --retries 1 -E 'test(file_backed)'
         working-directory: ./quickwit
       # Same suite, third layout: splits in immutable segments referenced by striped manifests. It is
       # the one whose reads are bounded by the query and whose writes are bounded by what they touch,
@@ -129,7 +129,7 @@ jobs:
         if: always() && steps.modified.outputs.rust_src == 'true'
         run: >-
           QW_METASTORE_TEST_MANIFEST_LAYOUT=true cargo nextest run -p quickwit-metastore
-          --features=postgres,metrics --retries 1 -E 'test(file_backed)'
+          --features=postgres --retries 1 -E 'test(file_backed)'
         working-directory: ./quickwit
       - name: Install python packages
         if: always() && steps.modified.outputs.rust_src == 'true'

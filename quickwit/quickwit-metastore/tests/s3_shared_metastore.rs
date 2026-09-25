@@ -172,11 +172,20 @@ async fn stage_and_publish_split(
     index_uid: &IndexUid,
     split_id: &str,
 ) -> anyhow::Result<()> {
+    stage_and_publish_split_with_time_range(metastore, index_uid, split_id, 0..=99).await
+}
+
+async fn stage_and_publish_split_with_time_range(
+    metastore: &FileBackedMetastore,
+    index_uid: &IndexUid,
+    split_id: &str,
+    time_range: RangeInclusive<i64>,
+) -> anyhow::Result<()> {
     let split_metadata = SplitMetadata {
         footer_offsets: 0..10,
         split_id: split_id.to_string().into(),
         num_docs: 1,
-        time_range: Some(RangeInclusive::new(0, 99)),
+        time_range: Some(time_range),
         ..Default::default()
     };
     let stage_splits_request =
@@ -479,6 +488,49 @@ async fn test_manifest_layout_on_s3_endpoint() -> anyhow::Result<()> {
         .collect_split_ids()
         .await?;
     assert_eq!(windowed_splits.len(), 3);
+
+    // A window that cannot overlap a split's time range must not return it: that pruning is what
+    // this layout exists for, and doing it on a real bucket also exercises the segment and WAL
+    // filtering.
+    stage_and_publish_split_with_time_range(
+        &metastore_a,
+        &index_uid,
+        "manifest-late",
+        4_000_000_000..=4_000_000_060,
+    )
+    .await?;
+    let early_window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(0)
+        .with_time_range_end_lt(3_600);
+    let early_split_ids = metastore_c
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(
+            &early_window,
+        )?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert!(
+        !early_split_ids
+            .iter()
+            .any(|split_id| split_id.as_str() == "manifest-late"),
+        "a split outside the query window must be pruned"
+    );
+    let late_window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(4_000_000_000)
+        .with_time_range_end_lt(4_000_003_600);
+    let late_split_ids = metastore_c
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(&late_window)?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert_eq!(
+        late_split_ids
+            .iter()
+            .filter(|split_id| split_id.as_str() == "manifest-late")
+            .count(),
+        1,
+        "the split inside the window must be returned"
+    );
 
     // A publish does not rewrite a shared object: the root keeps its version.
     let (_, root_version) = storage.get_all_with_version(&root_path).await?;

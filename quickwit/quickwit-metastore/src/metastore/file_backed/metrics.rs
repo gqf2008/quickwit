@@ -72,17 +72,6 @@ pub(super) static SHARD_STALE_VIEW_RETRIES_TOTAL: LazyCounter = lazy_counter!(
     subsystem: "metastore",
 );
 
-/// Number of reads of a manifest-layout index that caught a stripe moving and restarted.
-///
-/// The manifests of that layout are striped and each write commits one stripe; a read that lands
-/// between a stripe's read and its commit restarts rather than mixing two epochs.
-pub(super) static MANIFEST_STALE_READS_TOTAL: LazyCounter = lazy_counter!(
-    name: "file_backed_manifest_stale_reads_total",
-    description: "Number of reads of a manifest-layout index that caught a stripe moving and \
-                  restarted. Occasional restarts are normal under concurrent writes.",
-    subsystem: "metastore",
-);
-
 /// Number of folds of a manifest-layout stripe.
 pub(super) static MANIFEST_FOLDS_TOTAL: LazyCounter = lazy_counter!(
     name: "file_backed_manifest_folds_total",

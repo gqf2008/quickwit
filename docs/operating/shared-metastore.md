@@ -218,8 +218,9 @@ the numbers are the metastore's own work (2026-09, same machine as the other lay
 | publish one split | 1.32 s | 1.37 s | **29 ms** |
 | staging throughput | 2 799/s | 3 056/s | **8 119/s** |
 
-Both of the first two layouts grow with the index; this one grows with the query and with what a write
-touches. What it does *not* change is the round trip to the bucket: a publish is still three storage
+Both of the first two layouts grow with the index; this one grows with the query and with what a
+write touches, which is why the same 4× more splits cost it 2.4–2.9× rather than 4× in a rerun of the
+measurement. What it does *not* change is the round trip to the bucket: a publish is still three storage
 calls plus the lookups of the splits it changes, so an index served from this layout wants its nodes
 next to the bucket, like every other layout here.
 

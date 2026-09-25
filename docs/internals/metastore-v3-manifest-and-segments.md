@@ -4,9 +4,10 @@
 > (`QW_METASTORE_MANIFEST_LAYOUT=true`,
 > `quickwit-metastore/src/metastore/file_backed/manifest_layout.rs`). Reads are pruned by the query's
 > window and the five split mutations read and write only the splits they touch; the shared metastore
-> suite passes on it, and CI runs it next to the other two layouts. Still open: the real-bucket
-> measurement of the port, sizing the stripe count in production, and the migration of an index that
-> was created in an older layout.
+> suite passes on it, and CI runs it next to the other two layouts. Measured growth is sub-linear
+> rather than flat (4× the splits cost the query and the publish 2.4–2.9× more, from the WAL tail and
+> the segment list). Still open: the real-bucket measurement of the port, sizing the stripe count in
+> production, and the migration of an index that was created in an older layout.
 >
 > The original spike, kept for the numbers and the shape, is
 > `quickwit-metastore/tests/obj_layout_spike.rs`.

@@ -45,8 +45,9 @@
 //!    committed but whose response was lost is indistinguishable from a lost race
 //!    (`LESSON_条件写失败后不得清理自己写的对象.md`), so only the generation-gated GC removes
 //!    anything.
-//! 4. A reader that finds a stripe whose manifest moved under it restarts; it never mixes a torn
-//!    view of two epochs.
+//! 4. A read is a snapshot: it loads a manifest and then fetches the immutable objects that
+//!    manifest names, so it cannot observe a torn view. It may observe an older or a newer epoch
+//!    than the caller wrote, never a mixture of the two.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -70,9 +71,6 @@ const SEGMENT_GRACE_GENERATIONS: u64 = 2;
 
 /// Bucket of the splits that carry no time range. A time window never prunes it away.
 const UNTIMED_BUCKET: i64 = i64::MIN;
-
-/// Attempts a read makes when a stripe moves under it.
-const READ_MAX_ATTEMPTS: usize = 5;
 
 /// A stripe folds its WAL tail once it holds this many unpublished batches.
 ///
@@ -111,6 +109,20 @@ struct SegmentRef {
     key: String,
     min_split_id: SplitId,
     max_split_id: SplitId,
+    /// Earliest `time_range.start` of the splits in the segment, or `None` when it holds only
+    /// splits without a time range.
+    ///
+    /// Pruning uses this span and not the bucket: a split is placed in the bucket of its *start*,
+    /// so its range can reach into later buckets, and pruning by bucket would drop a split
+    /// that overlaps the query.
+    #[serde(default)]
+    min_time_range_start: Option<i64>,
+    /// Latest `time_range.end` of the splits in the segment.
+    #[serde(default)]
+    max_time_range_end: Option<i64>,
+    /// Whether the segment holds splits with no time range, which no window prunes away.
+    #[serde(default)]
+    has_untimed_splits: bool,
     num_splits: usize,
 }
 
@@ -233,9 +245,13 @@ impl ManifestLayout {
         self.prefix().join(format!("manifest-{stripe:03}.json"))
     }
 
-    fn wal_path(&self, stripe: usize, object_id: &str) -> PathBuf {
-        self.prefix()
-            .join(format!("wal-{stripe:03}/{object_id}.json"))
+    fn wal_path(&self, stripe: usize, epoch: u64, object_id: &str) -> PathBuf {
+        self.wal_prefix(stripe)
+            .join(format!("{epoch:020}-{object_id}.json"))
+    }
+
+    fn wal_prefix(&self, stripe: usize) -> PathBuf {
+        self.prefix().join(format!("wal-{stripe:03}"))
     }
 
     fn segment_path(&self, bucket: i64, epoch: u64, object_id: &str) -> PathBuf {
@@ -533,6 +549,9 @@ impl ManifestLayout {
         }
         let (mut manifest, version) = self.read_manifest(storage, stripe).await?;
         let object_id = Uuid::new_v4().to_string();
+        // The object is named after the epoch that will reference it, which is what lets the
+        // garbage collection of a later fold tell an old WAL object from a live one.
+        let wal_epoch = manifest.epoch + 1;
         let num_ops = ops.len();
         let wal = WalBatch {
             format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
@@ -540,13 +559,13 @@ impl ManifestLayout {
         };
         storage
             .put(
-                &self.wal_path(stripe, &object_id),
+                &self.wal_path(stripe, wal_epoch, &object_id),
                 Box::new(serde_utils::to_json_bytes(&wal)?),
             )
             .await
             .map_err(|error| map_storage_error(&self.index_id, error))?;
         manifest.wal.push(
-            self.wal_path(stripe, &object_id)
+            self.wal_path(stripe, wal_epoch, &object_id)
                 .to_string_lossy()
                 .to_string(),
         );
@@ -626,6 +645,19 @@ impl ManifestLayout {
                     .last()
                     .map(|split| split.split_id().clone())
                     .unwrap_or_else(|| SplitId::from("")),
+                min_time_range_start: splits
+                    .iter()
+                    .filter_map(|split| split.split_metadata.time_range.as_ref())
+                    .map(|range| *range.start())
+                    .min(),
+                max_time_range_end: splits
+                    .iter()
+                    .filter_map(|split| split.split_metadata.time_range.as_ref())
+                    .map(|range| *range.end())
+                    .max(),
+                has_untimed_splits: splits
+                    .iter()
+                    .any(|split| split.split_metadata.time_range.is_none()),
                 num_splits: splits.len(),
             };
             let object_id = Uuid::new_v4().to_string();
@@ -664,6 +696,8 @@ impl ManifestLayout {
             .map_err(|error| map_storage_error(&self.index_id, error))?;
         super::metrics::MANIFEST_FOLDS_TOTAL.inc();
         self.garbage_collect(storage, commit_epoch).await;
+        self.garbage_collect_wal(storage, stripe, commit_epoch)
+            .await;
         Ok(true)
     }
 
@@ -708,6 +742,48 @@ impl ManifestLayout {
                 }
                 if let Err(error) = storage.delete(Path::new(&path)).await {
                     warn!(index_id = %self.index_id, path = %path, %error, "failed to delete a superseded segment");
+                }
+            }
+        }
+    }
+
+    /// Deletes the WAL objects a fold has taken over, once no manifest that could still be read
+    /// names them.
+    ///
+    /// A fold removes those references in the same compare-and-swap that advances the epoch, so an
+    /// object is collectible as soon as a manifest two generations later exists — the same grace
+    /// the segments get, and for the same reason: a reader holding an older manifest may still
+    /// be fetching what it names.
+    async fn garbage_collect_wal(&self, storage: &dyn Storage, stripe: usize, epoch: u64) {
+        let Some(delete_before) = epoch.checked_sub(SEGMENT_GRACE_GENERATIONS) else {
+            return;
+        };
+        let prefix = self.wal_prefix(stripe);
+        let mut pages = storage.list(&prefix);
+        loop {
+            let page = match pages.try_next().await {
+                Ok(Some(page)) => page,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(index_id = %self.index_id, stripe, %error, "failed to list wal objects for gc");
+                    return;
+                }
+            };
+            for metadata in page {
+                let path = metadata.path.to_string_lossy().to_string();
+                let Some(generation) = Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.split_once('-'))
+                    .and_then(|(generation, _)| generation.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                if generation > delete_before {
+                    continue;
+                }
+                if let Err(error) = storage.delete(Path::new(&path)).await {
+                    warn!(index_id = %self.index_id, stripe, path = %path, %error, "failed to delete a folded wal object");
                 }
             }
         }
@@ -758,32 +834,11 @@ impl ManifestLayout {
         from: i64,
         to: i64,
     ) -> MetastoreResult<Vec<Split>> {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.list_splits_once(storage, from, to).await {
-                Err(MetastoreError::FailedPrecondition { .. }) if attempt < READ_MAX_ATTEMPTS => {
-                    super::metrics::MANIFEST_STALE_READS_TOTAL.inc();
-                    continue;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    async fn list_splits_once(
-        &self,
-        storage: &dyn Storage,
-        from: i64,
-        to: i64,
-    ) -> MetastoreResult<Vec<Split>> {
-        let first_bucket = from.div_euclid(self.bucket_secs);
-        let last_bucket = (to - 1).div_euclid(self.bucket_secs);
         let mut splits = BTreeMap::new();
         for stripe in 0..self.num_stripes {
             let (manifest, _) = self.read_manifest(storage, stripe).await?;
-            for (bucket, segment_ref) in &manifest.segments {
-                if *bucket != UNTIMED_BUCKET && (*bucket < first_bucket || *bucket > last_bucket) {
+            for segment_ref in manifest.segments.values() {
+                if !segment_overlaps_window(segment_ref, from, to) {
                     continue;
                 }
                 let segment = self.read_segment(storage, &segment_ref.key).await?;
@@ -855,9 +910,200 @@ fn apply_op(splits: &mut BTreeMap<SplitId, Split>, op: SplitOp) {
     }
 }
 
+/// Whether a segment can hold a split the window `[from, to)` keeps.
+///
+/// A segment with no time range at all (every split untimed) always qualifies, because the
+/// metastore's predicate keeps untimed splits for every window.
+fn segment_overlaps_window(segment: &SegmentRef, from: i64, to: i64) -> bool {
+    if segment.has_untimed_splits {
+        return true;
+    }
+    let (Some(min_start), Some(max_end)) =
+        (segment.min_time_range_start, segment.max_time_range_end)
+    else {
+        // A segment with neither a span nor untimed splits holds nothing.
+        return false;
+    };
+    max_end >= from && min_start < to
+}
+
 fn split_overlaps(split: &Split, from: i64, to: i64) -> bool {
     let Some(time_range) = &split.split_metadata.time_range else {
         return true;
     };
     *time_range.end() >= from && *time_range.start() < to
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use quickwit_storage::RamStorage;
+
+    use super::*;
+    use crate::{SplitMetadata, SplitState};
+
+    const BUCKET_SECS: i64 = 3_600;
+
+    fn layout() -> ManifestLayout {
+        ManifestLayout::new("test-index", BUCKET_SECS, 2)
+    }
+
+    fn split(split_id: &str, time_range: Option<std::ops::RangeInclusive<i64>>) -> Split {
+        Split {
+            split_state: SplitState::Published,
+            update_timestamp: 0,
+            publish_timestamp: None,
+            split_metadata: SplitMetadata {
+                time_range,
+                ..SplitMetadata::for_test(SplitId::from(split_id))
+            },
+        }
+    }
+
+    async fn publish_and_fold(layout: &ManifestLayout, storage: &dyn Storage, splits: Vec<Split>) {
+        let ops: Vec<SplitOp> = splits
+            .into_iter()
+            .map(|split| SplitOp {
+                split_id: split.split_id().clone(),
+                split: Some(split),
+            })
+            .collect();
+        layout.publish_ops(storage, ops).await.unwrap();
+        for stripe in 0..layout.num_stripes {
+            layout.fold(storage, stripe).await.unwrap();
+        }
+    }
+
+    /// A split whose range starts in one bucket and reaches into the next must be returned by a
+    /// query that only covers the next one. This is the case a bucket-based pruning got wrong: it
+    /// dropped a split that the metastore's own predicate keeps.
+    #[tokio::test]
+    async fn test_a_split_reaching_into_the_next_window_is_not_pruned_away() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        // Start at 1800 (bucket 0), end at 5400 (bucket 1).
+        publish_and_fold(
+            &layout,
+            &storage,
+            vec![split("split-a", Some(1_800..=5_400))],
+        )
+        .await;
+
+        let next_window = layout.list_splits(&storage, 3_600, 7_200).await.unwrap();
+        assert_eq!(
+            next_window.len(),
+            1,
+            "a split overlapping the window was pruned away"
+        );
+        let previous_window = layout.list_splits(&storage, 0, 3_600).await.unwrap();
+        assert_eq!(previous_window.len(), 1);
+        let far_window = layout
+            .list_splits(&storage, 100_000, 103_600)
+            .await
+            .unwrap();
+        assert!(
+            far_window.is_empty(),
+            "a window that cannot overlap must prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_split_without_a_time_range_is_never_pruned() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        publish_and_fold(&layout, &storage, vec![split("split-untimed", None)]).await;
+
+        for window in [(0, 3_600), (1_700_000_000, 1_700_003_600)] {
+            let splits = layout
+                .list_splits(&storage, window.0, window.1)
+                .await
+                .unwrap();
+            assert_eq!(
+                splits.len(),
+                1,
+                "window {window:?} dropped an untimed split"
+            );
+        }
+    }
+
+    /// Folding has to collect the WAL objects it took over, or the layout grows with the number of
+    /// writes instead of with the number of splits.
+    #[tokio::test]
+    async fn test_folding_collects_the_wal_objects_it_took_over() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let mut num_wal_objects = 0;
+        for round in 0..4 {
+            let splits: Vec<Split> = (0..3)
+                .map(|index| {
+                    split(
+                        &format!("split-{round}-{index}"),
+                        Some(1_700_000_000..=1_700_000_060),
+                    )
+                })
+                .collect();
+            publish_and_fold(&layout, &storage, splits).await;
+            num_wal_objects += count_objects(&storage, "wal").await;
+        }
+        // Four folds, each collecting the WAL of the fold before it: what is left is the most
+        // recent generation (and the one before it, inside the grace), never everything
+        // ever written.
+        let remaining = count_objects(&storage, "wal").await;
+        assert!(
+            remaining <= 4,
+            "wal objects are piling up: {remaining} left after {num_wal_objects} published"
+        );
+        let splits = layout
+            .list_splits(&storage, 1_699_999_000, 1_700_010_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            splits.len(),
+            12,
+            "the splits themselves must survive the collection"
+        );
+    }
+
+    async fn count_objects(storage: &RamStorage, prefix: &str) -> usize {
+        let mut pages = storage.list(Path::new(&format!("test-index/v3/{prefix}")));
+        let mut count = 0;
+        while let Some(page) = pages.try_next().await.unwrap() {
+            count += page.len();
+        }
+        count
+    }
+
+    /// A read of a window must not fetch the segments of other windows.
+    #[tokio::test]
+    async fn test_a_windowed_read_does_not_read_other_segments() {
+        let layout = layout();
+        let (storage, counters) =
+            quickwit_storage::CountingStorage::instrument_storage(Arc::new(RamStorage::default()));
+        layout.create(&*storage).await.unwrap();
+        for hour in 0..24 {
+            let start = 1_700_000_000 + hour * BUCKET_SECS;
+            publish_and_fold(
+                &layout,
+                &*storage,
+                vec![split(&format!("split-{hour}"), Some(start..=start + 60))],
+            )
+            .await;
+        }
+        let (bytes_before, _) = counters.snapshot();
+        let splits = layout
+            .list_splits(&*storage, 1_700_000_000, 1_700_000_000 + BUCKET_SECS)
+            .await
+            .unwrap();
+        assert_eq!(splits.len(), 1);
+        let (bytes_read, _) = counters.snapshot();
+        let bytes_read = bytes_read - bytes_before;
+        assert!(
+            bytes_read < 4_000,
+            "a one-hour window read {bytes_read} bytes out of 24 hours of segments"
+        );
+    }
 }
