@@ -4,9 +4,10 @@
 > (`QW_METASTORE_MANIFEST_LAYOUT=true`,
 > `quickwit-metastore/src/metastore/file_backed/manifest_layout.rs`). Reads are pruned by the query's
 > window and the five split mutations read and write only the splits they touch; the shared metastore
-> suite passes on it, and CI runs it next to the other two layouts. Measured growth is sub-linear
-> rather than flat (4× the splits cost the query and the publish 2.4–2.9× more, from the WAL tail and
-> the segment list). Measured on a real bucket: a publish writes 1 380 bytes, 12 writers conflict 0.03
+> suite passes on it, and CI runs it next to the other two layouts. Its single-operation costs do not
+> grow with the index: 4× the splits (50 000 to 200 000, RAM, same harness) left a windowed read at
+> 74 ms against 99 ms and a single publish at 14 ms against 22 ms, while the bulk paths that touch
+> every split grew 3.1–3.3×. Measured on a real bucket: a publish writes 1 380 bytes, 12 writers conflict 0.03
 > times per publish on 32 stripes and reach 3.8 publishes/s, and the fold path writes, reads and
 > collects the segments it is supposed to (`tests/s3_shared_metastore.rs`,
 > `docs/operating/shared-metastore.md`). Still open: the migration of an index that was created in an
@@ -85,8 +86,13 @@ against an artificial round trip:
 
 | Round trip | 1 manifest | 8 striped manifests |
 | ---------- | ---------- | ------------------- |
-| 20 ms (in-region) | 12.0/s published, **240 conflicts / 120 publishes** (2 per publish, 9 storage calls each) | **12.0/s, 0 conflicts, 3.0 storage calls per publish** |
+| 20 ms (simulated in-region) | 12.0/s published, **240 conflicts / 120 publishes** (2 per publish, 9 storage calls each) | **12.0/s, 0 conflicts, 3.0 storage calls per publish** |
 | 200 ms | **1.6/s published** (target 12/s), 74 conflicts, **4 writes exhausted their replay budget** | 8.3/s, **0 conflicts**, 3.0 storage calls per publish |
+
+The run above injects the round trip into RAM storage rather than measuring a bucket, and its writers
+are assigned to distinct stripes (`writer % stripes`), so its zeros are structural: read the
+conflict numbers measured against a real bucket in
+[Shared object-storage metastore](../operating/shared-metastore.md) instead of these.
 
 So one manifest per index is *not* enough for this workload away from a same-zone bucket — it does
 not reach the rate, and it starts dropping writes when the replay budget runs out — while eight

@@ -164,12 +164,12 @@ PostgreSQL over loopback at 1 000 000 splits.
 | Memory per node | the whole split map (~12 GB at 15 M) | the whole split map | none | none |
 | `list_splits` for the whole index | the in-memory copy | the in-memory copy | the window's metadata | streams: 4 ms to the first chunk, 37 s for 1 M rows |
 
-The same run at 200 000 splits — 4× the index, same machine and harness — says what the last two
-columns buy. The manifest layout's windowed read is **74 ms** and its single publish **14 ms**: the
-same numbers as at 50 000, because neither operation loads the index. Only its bulk paths grow, and
-less than the index does (staging 9 033/s and publishing all of them 6 424/s, 3.1–3.3× the time for 4×
-the splits), while the other two layouts grow on every number (single object: a 3.16 s windowed read
-and a 5.89 s publish; sharded: 4.59 s and 4.57 s).
+The same run at 200 000 splits — 4× the index, same machine and harness — says what the manifest
+column buys: its windowed read is **74 ms** against 99 ms at 50 000, and its single publish **14 ms**
+against 22 ms. Both are the same cost rather than 4×, because neither operation loads the index. Only
+its bulk paths grow, and less than the index does (staging 9 033/s and publishing all of them 6 424/s,
+3.1–3.3× the time for 4× the splits), while the other two layouts grow on every number (single object:
+a 3.16 s windowed read and a 5.89 s publish; sharded: 4.59 s and 4.57 s).
 
 Both runs are in the repository (`quickwit-metastore/tests/file_backed_scale.rs` measures all three
 layouts in one run, `quickwit-metastore/tests/postgres_scale.rs` the database); rerun them with
@@ -180,16 +180,20 @@ backend to use follows the locality of its nodes:
 
 - **Nodes next to the bucket (same region, tens of milliseconds away): object storage, in the
   manifest layout.** It is the layout whose read and write cost does not grow with the index, it needs
-  no second component to run, back up and keep highly available, and the round trip allows the rate:
-  a publish is three storage calls, so ~16 publishes/s per node at a 20 ms round trip, and the spike
-  sustained 12/s with five writers on eight stripes and no conflicts.
+  no second component to run, back up and keep highly available, and the round trip allows the rate: a
+  publish is three storage calls, so ~16 publishes/s per node at a 20 ms round trip. That latency is a
+  **model, not a measurement of this port** — it comes from the spike
+  (`quickwit-metastore/tests/obj_layout_spike.rs`, which injects the round trip into RAM storage) and
+  from the three-call arithmetic; no deployment in the same region as the nodes has been measured
+  here, so measure the rate on the deployment's own bucket before relying on it.
 - **Nodes away from the bucket: PostgreSQL, or move the nodes.** At the 0.81 s round trip the real
   bucket below measures from this machine those same three calls are ~2.4 s, so one node publishes
-  0.4/s and twelve writers reach 3.8/s — under the 5.8 publishes/s this shape asks for. A database
-  answers in one round trip because the server owns the storage, and the database part of a windowed
-  read is small: `EXPLAIN (ANALYZE, BUFFERS)` on the 1 M-split index shows a bitmap index scan over
-  the window (3 112 index entries, 70 shared buffers) executing in **0.2 ms**, so the 57 ms above is
-  the metastore serializing and the client decoding 776 KB of split metadata.
+  0.4/s and twelve writers reach 3.8/s — under the 5.8 split publications/s this shape asks for (11.6
+  metadata writes/s, counting the stage). A database answers in one round trip because the server owns
+  the storage, and the database part of a windowed read is small: `EXPLAIN (ANALYZE, BUFFERS)` on the 1
+  M-split index shows a bitmap index scan over the window (3 112 index entries, 70 shared buffers)
+  executing in **0.2 ms**, so the 57 ms above is the metastore serializing and the client decoding
+  776 KB of split metadata.
 
 The 15 M splits of that index are ~23 GB in PostgreSQL (1 M splits took 1.5 GB of table *and*
 indexes), so plan storage for the metadata of every index you keep and prefer retention, or one index
@@ -249,7 +253,7 @@ Measured through the metastore API at 50 000 splits over 30 days, one hour queri
 the numbers are the metastore's own work (2026-09-25): a windowed read takes **99 ms**, publishing one
 split **22 ms**, and staging runs at **6 957 splits/s** — against 743 ms, 1.43 s and 2 747/s for the
 default layout in the same run. The three-way comparison, and what it means for a large index, is
-[below](#sizing-which-backend-to-use-and-when-to-stop-using-this-one). It is also the layout that does
+[above](#sizing-which-backend-to-use-and-when-to-stop-using-this-one). It is also the layout that does
 not grow with the index: 4× the splits (200 000 against 50 000) leave a windowed read and a single
 publish at the same cost — 74 ms and 14 ms — because neither loads the index, and only its bulk paths
 grow, 3.1–3.3× for 4× the splits. What it does *not* change is the round trip to the bucket: a publish
