@@ -61,11 +61,13 @@ into one compare-and-swap, so a lost race means *nothing* happened and the retry
    while the root keeps losing, because the checkpoint is the payload of the commit that keeps
    failing.
 3. **Measure the read cost of moving the state** on a real bucket before writing the code, and decide
-   there whether a reader loads shard objects eagerly or on demand. Every read that materialises an
-   index today gets the shard state for free with the root (`index_metadata`,
-   `list_indexes_metadata`, and every mutation: they all go through `load_index`), and with the state
-   in its own objects each of them reads those objects too — `list_shards` per source, the control
-   plane's per-index reload per index. Step 3 has to count both, not just `list_shards`.
+   there whether a reader loads shard objects eagerly or on demand. Today the shard state rides along
+   with the root, and the readers that pay for the root are: every read that materialises an index
+   (`index_metadata`, `list_indexes_metadata`, the control plane's reload — all through `load_index`),
+   the mutations that are not split mutations (shard life cycle, sources, delete tasks — also through
+   `load_index`), and a v3 split mutation, which reads the root plus the stripes it touches. Moving
+   the state means each of those also reads one object per shard involved, unless step 3 decides to
+   load them on demand; step 3 counts both, and not `list_shards` alone.
 4. **Then move the state**, if the numbers say the read cost is affordable. That is what removes
    condition 3 rather than making it rarer.
 
