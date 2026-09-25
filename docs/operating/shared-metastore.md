@@ -197,7 +197,7 @@ built for large indexes:
 
 ```
 <index_id>/v3/manifest-<stripe>.json              mutable: references only, one compare-and-swap
-<index_id>/v3/wal-<stripe>/<id>.json              immutable: one object per published batch
+<index_id>/v3/wal-<stripe>/<generation>-<id>.json immutable: one object per published batch
 <index_id>/v3/segments/<stripe>/<bucket>/<generation>-<id>.json immutable: one per time bucket
 <index_id>/v3/root.json                           metadata, sources, checkpoints, delete tasks
 ```

@@ -23,8 +23,9 @@
 //!
 //! ```text
 //! <index_id>/v3/manifest-<stripe:03>.json      mutable, one compare-and-swap point per stripe
-//! <index_id>/v3/wal-<stripe:03>/<uuid>.json    immutable, one object per published batch
-//! <index_id>/v3/segments/<bucket:012>/<epoch:020>-<uuid>.json   immutable, one per time bucket
+//! <index_id>/v3/wal-<stripe:03>/<generation:020>-<uuid>.json   immutable, one per published batch
+//! <index_id>/v3/segments/<stripe:03>/<bucket:012>/<generation:020>-<uuid>.json
+//!                                              immutable, one per time bucket of one stripe
 //! ```
 //!
 //! A publish appends one WAL object and commits one manifest (three storage calls: read, write,
@@ -39,8 +40,11 @@
 //!
 //! 1. Only the writer holding a stripe's manifest version commits it; losing is an error the caller
 //!    replays, never an overwrite.
-//! 2. A segment is immutable and is named after the epoch that introduced it, so garbage collection
-//!    is a pure function of the name and the manifests (never of a wall clock).
+//! 2. A segment and a WAL object are immutable and are named after the *fold generation* of the
+//!    stripe that owns them — its own directory, its own counter — so garbage collection is a pure
+//!    function of the name and that stripe's manifest (never of a wall clock). A WAL object is
+//!    named after the fold that will take it over, which is what makes its name comparable with the
+//!    generation a later fold collects up to.
 //! 3. An unreferenced object is never deleted on the failure path: a conditional write that was
 //!    committed but whose response was lost is indistinguishable from a lost race
 //!    (`LESSON_条件写失败后不得清理自己写的对象.md`), so only the generation-gated GC removes
@@ -1214,12 +1218,13 @@ mod tests {
             publish_and_fold(&layout, &storage, splits).await;
             num_wal_objects += count_objects(&storage, "wal-000").await;
         }
-        // Four folds, each collecting the WAL of the fold before it: what is left is the most
-        // recent generation (and the one before it, inside the grace), never everything
-        // ever written.
+        // Four folds, each collecting what the fold two generations back took over: what is left is
+        // the most recent generation and the one before it, never everything ever written. The
+        // bound is exact rather than generous on purpose — four objects are written, so an
+        // assertion like `remaining <= 4` would hold with the collection switched off altogether.
         let remaining = count_objects(&storage, "wal-000").await;
-        assert!(
-            remaining <= 4,
+        assert_eq!(
+            remaining, 2,
             "wal objects are piling up: {remaining} left after {num_wal_objects} published"
         );
         let splits = layout
