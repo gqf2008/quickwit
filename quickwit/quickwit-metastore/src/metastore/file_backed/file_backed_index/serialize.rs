@@ -79,10 +79,15 @@ pub(crate) struct FileBackedIndexV0_8 {
 
 impl From<FileBackedIndex> for FileBackedIndexV0_8 {
     fn from(index: FileBackedIndex) -> Self {
+        // Every list is sorted *deterministically*, down to the last field of the key. The byte
+        // comparison in `store_root` (and in the sharded layout's bookmark) is what lets a write
+        // that changes nothing skip its compare-and-swap, and hash-map order differs
+        // between processes: the same state from two nodes used to serialize differently,
+        // so the write happened anyway.
         let splits = index
             .splits
             .into_values()
-            .sorted_by_key(|split| split.update_timestamp)
+            .sorted_by_key(|split| (split.update_timestamp, split.split_id().clone()))
             .collect();
         let shards = index
             .per_source_shards
@@ -93,7 +98,14 @@ impl From<FileBackedIndex> for FileBackedIndexV0_8 {
                 // default. This way, we can still modify the serialization format without worrying
                 // about backward compatibility post `0.7`.
                 if !shards.is_empty() {
-                    Some((source_id, shards.into_shards_vec()))
+                    Some((
+                        source_id,
+                        shards
+                            .into_shards_vec()
+                            .into_iter()
+                            .sorted_by_key(|shard| shard.shard_id.clone())
+                            .collect(),
+                    ))
                 } else {
                     None
                 }
@@ -102,17 +114,17 @@ impl From<FileBackedIndex> for FileBackedIndexV0_8 {
         let delete_tasks = index
             .delete_tasks
             .into_iter()
-            .sorted_by_key(|delete_task| delete_task.opstamp)
+            .sorted_by_key(|delete_task| (delete_task.opstamp, delete_task.create_timestamp))
             .collect();
         let metrics_splits = index
             .metrics_splits
             .into_values()
-            .sorted_by_key(|split| split.update_timestamp)
+            .sorted_by_key(|split| (split.update_timestamp, split.metadata.split_id.to_string()))
             .collect();
         let sketch_splits = index
             .sketch_splits
             .into_values()
-            .sorted_by_key(|split| split.update_timestamp)
+            .sorted_by_key(|split| (split.update_timestamp, split.metadata.split_id.to_string()))
             .collect();
         Self {
             metadata: index.metadata,
@@ -156,5 +168,67 @@ impl From<FileBackedIndexV0_8> for FileBackedIndex {
             index.metrics_splits,
             index.sketch_splits,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quickwit_config::IndexConfig;
+    use quickwit_proto::ingest::Shard;
+    use quickwit_proto::types::ShardId;
+
+    use super::*;
+    use crate::{IndexMetadata, SplitMetadata, SplitState};
+
+    /// An index whose contents are the same has to serialize to the same bytes.
+    ///
+    /// The metastore compares them to decide whether a write changed anything and can skip its
+    /// compare-and-swap, and the order of the map the index keeps its splits and shards in differs
+    /// between processes: the same state from two nodes used to serialize differently, so the write
+    /// happened anyway.
+    #[test]
+    fn test_serializing_an_index_is_deterministic() {
+        let index_config =
+            IndexConfig::for_test("test-deterministic", "ram:///indexes/test-deterministic");
+        let metadata = IndexMetadata::new(index_config);
+        let split = |split_id: &str| Split {
+            split_state: SplitState::Published,
+            // The same timestamp on purpose: the id is what has to break the tie.
+            update_timestamp: 7,
+            publish_timestamp: None,
+            split_metadata: SplitMetadata::for_test(quickwit_proto::types::SplitId::from(split_id)),
+        };
+        let shard = |shard_id: &str| Shard {
+            shard_id: Some(ShardId::from(shard_id)),
+            // The conversion asserts on the fields ingest v2 requires.
+            publish_position_inclusive: Some(quickwit_proto::types::Position::Beginning),
+            doc_mapping_uid: Some(quickwit_proto::types::DocMappingUid::default()),
+            ..Default::default()
+        };
+        let build = |reverse: bool| {
+            let mut splits = vec![split("split-a"), split("split-b"), split("split-c")];
+            let mut shards = vec![shard("shard-a"), shard("shard-b")];
+            if reverse {
+                splits.reverse();
+                shards.reverse();
+            }
+            let index = FileBackedIndexV0_8 {
+                metadata: metadata.clone(),
+                splits,
+                shards: HashMap::from([("source".to_string(), shards)]),
+                delete_tasks: Vec::new(),
+                metrics_splits: Vec::new(),
+                sketch_splits: Vec::new(),
+            };
+            FileBackedIndex::from(VersionedFileBackedIndex::V0_9(index))
+        };
+        let serialized = |index: FileBackedIndex| {
+            quickwit_proto::metastore::serde_utils::to_json_bytes_pretty(&index).unwrap()
+        };
+        assert_eq!(
+            serialized(build(false)),
+            serialized(build(true)),
+            "the same state in a different order must serialize to the same bytes"
+        );
     }
 }
