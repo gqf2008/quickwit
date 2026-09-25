@@ -121,10 +121,13 @@ const MANIFEST_LAYOUT_BUCKET_SECS: i64 = 3_600;
 /// Striping is a requirement, not an optimisation: with one manifest the spike measured the write
 /// rate a 5·10¹² documents/day index needs failing away from a same-zone round trip, and two
 /// conflicts per publish. The count is also a sizing rule, measured on a real bucket: writers that
-/// hash to the same stripe contend, so with eight stripes four writers saw 0 conflicts per publish,
-/// eight writers 0.25, and twelve writers 0.58 — each conflict costing a replay of the publish. The
-/// default leaves room for a burst of writers over the stripe count, because a read fetches all the
-/// manifests at once and pays for them in one round trip, not one per stripe.
+/// hash to the same stripe contend, so four writers saw 0 conflicts per publish on eight stripes,
+/// twelve writers 0.68 with eight stripes and 0.03 with 32 — each conflict costing a replay of the
+/// publish. Those counts come from split ids the test harness generates, which do not hash like the
+/// ULIDs a deployment publishes, so they are a lower bound; the table, and what each number
+/// measures, is in `docs/operating/shared-metastore.md`. The default leaves room for a burst of
+/// writers over the stripe count, because a read fetches all the manifests at once and pays for
+/// them in one round trip, not one per stripe.
 const MANIFEST_LAYOUT_NUM_STRIPES: usize = 32;
 
 /// Environment variable that sets the stripe count of indexes this node creates in the manifest
