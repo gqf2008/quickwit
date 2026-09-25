@@ -106,6 +106,13 @@ that enforces conditional writes, and the node refuses to start with this settin
 [Shared object-storage metastore](../operating/shared-metastore.md) for the layout and the measured
 write amplification.
 
+That setting bounds what a write writes, not what a node holds: the file-backed metastore keeps an
+index's entire split map in memory and reloads it before every mutation, so its cost per write and
+per node grows with the index. Past a few gigabytes of split metadata — a few million splits —
+**use PostgreSQL** (see [Sharded metastore
+sizing](../operating/shared-metastore.md#sizing-when-this-layout-is-the-wrong-tool)): it updates one
+row per split, and a search reads only the rows of its time window.
+
 #### Monitoring a shared metastore
 
 A shared metastore exposes two counters on the `/metrics` endpoint:

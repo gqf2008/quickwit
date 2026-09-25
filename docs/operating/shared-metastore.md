@@ -130,3 +130,32 @@ stay behind another node's writes until the next poll — the object store has e
 does not. That is the same contract as today (`#polling_interval` is what makes a node notice other
 nodes' work), but the margin is thinner: configure polling wherever a node reads an index it also
 writes, and expect a node that neither polls nor writes to keep the view it loaded.
+
+### Sizing: when this layout is the wrong tool
+
+The layout fixes *how much a write writes*. It does not change how much a read reads: the file-backed
+metastore keeps the split map of an index in memory on every node, and reloads it in full before
+every mutation. Both are `O(splits in the index)`, so a 15 M-split index means a ~12 GB in-memory
+split map per node and a full reload per write, whatever the layout.
+
+Measured on this machine (2026-09), comparing the two backends at the scale each is used at —
+PostgreSQL over loopback, the file-backed metastore on RAM so that the numbers are the metastore's
+own work rather than the network:
+
+| Workload | File-backed, 50 000 splits | PostgreSQL, 1 000 000 splits |
+| -------- | -------------------------- | ---------------------------- |
+| publish one split into the index | 1.25–1.35 s (reload and rewrite of the whole index) | **8.4 ms** (one row update) |
+| `list_splits` for one hour of a 30-day index | 7 ms, served from the in-memory copy of the whole index | **57 ms**, 776 KB read from the database |
+| `list_splits` for the whole index | the node already holds it, and holds it for good | streams: first chunk in 4 ms, 37 s for all 1 M rows |
+| Memory per node | the whole split map (~38 MB at 50 k splits, ~12 GB at 15 M) | none |
+
+Both runs are in the repository (`quickwit-metastore/tests/file_backed_scale.rs` and
+`quickwit-metastore/tests/postgres_scale.rs`); rerun them with `QW_TEST_SCALE_SPLITS` and
+`QW_TEST_POSTGRES_URI`.
+
+For a 5·10¹² documents/day index (500 000 splits/day, ~15 M splits at 30 days of retention) the
+conclusion is that **PostgreSQL is the backend to use**: a publish touches one row, and a search reads
+the rows of its time window through an index, independently of how many splits the index holds. The
+object-storage metastore is the right tool when the point is to avoid operating a database and the
+metadata stays in the single-digit-gigabyte range; past that it needs a split map that is queried and
+mutated per time bucket instead of loaded whole, which is a different design rather than a setting.
