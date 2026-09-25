@@ -15,15 +15,16 @@ ingest errors, the searches ended 1 180 documents *larger* than that, and the lo
   modified concurrently` on the first attempt and `splits are not staged` on the retries: the
   compare-and-swap on `v3/root.json` lost its budget, the mutation's splits had already committed,
   and the publisher's retry — a *fresh* request — cannot republish them;
-- **one `MergePublisher` fault**, with no checkpoint delta at all, so it never wrote the root. The
-  three errors it reports are two halves of one state. Its *attempt 1* is the first request's own
-  error, `precondition failed for splits <the ten replaced splits>: splits are not deletable`: inside
-  that request the metastore had already published the replacing split and marked the splits it
-  replaced, and its own replay then stopped at the marking step, which refused a split that was
-  already marked. The retries after it are *fresh* requests and report `splits are not staged` for
-  the replacing split, because by then the publication is durable too. Step 1 below is what lets the
-  first request's replay finish — it is the failure that faulted the publisher; step 2 is what lets a
-  fresh retry finish, and it has to feed both steps.
+- **one `MergePublisher` fault** — the same hot object as the three above, reached through a mutation
+  that carries no checkpoint delta. Its ten markings and the publication of the replacing split
+  commit together, so the only replay point after them is `store_root`, and that is where the first
+  request failed. What the publisher then reports is that state in two halves: *attempt 1* is the
+  first request's own error, `precondition failed for splits <the ten replaced splits>: splits are
+  not deletable`, which its internal replay hit when it met the splits it had already marked, and the
+  *fresh* retries after it report `splits are not staged` for the replacing split, because the
+  publication is durable too. Step 1 below lets the first request's replay finish; step 2 is what a
+  fresh retry needs, and it has to feed both steps. (A second node met the same shape as it was being
+  shut down, so the four faults undercount the occurrences.)
 
 The three `Publisher` faults need three conditions together, and all three hold:
 
@@ -34,7 +35,12 @@ The three `Publisher` faults need three conditions together, and all three hold:
    there); five nodes commit about every two seconds and a root compare-and-swap costs two round
    trips, 1.6 s here, so a writer's window almost always contains someone else's write. The internal
    budget (16 attempts, backoff capped at 2 s) lost every time; an attempt wins a few percent of the
-   time, so a budget that is reliable is minutes long, which the ingest pipeline cannot pay.
+   time, so a budget that is reliable is minutes long, which the ingest pipeline cannot pay. And the
+   write is not even conditional on a change: `store_root` skips the compare-and-swap only when the
+   serialized bytes are identical to the ones it read, and the state it serializes contains hash maps
+   whose iteration order differs between processes, so the same state from two nodes looks different.
+   Making that serialization deterministic is a cheap win of its own; it does not remove this
+   condition, because an ordinary publish does change the checkpoint.
 
 The single-object and sharded layouts do not have this failure: their publish and their checkpoint go
 into one compare-and-swap, so a lost race means *nothing* happened and the retry is safe.
@@ -54,12 +60,12 @@ into one compare-and-swap, so a lost race means *nothing* happened and the retry
    the second one. It is what makes a half-applied mutation *finishable*; on its own it does not help
    while the root keeps losing, because the checkpoint is the payload of the commit that keeps
    failing.
-3. **Measure the read cost of moving the state** on a real bucket before writing the code. The read
-   that changes is `list_shards`: today it is served from the root, and with the state in its own
-   objects it becomes a list plus one read per shard of the source. `index_metadata` does *not*
-   change — it returns the root's metadata and carries no shard state — and the control plane's
-   per-index reload path (`list_indexes_metadata`) is root-only too, so `list_shards` is what step 3
-   has to measure.
+3. **Measure the read cost of moving the state** on a real bucket before writing the code, and decide
+   there whether a reader loads shard objects eagerly or on demand. Every read that materialises an
+   index today gets the shard state for free with the root (`index_metadata`,
+   `list_indexes_metadata`, and every mutation: they all go through `load_index`), and with the state
+   in its own objects each of them reads those objects too — `list_shards` per source, the control
+   plane's per-index reload per index. Step 3 has to count both, not just `list_shards`.
 4. **Then move the state**, if the numbers say the read cost is affordable. That is what removes
    condition 3 rather than making it rarer.
 
@@ -98,9 +104,10 @@ publishes keep writing the root. Either those move too (keyed per source instead
 the design says plainly that they are not covered — that decision belongs to step 4.
 
 **Reads.** `list_shards` lists the source's directory and fetches its objects in parallel; a
-mutation reads only the shards its request names. The price is that `list_shards` goes from one read
-of the root to a list plus one read per shard of the source — that is the number step 3 measures.
-`index_metadata` and `list_indexes_metadata` read the root alone and are unaffected.
+mutation reads only the shards its request names. Every read that materialises the index —
+`index_metadata`, `list_indexes_metadata`, the control plane's reload — also needs the shard state,
+so unless step 3 decides to load it on demand, each of them gains a list plus one read per shard.
+That, and not only `list_shards`, is the cost step 3 measures and the reason step 4 waits for it.
 
 **Compatibility.** A root written before the change carries the state, so reads take the root's copy
 as a base and let the objects override it; writes move the state into the objects and clear the
@@ -116,10 +123,10 @@ individually.
 ## Acceptance
 
 - The five-node run, same harness, same bucket, same 120 s of ingest: **zero actor faults and the
-  hit count equal to the acknowledged count** (today: 4 faults, +1 180 hits). Step 1 should remove
-  the `MergePublisher` fault (its first request's replay is what failed); step 2 makes a fresh retry
-  able to finish the three `Publisher` cases and the merge case whenever the publisher's own retry is
-  the one that has to complete the mutation.
+  hit count equal to the acknowledged count** (today: 4 faults, +1 180 hits). Step 1 removes one way
+  a merge faults — a replay that stopped at the marking step — but a merge that keeps losing the root
+  still ends with a fresh retry that cannot finish, and neither do the three `Publisher` faults.
+  Step 2 is what makes those finishable; step 4 is what stops them from happening.
 - The metastore suite on the three layouts, plus: a replay that meets an already marked replaced
   split (step 1, done), a failpoint on the shard-object commit that a replay carrying the step-2
   field has to survive, an `acquire_shards` racing a publish on the same shard, and — once step 4
