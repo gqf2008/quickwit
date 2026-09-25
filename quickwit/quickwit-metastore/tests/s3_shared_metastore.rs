@@ -636,7 +636,9 @@ async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
         read_latencies[read_latencies.len() * 95 / 100],
     );
 
-    // Four writers publishing concurrently: what the striped manifests are for.
+    // Four writers publishing concurrently: what the striped manifests are for, and the only place
+    // where contention shows up as something other than latency.
+    let conflicts_before = metastore.cas_conflicts_total();
     let start = std::time::Instant::now();
     let mut handles = Vec::new();
     for writer in 0..4 {
@@ -656,11 +658,13 @@ async fn test_manifest_layout_cost_on_s3_endpoint() -> anyhow::Result<()> {
     }
     futures::future::try_join_all(handles).await?;
     let elapsed = start.elapsed();
+    let conflicts = metastore.cas_conflicts_total() - conflicts_before;
     eprintln!(
-        "4 writers x 5 publishes on R2: {} publishes in {:?} ({:.2}/s)",
+        "4 writers x 5 publishes on R2: {} publishes in {:?} ({:.2}/s), {conflicts} conflicts          ({:.2} per publish)",
         20,
         elapsed,
         20.0 / elapsed.as_secs_f64(),
+        conflicts as f64 / 20.0,
     );
 
     metastore

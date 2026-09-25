@@ -412,6 +412,17 @@ impl FileBackedMetastore {
         self.storage.clone()
     }
 
+    /// Compare-and-swap conflicts recorded so far by this process.
+    ///
+    /// Exposed for the integration measurements that run against a real endpoint: a conflict
+    /// counter is the only way to tell contention from latency there, and the metric registry
+    /// is not part of the metastore's API.
+    #[cfg(any(test, feature = "ci-test", feature = "testsuite"))]
+    #[doc(hidden)]
+    pub fn cas_conflicts_total(&self) -> u64 {
+        metrics::CAS_CONFLICTS_TOTAL.get()
+    }
+
     /// Creates a [`FileBackedMetastore`] for a specified storage, immediately loading the manifest
     /// file.
     pub async fn try_new(
