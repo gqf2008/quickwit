@@ -58,6 +58,7 @@ searchers need to notice indexes created by other nodes.
 | Scenario | Result |
 | -------- | ------ |
 | 3 nodes publishing into one index on R2, 2 minutes | 32,880 acknowledged = 32,880 searchable, zero actor faults |
+| **5 nodes publishing into one manifest-layout index on R2, 2 minutes** | **54,240 acknowledged = 54,240 searchable, zero actor faults, zero error lines** |
 | GC/retention load, 3 nodes, ~14 minutes | zero actor faults, delete tasks progressing on every node |
 | Metastore outage, 5 minutes, ingest continuing | 600/600 acknowledged during the outage, all 640 documents searchable 1.5 s after recovery |
 | Rollback drill with a pre-CAS binary | data readable both ways; mixed versions silently lose updates (documented) |
@@ -67,9 +68,12 @@ searchers need to notice indexes created by other nodes.
 
 - Cross-region latency dominates: one round trip to the bucket used for these measurements was
   0.81 s, so run nodes close to the bucket.
-- The janitor's `DeleteTaskPlanner` tripped the actor progress watchdog once in three three-node
-  runs and did not reproduce under a GC-heavy soak; it stays a low-severity item to watch (a stalled
-  planner means garbage collection lags, not data loss).
+- The janitor's `DeleteTaskPlanner` used to trip the actor progress watchdog under load: its
+  metastore and search calls are now awaited in the actor framework's protected zone, which is what
+  those calls need (they are another actor's latency, not this one's), and the 5-node manifest-layout
+  run above has no such fault. A protected call is no longer covered by this actor's watchdog, so a
+  call that never returns relies on the downstream service to fail; if that shows up, bound it in
+  the client rather than here.
 
 ## Very large indexes: sharded splits
 
