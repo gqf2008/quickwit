@@ -169,5 +169,8 @@ individually.
   split (step 1, done), a failpoint on the shard-object commit that a replay carrying the step-2
   field has to survive, an `acquire_shards` racing a publish on the same shard, and an assertion that
   a publish whose only persisted change is a shard's state does not write `root.json`
-  (`test_a_shard_mutation_does_not_touch_the_root`). Still missing from that list: a failpoint on the
-  shard-object commit.
+  (`test_a_shard_mutation_does_not_touch_the_root`). The failpoint is
+  `test_a_lost_shard_object_write_is_replayed`: it stages a split, publishes it with a checkpoint
+  delta that moves a shard's publish position, fails that shard-object write once, and asserts that
+  the replay leaves the split published and the shard's position advanced — the case the publisher's
+  `is_replay` field exists for.

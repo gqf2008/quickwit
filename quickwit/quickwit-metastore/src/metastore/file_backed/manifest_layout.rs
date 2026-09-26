@@ -110,6 +110,8 @@ pub(crate) mod test_hooks {
 
     static FAIL_NEXT_COMMIT_FOR_STRIPE: Mutex<Option<usize>> = Mutex::new(None);
     static FAIL_NEXT_ROOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
+    static FAIL_NEXT_SHARD_OBJECT_WRITES: Mutex<Option<(String, u32)>> = Mutex::new(None);
+    static SHARD_OBJECT_WRITE_INJECTIONS: Mutex<u32> = Mutex::new(0);
 
     /// Fails the next manifest commit of `stripe`, once.
     pub(crate) fn fail_next_commit_for_stripe(stripe: usize) {
@@ -135,6 +137,34 @@ pub(crate) mod test_hooks {
             return false;
         }
         *attempts -= 1;
+        true
+    }
+
+    /// Fails the next `writes` shard-object writes of `index_id`.
+    ///
+    /// A publish commits its stripe, then the state of the shards it touched, then the root. This
+    /// is the hook for the middle of those three: whatever the caller does next has to finish
+    /// the mutation rather than leave a split that no shard state describes.
+    pub(crate) fn fail_next_shard_object_writes(index_id: &str, writes: u32) {
+        *FAIL_NEXT_SHARD_OBJECT_WRITES.lock().unwrap() = Some((index_id.to_string(), writes));
+    }
+
+    /// How many shard-object writes the hook has failed, so a test can assert the injection
+    /// happened instead of passing because the hook never fired.
+    pub(crate) fn shard_object_write_injections() -> u32 {
+        *SHARD_OBJECT_WRITE_INJECTIONS.lock().unwrap()
+    }
+
+    pub(super) fn take_shard_object_write_failure(index_id: &str) -> bool {
+        let mut guard = FAIL_NEXT_SHARD_OBJECT_WRITES.lock().unwrap();
+        let Some((armed_index_id, writes)) = guard.as_mut() else {
+            return false;
+        };
+        if armed_index_id != index_id || *writes == 0 {
+            return false;
+        }
+        *writes -= 1;
+        *SHARD_OBJECT_WRITE_INJECTIONS.lock().unwrap() += 1;
         true
     }
 
@@ -697,6 +727,15 @@ impl ManifestLayout {
             };
             let bytes = serde_utils::to_json_bytes_pretty(&object)?;
             let path = self.shard_path(source_id, shard_id);
+            #[cfg(test)]
+            if test_hooks::take_shard_object_write_failure(&self.index_id) {
+                return Err(MetastoreError::FailedPrecondition {
+                    entity: quickwit_proto::metastore::EntityKind::Index {
+                        index_id: self.index_id.clone(),
+                    },
+                    message: "injected shard state conflict".to_string(),
+                });
+            }
             // The shard state left the root, so the root's compare-and-swap no longer serializes a
             // read-modify-write of one shard: the object's own version does. A writer that read the
             // shard before someone else wrote it loses here and replays against the fresh state,

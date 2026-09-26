@@ -2883,6 +2883,134 @@ mod tests {
         );
     }
 
+    /// A publish whose shard-object write is lost is replayed and finishes, rather than leaving a
+    /// split that no shard state describes.
+    ///
+    /// A publish commits its stripe first (the split), then the state of the shards it touched,
+    /// then the root. The hook fails that middle write: the split is committed by then, so the
+    /// caller's retry has to finish the mutation — that is the case the acceptance list of
+    /// `docs/internals/metastore-v3-shard-state.md` names, and the one the publisher's `is_replay`
+    /// field exists for.
+    #[tokio::test]
+    async fn test_a_lost_shard_object_write_is_replayed() {
+        use super::manifest_layout::test_hooks;
+        use crate::checkpoint::{IndexCheckpointDelta, PartitionId, SourceCheckpointDelta};
+
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+
+        let index_id = "test-shard-replay";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        let source_id = SourceId::from(INGEST_V2_SOURCE_ID);
+        metastore
+            .add_source(AddSourceRequest {
+                index_uid: Some(index_uid.clone()),
+                source_config_json: serde_json::to_string(&SourceConfig::ingest_v2()).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        // A shard of the ingest-v2 source, opened through the API the control plane uses.
+        let opened = metastore
+            .open_shards(OpenShardsRequest {
+                subrequests: vec![OpenShardSubrequest {
+                    index_uid: Some(index_uid.clone()),
+                    source_id: source_id.clone(),
+                    shard_id: Some(ShardId::from("01J0REPLAY")),
+                    ingester_id: "test-ingester".to_string(),
+                    publish_token: Some("test-publish-token".to_string()),
+                    ..Default::default()
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(
+            opened.subresponses[0].open_shard.is_some(),
+            "the shard the test opens has to exist"
+        );
+
+        // A split to publish, and the checkpoint delta that moves the shard's publish position.
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-replay"));
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut source_delta = SourceCheckpointDelta::default();
+        source_delta
+            .record_partition_delta(
+                PartitionId::from("01J0REPLAY"),
+                Position::Beginning,
+                Position::offset(1u64),
+            )
+            .unwrap();
+        let delta_json = serde_json::to_string(&IndexCheckpointDelta {
+            source_id: source_id.clone(),
+            source_delta,
+        })
+        .unwrap();
+
+        // Fail the first write of the shard state; the replay has to finish the publish.
+        let injections_before = test_hooks::shard_object_write_injections();
+        test_hooks::fail_next_shard_object_writes(index_id, 1);
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec!["split-replay".to_string()],
+                index_checkpoint_delta_json_opt: Some(delta_json.clone()),
+                publish_token_opt: Some("test-publish-token".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            test_hooks::shard_object_write_injections(),
+            injections_before + 1,
+            "the injection has to have fired for this test to mean anything"
+        );
+
+        let mut pages = storage.list(Path::new("test-shard-replay/v3/shards"));
+        let mut paths = Vec::new();
+        while let Some(Ok(page)) = futures::StreamExt::next(&mut pages).await {
+            for metadata in page {
+                paths.push(metadata.path);
+            }
+        }
+        assert!(
+            paths.iter().any(|path| path.ends_with("01J0REPLAY.json")),
+            "the replay has to leave the shard state on its object: {paths:?}"
+        );
+        assert_eq!(
+            list_published_split_ids_with(&metastore, &index_uid)
+                .await
+                .unwrap(),
+            vec!["split-replay".to_string()],
+            "the split the first attempt committed is the one the index has"
+        );
+        let shards = metastore.list_all_shards(&index_uid, &source_id).await;
+        assert_eq!(shards.len(), 1, "the index has the one shard");
+        assert_eq!(
+            shards[0].publish_position_inclusive,
+            Some(Position::offset(1u64)),
+            "the shard state the replay committed is the one on its object"
+        );
+    }
+
     // Hook of the layout itself: the suite above runs on whichever layout the environment selects,
     // so this test pins that the selection actually reaches the storage.
     #[tokio::test]
