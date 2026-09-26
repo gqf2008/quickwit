@@ -207,7 +207,19 @@ This section may contain one configuration subsection per available metastore im
 
 ### File-backed metastore configuration
 
-File-backed metastore doesn't have any node level configuration. You can configure the poll interval [at the index level](./metastore-config.md#polling-configuration).
+The file-backed metastore has no configuration key: the metastore URI selects it, and the poll
+interval is configured [at the index level](./metastore-config.md#polling-configuration). Its
+behaviour is otherwise chosen through these environment variables, read when the node starts:
+
+| Environment variable | Purpose |
+| -------------------- | ------- |
+| `QW_METASTORE_ALLOW_UNSAFE_STORAGE` | Run on a storage whose endpoint accepts a conditional write it should have rejected, in **single-writer** mode. Its prefix must then never be shared. |
+| `QW_METASTORE_SHARDED_LAYOUT` | Create new indexes in the [sharded split layout](./metastore-config.md#very-large-indexes-sharded-splits). |
+| `QW_METASTORE_MANIFEST_LAYOUT` | Create new indexes in the [manifest layout](./metastore-config.md#very-large-indexes-sharded-splits). |
+| `QW_METASTORE_MANIFEST_STRIPES` | Stripe count for indexes created in the manifest layout (default: 32). Keep it at or above the number of nodes publishing into one index. |
+
+Each layout variable only decides what *new* indexes are created with; a node reads an index in
+whichever layout created it.
 
 ### PostgreSQL metastore configuration
 

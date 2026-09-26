@@ -13,10 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums. Verified against the
   real R2 endpoint: it enforces `If-None-Match`/`If-Match` and accepts both the `Content-MD5` and the default
   `crc32c` upload checksums. (walgit: `qw-dist-metastore-s3-r2`, `qw-r2-flavor-and-storage-polish`, `qw-real-r2-verification`)
+  Note for implementors of `Storage`: the three methods have default implementations, so an existing
+  implementation keeps compiling, but `ObjectMetadata` gains a public field and `StorageErrorKind` two
+  variants, which breaks exhaustive `match`es and struct literals outside this repository.
 - Metastore: a shared (S3-compatible) file-backed metastore now reports
   `quickwit_metastore_file_backed_cas_conflicts_total` (writes that lost a compare-and-swap race and were
   replayed) and `..._exhausted_total` (mutations dropped after the replay budget ran out), so contention and
-  dropped writes are visible from Prometheus. (walgit: `qw-metastore-cas-observability`)
+  dropped writes are visible from Prometheus. A third counter, `..._replay_tolerated_splits_total`, counts the
+  split state changes a replayed publish found already applied, so the tolerance granted by `is_replay` is
+  visible instead of silent. (walgit: `qw-metastore-cas-observability`, `qw-metastore-replay-visibility`)
 - **Metastore: a third layout for very large indexes, where the manifest holds references instead of the
   split map.** `QW_METASTORE_MANIFEST_LAYOUT=true` makes a node create indexes with one manifest per stripe
   (`v3/manifest-<stripe>.json`), an immutable WAL object per published batch and one segment per time bucket,
@@ -33,13 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **An S3-compatible file-backed metastore can be shared by several nodes.** Metadata writes reload the file
   together with its version and write it back with `If-Match`; a lost race is replayed within a bounded budget
-  (16 attempts, delays doubling from 5 ms to a 2 s cap) instead of overwriting the
+  (16 attempts, the delay doubling from 10 ms to a 2 s cap) instead of overwriting the
   winner. The metastore probes the endpoint for conditional-write support at startup and refuses to run in
   shared mode when the endpoint would silently ignore the preconditions
   (`QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on such an endpoint). `file://`,
   `gs://` and `azure://` metastores keep the single-writer behaviour, and the startup probe that decides
   between the two modes is covered by the same thread. (walgit: `qw-dist-metastore-s3-r2`,
   `qw-metastore-distributed-mode`)
+  The escape hatch covers only what the probe can prove — an endpoint that accepts a conditional write it
+  should have rejected. A storage that does not implement conditional writes, or a probe that could not run,
+  still stops the node instead of silently starting in single-writer mode.
 - Documentation: how to upgrade and roll back a cluster that shares an object-storage metastore (including the
   lost-update hazard of mixing versions), and what a metadata write costs in requests and latency.
   (walgit: `qw-metastore-rollback-drill`, `qw-metastore-perf-bench`)

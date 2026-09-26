@@ -32,4 +32,8 @@ Support for native distributed indexing was added with Quickwit 0.9.
 
 ## File-backed metastore limitations
 
-The file-backed metastore is a good fit for standalone and small deployments. However, it does not support multiple instances running at the same time. As long as you can guarantee that no more than one metastore is running at any given time, the file-backed metastore is safe to use. For heavy workloads, we recommend using a PostgreSQL metastore.
+The file-backed metastore is a good fit for standalone and small deployments, and on an `s3://` URI several nodes can share one prefix safely: a metadata write is a compare-and-swap using the S3 conditional-write API, and a write that loses the race is replayed against the fresh object. A node verifies that the endpoint really enforces the preconditions before it joins the prefix. The only failure that `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` turns into single-writer mode (whose prefix must then never be shared) is an endpoint that accepts a conditional write it should have rejected; a storage that cannot express a conditional write, or a probe that could not run, stops the node instead.
+
+A metastore on a `file://`, `gs://` or `azure://` URI is still limited to a single instance: as long as you can guarantee that no more than one metastore is running at any given time, it is safe to use. For heavy workloads, we recommend using a PostgreSQL metastore.
+
+See [metastore configuration](../configuration/metastore-config.md#distributed-deployments) for the requirements and [shared object-storage metastore](../operating/shared-metastore.md) for the operational details.

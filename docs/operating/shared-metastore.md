@@ -12,7 +12,7 @@ procedure lives in [Version upgrade](upgrades.md).
 
 Every metadata write reloads the file together with its version and writes it back with `If-Match`.
 Losing the race is normal — another node wrote first — so the operation replays within a bounded
-budget (16 attempts, delays doubling from 5 ms to a 2 s cap) instead of overwriting the winner.
+budget (16 attempts, the delay doubling from 10 ms to a 2 s cap) instead of overwriting the winner.
 Contention and dropped writes are exported as
 `quickwit_metastore_file_backed_cas_conflicts_total` and `..._exhausted_total`.
 
@@ -23,7 +23,8 @@ Contention and dropped writes are exported as
 - At startup the node writes a throwaway object twice with `If-None-Match` and refuses to start in
   shared mode if the second write is accepted, because such a prefix would silently lose updates.
   `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on those endpoints; never
-  share a prefix in that mode.
+  share a prefix in that mode. The variable only covers that proven case: a storage that does not
+  implement conditional writes at all, or a probe that could not run, still stops the node.
 - `file://`, `gs://` and `azure://` metastores remain single-writer.
 
 ## Configuration

@@ -85,7 +85,11 @@ Quickwit does not take that on faith: at startup it writes a throwaway object tw
 `If-None-Match` and checks that the second write is rejected. If the endpoint accepts it anyway
 (localstack 3.5.0 does, which would make a shared prefix lose updates silently), the node refuses to
 start. To run such an endpoint in **single-writer** mode, set `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true`;
-the node then logs a warning and behaves like a `file://` metastore. Do not share its prefix.
+the node then logs a warning and behaves like a `file://` metastore. Do not share its prefix. That
+variable covers only this case — an endpoint that accepted a conditional write it should have
+rejected. A storage that does not implement conditional writes at all, or a probe that could not
+run (credentials, connectivity), still stops the node: those are a configuration mistake and a
+failure the probe did not observe, not an unsafe endpoint.
 
 Two cases remain single-node:
 
@@ -102,7 +106,14 @@ rewrites. Set `QW_METASTORE_SHARDED_LAYOUT=true` to make this node create indexe
 spread over 256 objects instead (`<index_id>/v2/`), so a write only rewrites the slots it touched.
 It is a per-index, per-node choice recorded in the objects themselves: a node reads whichever layout
 an index was created with, and the variable only decides what new indexes use. It requires a storage
-that enforces conditional writes, and the node refuses to start with this setting otherwise. See
+that enforces conditional writes, and the node refuses to start with this setting otherwise.
+
+The layout needs a second capability that the single-object one does not use: **the objects it lists
+have to come back with a version** (the ETag, on object storage). A slot file is only re-read when
+the version in the listing differs from the one an earlier read recorded, so a storage that lists
+objects without versions fails the read rather than silently serving a stale split map. The
+S3-compatible backend reports it; a backend that does not is a single-writer backend and should not
+be used with this setting. See
 [Shared object-storage metastore](../operating/shared-metastore.md) for the layout and the measured
 write amplification.
 
@@ -128,7 +139,8 @@ A shared metastore exposes these counters on the `/metrics` endpoint:
 | Metric | Meaning |
 | ------ | ------- |
 | `quickwit_metastore_file_backed_cas_conflicts_total` | Metadata writes that lost a compare-and-swap race (`412 Precondition Failed`) and were replayed against the fresh file. A conflict is normal and harmless: it only says another node wrote first. |
-| `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (16 attempts, doubling from 10 ms up to a 2 s cap — under 20 s in total). The mutation was **not** applied. |
+| `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (16 attempts, the delay doubling from 10 ms up to a 2 s cap, plus jitter — under 20 s in total). The mutation was **not** applied. |
+| `quickwit_metastore_file_backed_replay_tolerated_splits_total` | Split state changes that a publish being replayed found already applied and accepted. A replay is either a caller's second attempt, whose first one committed before its response was lost, or the manifest layout finishing its own multi-step commit. Growth without a matching retry in the pipeline means callers keep re-sending publishes that already succeeded. |
 | `quickwit_metastore_file_backed_shard_folds_total` | Split slots of the [sharded layout](#very-large-indexes-sharded-splits) folded into a segment. Folding is what keeps a slot file bounded, so this should grow slowly but steadily on an index being written to. |
 | `quickwit_metastore_file_backed_shard_fold_failures_total` | Folds that failed and were left for the next write to retry. The write itself was already durable, so this is maintenance falling behind: a rate that keeps rising while `..._shard_folds_total` stands still means slot files are growing. |
 | `quickwit_metastore_file_backed_shard_stale_view_retries_total` | Reads that caught a fold moving the split view and restarted. Occasional retries are normal; a rate that tracks the read rate means reads keep landing on a view that is already obsolete. |

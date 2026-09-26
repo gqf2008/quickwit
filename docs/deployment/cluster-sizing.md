@@ -78,13 +78,17 @@ The Control Plane, Metastore and, Janitor are lightweight components.
 - **Control Plane**: A cluster must have only one Control Plane. It needs a
   single core and 2GB of RAM. It doesn't require any disk.
 
-- **Metastore**: A cluster must have exactly one Metastore when using the
-  [file-backed metastore](../configuration/metastore-config.md#file-backed-metastore).
-  When using the [PostgreSQL metastore](#postgres-metastore-backend), you can
-  run one or several Metastore pods for high availability (HA). The Metastore
-  requires a single core and 2GB of RAM. For clusters handling hundreds of
-  indexes, you may increase the size to 2 cores and 4GB of RAM. It doesn't
-  write to disk (when using PostgreSQL, the database handles persistence).
+- **Metastore**: On a `file://`, `gs://` or `azure://` URI the
+  [file-backed metastore](../configuration/metastore-config.md#file-backed-metastore)
+  supports exactly one Metastore at a time. On an `s3://` URI several Metastore
+  nodes may share the prefix: metadata writes are compare-and-swap, and a node
+  probes the endpoint before joining so that it refuses to share one that
+  ignores the preconditions. When using the
+  [PostgreSQL metastore](#postgres-metastore-backend), you can run one or
+  several Metastore pods for high availability (HA). The Metastore requires a
+  single core and 2GB of RAM. For clusters handling hundreds of indexes, you may
+  increase the size to 2 cores and 4GB of RAM. It doesn't write to disk (when
+  using PostgreSQL, the database handles persistence).
 
 - **Janitor**: A cluster must have only one Janitor. In general, it requires 1
   core and 2GB of RAM and doesn't use the disk. If you use the [delete
