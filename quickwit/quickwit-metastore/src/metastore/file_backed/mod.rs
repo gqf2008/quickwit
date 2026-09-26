@@ -79,6 +79,7 @@ use uuid::Uuid;
 use self::file_backed_index::FileBackedIndex;
 pub use self::file_backed_metastore_factory::FileBackedMetastoreFactory;
 use self::index_id_matcher::IndexIdMatcher;
+use self::index_template_matcher::IndexTemplateMatcher;
 use self::lazy_file_backed_index::LazyFileBackedIndex;
 use self::manifest::{
     MANIFEST_FILE_NAME, load_manifest_with_version, load_or_create_manifest, save_manifest,
@@ -715,6 +716,79 @@ impl FileBackedMetastore {
                 )),
             );
         }
+    }
+
+    /// Adopts what the manifest has and this node does not: the indexes, and the index templates
+    /// that go with them.
+    ///
+    /// A node reloads the whole manifest when it writes, so a node that never writes would never
+    /// list an index another node created (nor use a template it added): the janitor and the
+    /// listing callers of a long-running node would not see it, and the requests it never plans for
+    /// would fail. Listing what the metastore holds is exactly the moment to notice one, and the
+    /// manifest is small.
+    ///
+    /// The manifest is the index set and the template set, so both are taken from it whole: an
+    /// index or a template another node deleted stops being listed here, and one another node
+    /// changed takes its new state. An index that is active keeps the object it already has.
+    ///
+    /// Single-node mode is the no-op it is for every other reload: the cached state is the only
+    /// state there is.
+    async fn adopt_indexes_from_manifest(&self) -> MetastoreResult<()> {
+        if !self.distributed {
+            return Ok(());
+        }
+        let mut state_wlock_guard = self.state.write().await;
+        // The manifest is read under the lock: a writer reloads and rewrites it while holding it,
+        // so reading before the lock could rebuild the state from a manifest that is
+        // already gone.
+        let (manifest, _) = load_manifest_with_version(&*self.storage).await?;
+        // The manifest is the index set, so this rebuilds it rather than only adding what is
+        // missing: an index this node listed while another node was still creating it would
+        // otherwise stay `Creating` for ever (the create finishes in the manifest, and adding only
+        // missing keys never replaces what is already there), and an index another node deleted
+        // would stay in the listing. An index that is already active keeps the object it has, so
+        // the rebuild does not drop a cache or restart its poller; the layout cache and the
+        // metastore's identity are untouched.
+        let mut indexes: HashMap<IndexId, LazyIndexStatus> =
+            HashMap::with_capacity(manifest.indexes.len());
+        for (index_id, index_status) in manifest.indexes {
+            let lazy_index_status = match index_status {
+                manifest::IndexStatus::Creating => LazyIndexStatus::Creating,
+                manifest::IndexStatus::Deleting => LazyIndexStatus::Deleting,
+                manifest::IndexStatus::Active => {
+                    match state_wlock_guard.indexes.remove(&index_id) {
+                        Some(active @ LazyIndexStatus::Active(_)) => active,
+                        _ => LazyIndexStatus::Active(LazyFileBackedIndex::new(
+                            self.storage.clone(),
+                            index_id.clone(),
+                            self.polling_interval_opt,
+                            None,
+                        )),
+                    }
+                }
+            };
+            indexes.insert(index_id, lazy_index_status);
+        }
+        // Templates travel in the same manifest, so a node that never wrote would also miss a
+        // template another node added — or keep the old patterns of one it overwrote, which is what
+        // the control plane creates indexes from. They are the manifest's set, like the indexes:
+        // replacing them wholesale is what drops one another node deleted.
+        let templates = manifest.templates;
+        let templates_changed = templates != state_wlock_guard.templates;
+        let template_matcher = if templates_changed {
+            Some(IndexTemplateMatcher::try_from_index_templates(
+                templates.values(),
+            )?)
+        } else {
+            None
+        };
+        // Everything is built before anything is assigned, so a failure leaves the state as it was.
+        state_wlock_guard.indexes = indexes;
+        if templates_changed {
+            state_wlock_guard.templates = templates;
+            state_wlock_guard.template_matcher = template_matcher.expect("built above");
+        }
+        Ok(())
     }
 
     /// Reloads the manifest into `state_wlock_guard` when this metastore is shared with other
@@ -1938,6 +2012,9 @@ impl MetastoreService for FileBackedMetastore {
         // take a write lock on `per_index_metastores`.
         let index_id_matcher =
             IndexIdMatcher::try_from_index_id_patterns(&request.index_id_patterns)?;
+        // A node that has not written since another node created an index does not have it in its
+        // cached state; the listing is where that is noticed (see `adopt_indexes_from_manifest`).
+        self.adopt_indexes_from_manifest().await?;
         let inner_rlock_guard = self.state.read().await;
         let index_ids: Vec<IndexId> = inner_rlock_guard
             .indexes
@@ -2880,6 +2957,133 @@ mod tests {
             shards.len(),
             2,
             "the shard opened through the API and the inserted one are both in the index"
+        );
+    }
+
+    /// An index a node adopted while it was still being created becomes visible when the create
+    /// finishes.
+    ///
+    /// A create takes more than one round trip (the manifest says `Creating`, the index file is
+    /// written, the manifest says `Active`), and a listing that lands in the middle adopts the
+    /// index as `Creating`. Adopting only what is missing would leave it there for ever, because
+    /// nothing else on a node that never writes replaces what its state already holds.
+    #[tokio::test]
+    async fn test_an_index_adopted_while_it_was_creating_becomes_visible() {
+        use super::manifest::{IndexStatus, load_manifest_with_version, save_manifest};
+
+        let storage = Arc::new(RamStorage::default());
+        let mut node_a = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_a.set_distributed(true);
+        node_a.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        let mut node_b = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_b.set_distributed(true);
+        node_b.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+
+        let index_id = "test-created-window";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        node_a
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap();
+        let listed_by_b = |metastore: FileBackedMetastore| async move {
+            metastore
+                .list_indexes_metadata(ListIndexesMetadataRequest::all())
+                .await
+                .unwrap()
+                .deserialize_indexes_metadata()
+                .await
+                .unwrap()
+        };
+
+        // A listing that lands in the middle of the create sees it as `Creating`.
+        let (mut manifest, _) = load_manifest_with_version(&*storage).await.unwrap();
+        manifest
+            .indexes
+            .insert(index_id.to_string(), IndexStatus::Creating);
+        save_manifest(&*storage, &manifest).await.unwrap();
+        assert!(
+            listed_by_b(node_b.clone()).await.is_empty(),
+            "an index that is still being created is not listed"
+        );
+
+        // The create finishes, and the node that never wrote has to see it.
+        let (mut manifest, _) = load_manifest_with_version(&*storage).await.unwrap();
+        manifest
+            .indexes
+            .insert(index_id.to_string(), IndexStatus::Active);
+        save_manifest(&*storage, &manifest).await.unwrap();
+        let listed = listed_by_b(node_b).await;
+        assert!(
+            listed
+                .iter()
+                .any(|metadata| metadata.index_id() == index_id),
+            "the index stayed invisible after the create finished: {listed:?}"
+        );
+    }
+
+    /// A node that has not written since another node created an index still lists it.
+    ///
+    /// The index set lives in the metastore's `manifest.json`, and a long-running node only
+    /// reloaded it when it wrote: a node that never wrote would not list an index another node
+    /// created, so its control plane never planned it and its requests for it failed. Two nodes on
+    /// one storage are the shape to test, and the second one here never writes.
+    #[tokio::test]
+    async fn test_a_node_that_never_wrote_still_lists_an_index_another_node_created() {
+        let storage = Arc::new(RamStorage::default());
+        let mut node_a = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_a.set_distributed(true);
+        node_a.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        let mut node_b = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_b.set_distributed(true);
+        node_b.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+
+        let listed_by_b = |metastore: FileBackedMetastore| async move {
+            metastore
+                .list_indexes_metadata(ListIndexesMetadataRequest::all())
+                .await
+                .unwrap()
+                .deserialize_indexes_metadata()
+                .await
+                .unwrap()
+        };
+        assert!(
+            listed_by_b(node_b.clone()).await.is_empty(),
+            "the node starts with an empty metastore"
+        );
+
+        let index_id = "test-late-adoption";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        node_a
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap();
+
+        let listed = listed_by_b(node_b).await;
+        assert!(
+            listed
+                .iter()
+                .any(|metadata| metadata.index_id() == index_id),
+            "a node that never wrote has to adopt the index: {listed:?}"
         );
     }
 
