@@ -195,6 +195,10 @@ top of the requests a single-writer node already makes.
 ### Polling configuration
 
 By default, the File-Backed Metastore is only read once when you start a Quickwit process (searcher, indexer, ...).
+That is about the metadata of the indexes a node already knows. On a shared prefix the index set itself
+comes from `manifest.json`: a write reloads it, and the listings that walk the index set adopt what it
+has, so a long-running node still notices an index another node created (see
+[Operating it](../operating/shared-metastore.md#operating-it)).
 
 You can also configure it to poll the File-Backed Metastore periodically to keep a fresh view of it. This is useful for a Searcher instance that needs to be aware of new splits published by an Indexer running in parallel.
 

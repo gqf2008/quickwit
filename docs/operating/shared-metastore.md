@@ -36,8 +36,10 @@ storage:
     flavor: r2                                    # Cloudflare R2: region auto, path style, Content-MD5
 ```
 
-A `#polling_interval=30s` fragment on the URI makes a node re-read the metastore periodically, which
-searchers need to notice indexes created by other nodes.
+A `#polling_interval=30s` fragment on the URI makes a node re-read the metadata of the indexes it
+already knows periodically, so a searcher's cached split list does not stay stale. Seeing an index
+another node created is a different mechanism: a write reloads the manifest, and the listings that
+walk the index set adopt what it has (see *Seeing what another node created* below).
 
 ## Operating it
 
@@ -52,6 +54,16 @@ searchers need to notice indexes created by other nodes.
   node's cached metadata. Recovery is automatic.
 - **Upgrade/rollback**: never run a pre-CAS binary and a CAS binary on the same prefix at the same
   time — the older node overwrites what the newer one committed. See [Version upgrade](upgrades.md).
+- **Seeing what another node created**: a node's view of the index set and the template set comes
+  from `manifest.json`. It reloads that manifest when it writes, and the listings that walk the
+  index set — the index listing, the split listing that names no index, the stats listing — plus the
+  three template readers adopt what it has. So a long-running node that never writes still picks up
+  an index or a template another node created, on its next such call; listings that name a fixed set
+  of indexes (a search naming `index_uids`, the delete-task and shard listings) do not. Each of those
+  calls pays one extra read of `manifest.json` — a small object that grows with the number of indexes
+  and templates, since the templates travel in it — and it takes the same lock the writers take, so
+  the read serializes against a concurrent write. An index or template another node deleted stops
+  being listed the same way.
 
 ## Measured on real endpoints (2026-09)
 
