@@ -1641,6 +1641,45 @@ mod tests {
         );
     }
 
+    /// A shard object this node cannot read is that shard's problem, not the index's.
+    ///
+    /// The same reasoning as the test above: an error here makes `load_root` fail, and the search
+    /// and ingest paths read that as "the index does not exist".
+    #[tokio::test]
+    async fn test_an_unreadable_shard_object_does_not_hide_the_index() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        let (index, source_id, shard_id) = index_with_one_shard();
+        layout.create_index(&storage, &index).await.unwrap();
+        // A readable shard of its own, so the assertion is about what survives.
+        let other_shard = Shard {
+            shard_id: Some(ShardId::from("01J0OTHER")),
+            publish_position_inclusive: Some(quickwit_proto::types::Position::Beginning),
+            doc_mapping_uid: Some(quickwit_proto::types::DocMappingUid::default()),
+            ..Default::default()
+        };
+        let other_path = layout.shard_path(&source_id, &ShardId::from("01J0OTHER"));
+        let object = serde_utils::to_json_bytes_pretty(&ShardObject {
+            format_version: SHARD_OBJECT_FORMAT_VERSION,
+            shard: other_shard,
+        })
+        .unwrap();
+        storage.put(&other_path, Box::new(object)).await.unwrap();
+        // And one the reader cannot parse at all.
+        storage
+            .put(
+                &layout.shard_path(&source_id, &shard_id),
+                Box::new(b"not json".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let (root_info, _, _) = layout.load_root(&storage).await.unwrap();
+        let states = root_info.index.shard_states();
+        assert_eq!(states.len(), 1, "the readable shard is still there");
+        assert_eq!(states[0].1, ShardId::from("01J0OTHER"));
+    }
+
     ///
     /// The shard state is not in the root any more, so the root's compare-and-swap no longer
     /// serializes a read-modify-write of one shard. Without the object's own version the second
