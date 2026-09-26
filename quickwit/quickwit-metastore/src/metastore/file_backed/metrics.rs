@@ -38,6 +38,24 @@ pub(super) static CAS_CONFLICTS_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
     subsystem: "metastore",
 );
 
+/// Number of split state changes a publish being replayed accepted as already applied.
+///
+/// A mutation is replayed for one of two reasons: a caller's second attempt, whose first one may
+/// have committed while its response was lost, or the manifest layout finishing its own commit one
+/// stripe at a time. Both reach the mutation with the tolerance asked for; a *fresh* request that
+/// publishes an already-published split is still refused. Without the counter the tolerance would
+/// be invisible, and a client that keeps re-sending publishes it already got an acknowledgement for
+/// would look like normal traffic.
+pub(super) static REPLAY_TOLERATED_SPLITS_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_replay_tolerated_splits_total",
+    description: "Number of split state changes that a replayed publish found already applied and \
+                  accepted. The replay is either a caller's second attempt, whose first one \
+                  committed before its response was lost, or the manifest layout finishing its own \
+                  multi-step commit. Growth with no matching retry in the pipeline means callers are \
+                  re-sending publishes that already succeeded.",
+    subsystem: "metastore",
+);
+
 /// Number of split slots folded into a segment.
 ///
 /// Folding is what keeps a slot file bounded: it only ever holds the entries written since the last

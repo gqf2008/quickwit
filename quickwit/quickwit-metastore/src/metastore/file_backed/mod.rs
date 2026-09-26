@@ -93,8 +93,14 @@ use self::store_operations::{
     put_index_if_version_matches,
 };
 
-/// Environment variable that lets an operator run a metastore on a storage that ignores conditional
-/// writes. The metastore then falls back to single-writer mode instead of refusing to start.
+/// Environment variable that lets an operator run a metastore on an endpoint that *ignores*
+/// conditional writes. The metastore then falls back to single-writer mode instead of refusing to
+/// start.
+///
+/// Hidden contract: this only covers what the startup probe can prove -- an endpoint that accepts a
+/// conditional write it should have rejected. A storage that does not implement conditional writes,
+/// or a probe that failed to run, still stops the node: those are a configuration mistake and a
+/// connectivity problem, not an unsafe endpoint, and a warning would hide them.
 pub const ALLOW_UNSAFE_STORAGE_ENV_KEY: &str = "QW_METASTORE_ALLOW_UNSAFE_STORAGE";
 
 /// Environment variable that makes this node create indexes in the sharded split layout.
@@ -226,6 +232,59 @@ fn unsafe_storage_error(storage: &dyn Storage, reason: &str) -> MetastoreError {
              {ALLOW_UNSAFE_STORAGE_ENV_KEY}=true to run this node in single-writer mode.",
             storage.uri()
         ),
+    }
+}
+
+/// Builds the error raised when the storage cannot express a conditional write at all.
+///
+/// Hidden contract: [`ALLOW_UNSAFE_STORAGE_ENV_KEY`] deliberately does **not** cover this case. The
+/// variable is for an endpoint that accepts a conditional write it should have rejected -- an
+/// unsafe *endpoint*, which the operator has proven they know about. A storage that does not
+/// implement conditional writes is a configuration mistake, and answering it with a warning plus
+/// single-writer mode would turn "this node cannot be shared" into a line in a startup log.
+fn storage_without_conditional_writes_error(storage: &dyn Storage) -> MetastoreError {
+    MetastoreError::Internal {
+        message: "the metastore storage does not implement conditional writes".to_string(),
+        cause: format!(
+            "`{}` cannot back a metastore shared by several nodes because it does not implement \
+             conditional writes, so there is no precondition to enforce. Point the metastore at a \
+             storage that implements them (AWS S3, Cloudflare R2, MinIO), or keep a single writer \
+             and use a `file://` metastore. {ALLOW_UNSAFE_STORAGE_ENV_KEY}=true does not apply here: \
+             it covers an endpoint that accepts a conditional write it should reject, not a storage \
+             that cannot express one.",
+            storage.uri()
+        ),
+    }
+}
+
+/// What the startup probe learned about the storage backing a file-backed metastore.
+///
+/// The four outcomes are kept apart because [`ALLOW_UNSAFE_STORAGE_ENV_KEY`] only covers one of
+/// them. Downgrading any other failure to single-writer mode would hide a configuration mistake or
+/// a connectivity problem behind a warning, so the node refuses to start instead.
+enum ConditionalWriteSupport {
+    /// The storage rejected a conditional write whose precondition did not hold.
+    Enforced,
+    /// The storage accepted a conditional write it should have rejected, and would therefore lose
+    /// updates if several nodes shared the prefix.
+    EndpointIgnoresPreconditions(String),
+    /// The storage does not implement conditional writes.
+    NotImplemented,
+    /// The probe could not run to completion.
+    ProbeFailed(MetastoreError),
+}
+
+impl ConditionalWriteSupport {
+    /// The error to return when this outcome means the node may not share the prefix.
+    fn into_metastore_error(self, storage: &dyn Storage) -> MetastoreError {
+        match self {
+            Self::Enforced => {
+                unreachable!("a storage that enforces preconditions has no error to report")
+            }
+            Self::EndpointIgnoresPreconditions(reason) => unsafe_storage_error(storage, &reason),
+            Self::NotImplemented => storage_without_conditional_writes_error(storage),
+            Self::ProbeFailed(error) => error,
+        }
     }
 }
 use super::{
@@ -382,7 +441,7 @@ impl FileBackedMetastore {
     /// metadata.
     async fn check_storage_enforces_conditional_writes(
         storage: &dyn Storage,
-    ) -> MetastoreResult<()> {
+    ) -> ConditionalWriteSupport {
         let probe_path: std::path::PathBuf =
             format!(".quickwit-conditional-write-probe-{}", Ulid::new()).into();
         let check_result = match storage
@@ -394,18 +453,26 @@ impl FileBackedMetastore {
                     .put_if_absent(&probe_path, Box::new(b"probe again".to_vec()))
                     .await
                 {
-                    Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => Ok(()),
-                    Err(error) => Err(unsafe_storage_error(storage, &error.to_string())),
-                    Ok(_) => Err(unsafe_storage_error(
-                        storage,
-                        "it accepted a second write carrying `If-None-Match: *`",
-                    )),
+                    Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => {
+                        ConditionalWriteSupport::Enforced
+                    }
+                    Err(error) => ConditionalWriteSupport::ProbeFailed(MetastoreError::Internal {
+                        message: format!(
+                            "failed to probe the metastore storage located at `{}`",
+                            storage.uri()
+                        ),
+                        cause: error.to_string(),
+                    }),
+                    Ok(_) => ConditionalWriteSupport::EndpointIgnoresPreconditions(
+                        "the endpoint accepted a second write carrying `If-None-Match: *`"
+                            .to_string(),
+                    ),
                 }
             }
-            Err(error) if error.kind() == StorageErrorKind::Unsupported => Err(
-                unsafe_storage_error(storage, "it does not implement conditional writes"),
-            ),
-            Err(error) => Err(MetastoreError::Internal {
+            Err(error) if error.kind() == StorageErrorKind::Unsupported => {
+                ConditionalWriteSupport::NotImplemented
+            }
+            Err(error) => ConditionalWriteSupport::ProbeFailed(MetastoreError::Internal {
                 message: format!(
                     "failed to probe the metastore storage located at `{}`",
                     storage.uri()
@@ -477,17 +544,19 @@ impl FileBackedMetastore {
         let mut distributed = storage.uri().protocol() == Protocol::S3;
         if distributed {
             match Self::check_storage_enforces_conditional_writes(&*storage).await {
-                Ok(()) => {}
-                Err(error) if allow_unsafe_storage => {
+                ConditionalWriteSupport::Enforced => {}
+                ConditionalWriteSupport::EndpointIgnoresPreconditions(reason)
+                    if allow_unsafe_storage =>
+                {
                     warn!(
                         metastore_uri = %storage.uri(),
                         "the metastore storage does not enforce conditional writes; \
                          {ALLOW_UNSAFE_STORAGE_ENV_KEY}=true, so this node runs in single-writer \
-                         mode and must not share its metastore prefix: {error}"
+                         mode and must not share its metastore prefix: {reason}"
                     );
                     distributed = false;
                 }
-                Err(error) => return Err(error),
+                unsupported => return Err(unsupported.into_metastore_error(&*storage)),
             }
         }
         if distributed {
@@ -3840,6 +3909,71 @@ mod tests {
             .expect("a replayed publish must finish the mutation it replays");
     }
 
+    /// The tolerance a caller buys with `is_replay` has to be visible, and it has to stay bounded
+    /// to what the flag says: the counter moves when a replay stops at a step its earlier
+    /// attempt applied, and the same publish without the flag is still refused.
+    #[tokio::test]
+    async fn test_a_replay_that_stops_on_applied_steps_is_counted() {
+        use crate::metastore::file_backed::metrics::REPLAY_TOLERATED_SPLITS_TOTAL;
+
+        // Process-global counter and parallel tests: the assertion is a lower bound.
+        let tolerated_before = REPLAY_TOLERATED_SPLITS_TOTAL.get();
+
+        let index_id = "test-tolerated-replay-counted";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-0"));
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let publish_request = PublishSplitsRequest {
+            index_uid: Some(index_uid.clone()),
+            staged_split_ids: vec![split_metadata.split_id.to_string()],
+            ..Default::default()
+        };
+        metastore
+            .publish_splits(publish_request.clone())
+            .await
+            .unwrap();
+
+        let error = metastore
+            .publish_splits(publish_request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "a publish of a published split without the flag must still fail: {error:?}"
+        );
+        // The counter is process-global and other tests publish with the tolerance, so this test
+        // cannot assert that the refused publish left it untouched: under `cargo test` the two
+        // happen in the same process. The refusal is checked above, and that a refused publish
+        // cannot be counted is structural -- the increment sits inside the branch that only the
+        // tolerance opens.
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                is_replay: true,
+                ..publish_request
+            })
+            .await
+            .expect("a replayed publish must finish the mutation it replays");
+        assert!(
+            REPLAY_TOLERATED_SPLITS_TOTAL.get() > tolerated_before,
+            "the split a replay found already published must be counted"
+        );
+    }
+
     #[tokio::test]
     async fn test_file_backed_metastore_connectivity_fails_if_states_file_does_not_exist() {
         let mut mock_storage = MockStorage::default();
@@ -5011,6 +5145,79 @@ mod tests {
         assert!(
             !metastore.is_distributed(),
             "with `allow_unsafe_storage` the metastore must fall back to single-writer mode"
+        );
+        Ok(())
+    }
+
+    /// A storage that cannot express a conditional write is a configuration mistake, not an unsafe
+    /// endpoint. The escape hatch was written for the latter, so it must not cover this: turning it
+    /// into a warning would start a node in single-writer mode on a prefix several nodes use.
+    #[tokio::test]
+    async fn test_distributed_metastore_refuses_storage_without_conditional_writes()
+    -> anyhow::Result<()> {
+        fn mock_storage_without_conditional_writes() -> MockStorage {
+            let mut mock_storage = MockStorage::default();
+            mock_storage
+                .expect_uri()
+                .return_const(Uri::for_test("s3://test-bucket/indexes"));
+            mock_storage.expect_exists().returning(|_| Ok(false));
+            mock_storage.expect_put().returning(|_, _| Ok(()));
+            mock_storage.expect_put_if_absent().returning(|_, _| {
+                Err(StorageErrorKind::Unsupported
+                    .with_error(anyhow::anyhow!("this storage has no conditional writes")))
+            });
+            mock_storage.expect_delete().returning(|_| Ok(()));
+            mock_storage
+        }
+
+        let error = FileBackedMetastore::try_new_with_options(
+            Arc::new(mock_storage_without_conditional_writes()),
+            None,
+            true,
+        )
+        .await
+        .expect_err("a storage without conditional writes must not start, even when allowed");
+        let message = error.to_string();
+        assert!(
+            message.contains("does not implement conditional writes"),
+            "the refusal must name the missing capability, got: {message}"
+        );
+        assert!(
+            message.contains("does not apply here"),
+            "the refusal must say the escape hatch does not cover this case, got: {message}"
+        );
+        Ok(())
+    }
+
+    /// A probe that could not run says nothing about preconditions. Downgrading it to single-writer
+    /// mode would let a connectivity or credential problem decide the write path.
+    #[tokio::test]
+    async fn test_distributed_metastore_refuses_to_start_when_the_probe_fails() -> anyhow::Result<()>
+    {
+        fn mock_storage_whose_probe_fails() -> MockStorage {
+            let mut mock_storage = MockStorage::default();
+            mock_storage
+                .expect_uri()
+                .return_const(Uri::for_test("s3://test-bucket/indexes"));
+            mock_storage.expect_exists().returning(|_| Ok(false));
+            mock_storage.expect_put().returning(|_, _| Ok(()));
+            mock_storage.expect_put_if_absent().returning(|_, _| {
+                Err(StorageErrorKind::Internal.with_error(anyhow::anyhow!("connection refused")))
+            });
+            mock_storage.expect_delete().returning(|_| Ok(()));
+            mock_storage
+        }
+
+        let error = FileBackedMetastore::try_new_with_options(
+            Arc::new(mock_storage_whose_probe_fails()),
+            None,
+            true,
+        )
+        .await
+        .expect_err("a probe that could not run must not be downgraded to single-writer mode");
+        assert!(
+            error.to_string().contains("failed to probe"),
+            "the refusal must say the probe failed rather than name a capability gap, got: {error}"
         );
         Ok(())
     }

@@ -515,7 +515,13 @@ impl FileBackedIndex {
                 continue;
             };
             if already_marked {
-                // If the split is already marked for deletion, This is fine, we just skip it.
+                // If the split is already marked for deletion, This is fine, we just skip it. The
+                // public request path reaches this branch too (it lists `MarkedForDeletion` among
+                // the states it accepts), so the counter only moves when the tolerance is what
+                // allowed the call through: that is a replay stopping at a step it already applied.
+                if tolerate_already_marked {
+                    super::metrics::REPLAY_TOLERATED_SPLITS_TOTAL.inc();
+                }
                 continue;
             }
             metadata.split_state = SplitState::MarkedForDeletion;
@@ -584,6 +590,7 @@ impl FileBackedIndex {
             } else if tolerate_already_published && metadata.split_state == SplitState::Published {
                 // Already published by the attempt that got partway through: publishing it again is
                 // what the replay does, and the op it publishes is the same value.
+                super::metrics::REPLAY_TOLERATED_SPLITS_TOTAL.inc();
                 self.touched_split_ids
                     .insert(SplitId::from(staged_split_id_ref));
             } else {
