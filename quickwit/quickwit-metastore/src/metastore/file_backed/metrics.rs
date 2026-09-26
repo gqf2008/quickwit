@@ -90,3 +90,19 @@ pub(super) static MANIFEST_FOLD_FAILURES_TOTAL: LazyCounter = lazy_counter!(
                   next write to retry.",
     subsystem: "metastore",
 );
+
+/// Number of shard objects a reader had to skip.
+///
+/// A shard object is skipped when it disappeared between the listing and the read (the normal fate
+/// of a retired shard), when the node cannot parse it, when its format is unknown to this revision,
+/// when it is not named like a shard at all, or when it names another shard than its path does.
+/// Skipping keeps one shard's problem from hiding the whole index, so this counter is how an
+/// operator sees that it is happening: a rate that tracks the read rate means the prefix holds
+/// objects this revision cannot use.
+pub(super) static SHARD_OBJECTS_SKIPPED_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_shard_objects_skipped_total",
+    description: "Number of manifest-layout shard objects a reader skipped because the object had \
+                  disappeared, could not be parsed, had an unknown format, was not named like a \
+                  shard, or named another shard than its path. The index still loads without them.",
+    subsystem: "metastore",
+);

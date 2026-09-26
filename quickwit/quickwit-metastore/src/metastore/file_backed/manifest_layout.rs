@@ -636,6 +636,7 @@ impl ManifestLayout {
         path: PathBuf,
     ) -> MetastoreResult<Option<((SourceId, ShardId), LoadedShard)>> {
         let Some((source_id, shard_id)) = shard_object_ids(prefix, &path) else {
+            super::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.inc();
             warn!(
                 index_id = self.index_id,
                 path = %path.display(),
@@ -647,6 +648,7 @@ impl ManifestLayout {
             Ok(result) => result,
             Err(error) if error.kind() == StorageErrorKind::NotFound => {
                 // A shard deleted between the listing and this read.
+                super::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.inc();
                 return Ok(None);
             }
             Err(error) => return Err(map_storage_error(&self.index_id, error)),
@@ -654,6 +656,7 @@ impl ManifestLayout {
         let object: ShardObject = match serde_utils::from_json_bytes(&bytes) {
             Ok(object) => object,
             Err(error) => {
+                super::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.inc();
                 warn!(
                     index_id = self.index_id,
                     path = %path.display(),
@@ -664,6 +667,7 @@ impl ManifestLayout {
             }
         };
         if object.format_version != SHARD_OBJECT_FORMAT_VERSION {
+            super::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.inc();
             warn!(
                 index_id = self.index_id,
                 path = %path.display(),
@@ -674,6 +678,7 @@ impl ManifestLayout {
             return Ok(None);
         }
         if object.shard.shard_id() != shard_id {
+            super::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.inc();
             warn!(
                 index_id = self.index_id,
                 path = %path.display(),
@@ -1655,6 +1660,8 @@ mod tests {
         assert!(storage.exists(&shard_path).await.unwrap());
         // The shard is retired right after the root commit, so a reader can list its object and
         // then not find it.
+        let skipped_before =
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get();
         storage.delete(&shard_path).await.unwrap();
         assert!(
             layout
@@ -1663,6 +1670,15 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a shard object the storage no longer has is missing, not an error"
+        );
+        // The counter is process-global, so an assertion on it is a lower bound: a test that runs
+        // in the same process may have skipped objects of its own (see the same convention
+        // in `file_backed/mod.rs` and `sharded_layout.rs`).
+        assert!(
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get()
+                - skipped_before
+                >= 1,
+            "a shard whose object disappeared is counted"
         );
         // A stray object under the shard prefix is one shard's problem, not the index's.
         storage
@@ -1678,6 +1694,82 @@ mod tests {
             0,
             "the index still loads; the shard whose object is gone is simply absent"
         );
+        assert!(
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get()
+                - skipped_before
+                >= 2,
+            "an object that is not named like a shard is counted too"
+        );
+    }
+
+    /// The other two ways a shard object is unusable: a format this node does not know, and an
+    /// object whose content names another shard than its path does.
+    #[tokio::test]
+    async fn test_a_shard_object_of_an_unknown_format_or_name_is_skipped() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        let (index, source_id, shard_id) = index_with_one_shard();
+        layout.create_index(&storage, &index).await.unwrap();
+        let shard = index.shard_states()[0].2.clone();
+        let skipped_before =
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get();
+
+        // The object the index was created with is replaced by one of a format this node does not
+        // know.
+        let unknown_format = serde_utils::to_json_bytes_pretty(&ShardObject {
+            format_version: SHARD_OBJECT_FORMAT_VERSION + 1,
+            shard: shard.clone(),
+        })
+        .unwrap();
+        storage
+            .put(
+                &layout.shard_path(&source_id, &shard_id),
+                Box::new(unknown_format),
+            )
+            .await
+            .unwrap();
+        // And an object that names another shard than the one its path does.
+        let mut mismatched = shard.clone();
+        mismatched.shard_id = Some(ShardId::from("01J0MISMATCH"));
+        let mismatched = serde_utils::to_json_bytes_pretty(&ShardObject {
+            format_version: SHARD_OBJECT_FORMAT_VERSION,
+            shard: mismatched,
+        })
+        .unwrap();
+        storage
+            .put(
+                &layout.shard_path(&source_id, &ShardId::from("01J0PATH")),
+                Box::new(mismatched),
+            )
+            .await
+            .unwrap();
+        // A shard this node can read, so the assertions are about what survives.
+        let survivor_id = ShardId::from("01J0SURVIVOR");
+        let mut survivor = shard;
+        survivor.shard_id = Some(survivor_id.clone());
+        let survivor = serde_utils::to_json_bytes_pretty(&ShardObject {
+            format_version: SHARD_OBJECT_FORMAT_VERSION,
+            shard: survivor,
+        })
+        .unwrap();
+        storage
+            .put(
+                &layout.shard_path(&source_id, &survivor_id),
+                Box::new(survivor),
+            )
+            .await
+            .unwrap();
+
+        let (root_info, _, _) = layout.load_root(&storage).await.unwrap();
+        let states = root_info.index.shard_states();
+        assert_eq!(states.len(), 1, "only the readable shard is loaded");
+        assert_eq!(states[0].1, survivor_id);
+        assert!(
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get()
+                - skipped_before
+                >= 2,
+            "both unusable objects are counted"
+        );
     }
 
     /// A shard object this node cannot read is that shard's problem, not the index's.
@@ -1690,6 +1782,8 @@ mod tests {
         let storage = RamStorage::default();
         let (index, source_id, shard_id) = index_with_one_shard();
         layout.create_index(&storage, &index).await.unwrap();
+        let skipped_before =
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get();
         // A readable shard of its own, so the assertion is about what survives.
         let other_shard = Shard {
             shard_id: Some(ShardId::from("01J0OTHER")),
@@ -1717,6 +1811,12 @@ mod tests {
         let states = root_info.index.shard_states();
         assert_eq!(states.len(), 1, "the readable shard is still there");
         assert_eq!(states[0].1, ShardId::from("01J0OTHER"));
+        assert!(
+            crate::metastore::file_backed::metrics::SHARD_OBJECTS_SKIPPED_TOTAL.get()
+                - skipped_before
+                >= 1,
+            "skipping a shard object has to be visible outside the logs"
+        );
     }
 
     ///
