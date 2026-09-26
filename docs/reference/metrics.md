@@ -70,12 +70,19 @@ PostgreSQL-backed metastores also expose connection pool gauges:
 | `quickwit_metastore` | `max_connections` | Maximum number of PostgreSQL pool connections configured per metastore node | `gauge` |
 
 The file-backed metastore shared by several nodes (S3-compatible URI) exposes the contention of its
-compare-and-swap write path:
+compare-and-swap write path and the maintenance its layouts need (folding a sharded slot or a manifest
+stripe into a segment), and how often a reader had to skip a shard object it could not use:
 
 | Namespace | Metric Name | Description | Type |
 | --------- | ----------- | ----------- | ---- |
 | `quickwit_metastore` | `file_backed_cas_conflicts_total` | Number of metadata writes that lost a compare-and-swap race and were replayed | `counter` |
 | `quickwit_metastore` | `file_backed_cas_conflicts_exhausted_total` | Number of mutations that failed after exhausting their replay budget | `counter` |
+| `quickwit_metastore` | `file_backed_shard_folds_total` | Number of split slots of the sharded layout folded into a segment | `counter` |
+| `quickwit_metastore` | `file_backed_shard_fold_failures_total` | Number of folds of a sharded split slot that failed and were left for the next write | `counter` |
+| `quickwit_metastore` | `file_backed_shard_stale_view_retries_total` | Number of reads of a sharded index that caught the split view moving and restarted | `counter` |
+| `quickwit_metastore` | `file_backed_manifest_folds_total` | Number of manifest-layout stripes folded into a segment | `counter` |
+| `quickwit_metastore` | `file_backed_manifest_fold_failures_total` | Number of folds of a manifest-layout stripe that failed and were left for the next write | `counter` |
+| `quickwit_metastore` | `file_backed_shard_objects_skipped_total` | Number of manifest-layout shard objects a reader skipped (deleted, unreadable, unknown format, misnamed, or naming another shard); the index still loads without them | `counter` |
 
 ## Rest API Metrics
 

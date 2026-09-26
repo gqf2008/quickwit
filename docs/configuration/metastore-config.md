@@ -132,6 +132,9 @@ A shared metastore exposes these counters on the `/metrics` endpoint:
 | `quickwit_metastore_file_backed_shard_folds_total` | Split slots of the [sharded layout](#very-large-indexes-sharded-splits) folded into a segment. Folding is what keeps a slot file bounded, so this should grow slowly but steadily on an index being written to. |
 | `quickwit_metastore_file_backed_shard_fold_failures_total` | Folds that failed and were left for the next write to retry. The write itself was already durable, so this is maintenance falling behind: a rate that keeps rising while `..._shard_folds_total` stands still means slot files are growing. |
 | `quickwit_metastore_file_backed_shard_stale_view_retries_total` | Reads that caught a fold moving the split view and restarted. Occasional retries are normal; a rate that tracks the read rate means reads keep landing on a view that is already obsolete. |
+| `quickwit_metastore_file_backed_manifest_folds_total` | Stripes of a [manifest-layout index](../operating/shared-metastore.md#splits-as-manifests-segments-and-a-wal-tail) folded into a segment. Folding keeps a read's segment list and a stripe's WAL tail short, so this should grow steadily on an index being written to. |
+| `quickwit_metastore_file_backed_manifest_fold_failures_total` | Folds of a stripe that failed and were left for the next write. The publish that triggered the fold is already durable; sustained growth without folds means WAL tails and read costs are growing. |
+| `quickwit_metastore_file_backed_shard_objects_skipped_total` | Shard objects a reader skipped: the shard was deleted between the listing and the read (the normal fate of a retired shard), the object could not be parsed, its format is unknown to this revision, it is not named like a shard, or it names another shard than its path. The index still loads without them — a rate that tracks the read rate means the prefix holds objects this revision cannot use. |
 
 Suggested alerts:
 
