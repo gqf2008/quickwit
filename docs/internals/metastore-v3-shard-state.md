@@ -1,9 +1,11 @@
 # Splits as manifests, take two: getting the shard state out of the root
 
-> Status: design, revised after an independent design review; steps 1 and 2 of it are implemented
+> Status: implemented. Steps 1 and 2 landed on `main`
 > (`test_a_publish_that_marked_a_replaced_split_and_lost_the_other_stripe_replays`, and the
-> `is_replay` field the publisher sets from its second attempt). Steps 3 and 4 are tracked as
-> `qw-metastore-manifest-root-contention`, whose issue carries the run and the logs.
+> `is_replay` field the publisher sets from its second attempt), the read cost of step 3 was
+> measured on a real bucket, and step 4 — the shard state in one object per shard — is on
+> `feat/metastore-shard-objects`. The run, the logs and the reviews are under
+> `qw-metastore-manifest-root-contention`.
 
 ## What the run found
 
@@ -88,10 +90,22 @@ does the same for the state that changes on every commit.
 ```
 
 `<source>` is the source id (already validated as an identifier) and `<shard>` a shard id (a ULID);
-both are path-safe. Each object holds what `Shards` holds for that shard today: the `Shard` state
-(publish token, doc and split counters, timestamps) and that shard's checkpoint position. For an
-ingest-v2 source the checkpoint's partition id *is* the shard id, so a delta names the object
-directly — the three-part `queue_id` is the key inside the shard, not the file name.
+both are path-safe. The object holds the `Shard` (state, publish token, doc and split counters, and
+the publish position) and nothing else: the source's checkpoint is rebuilt from the shards' publish
+positions, which is how reading the root's inline copy worked too, so there is no second copy to
+keep in sync. For an ingest-v2 source the checkpoint's partition id *is* the shard id, so a delta
+names the object directly — the three-part `queue_id` is the key inside the shard, not the file
+name.
+
+**The version of the object replaces what the root's compare-and-swap gave.** Every write to a shard
+is a read-modify-write, and it used to be serialized by the root's version, which changed whenever
+the shard state did. With the state in its own object, that object's version is the serialization
+point: a writer that read a shard before someone else wrote it gets a `FailedPrecondition` when it
+writes, and the caller replays the mutation against the fresh state, exactly as it does for a lost
+root compare-and-swap. Without it two writers that read the same shard could both write, and the
+second one would put back a publish position the first had already moved past — the checkpoint would
+regress and the documents in between would be ingested twice. A shard that has no object yet is
+written with `put_if_absent`; losing that race is a conflict too.
 
 **What this buys, precisely.** The writers that collide today are the nodes publishing *different
 shards of the same source*: they stop colliding, because each writes its own object, the way they
@@ -108,11 +122,13 @@ a source that does not keeps its checkpoint in `metadata.checkpoint`, inside the
 publishes keep writing the root. Either those move too (keyed per source instead of per shard) or
 the design says plainly that they are not covered — that decision belongs to step 4.
 
-**Reads.** `list_shards` lists the source's directory and fetches its objects in parallel; a
-mutation reads only the shards its request names. Every read that materialises the index —
-`index_metadata`, `list_indexes_metadata`, the control plane's reload — also needs the shard state,
-so unless step 3 decides to load it on demand, each of them gains a list plus one read per shard.
-That, and not only `list_shards`, is the cost step 3 measures and the reason step 4 waits for it.
+**Reads.** Reading the root lists the shard prefix and fetches the objects *in parallel*; a mutation
+reads every shard of the index, because the index it hands to the mutation carries them. Every read
+that materialises the index — `index_metadata`, `list_indexes_metadata`, the control plane's reload
+— pays that, which is the cost step 3 measured. The readers that only need the index metadata —
+`index_stats_of`, the listing that filters a time window, and the layout probe — read the root
+without the shard objects (`load_root_metadata_only`), so the read they were just optimised for did
+not become expensive again.
 
 **Compatibility.** A root written before the change carries the state, so reads take the root's copy
 as a base and let the objects override it; writes move the state into the objects and clear the
