@@ -2270,6 +2270,9 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         request: GetIndexTemplateRequest,
     ) -> MetastoreResult<GetIndexTemplateResponse> {
+        // Templates live in the manifest with the indexes: a node that never wrote would not see
+        // one another node added (see `adopt_indexes_from_manifest`).
+        self.adopt_indexes_from_manifest().await?;
         let inner_rlock_guard = self.state.read().await;
         let index_template = inner_rlock_guard
             .templates
@@ -2291,6 +2294,9 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         request: FindIndexTemplateMatchesRequest,
     ) -> MetastoreResult<FindIndexTemplateMatchesResponse> {
+        // The control plane creates indexes from the template this returns, so a stale view does
+        // not fail loudly: it creates the index without the template another node added.
+        self.adopt_indexes_from_manifest().await?;
         let inner_rlock_guard = self.state.read().await;
 
         let mut matches = Vec::new();
@@ -2323,6 +2329,7 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         _request: ListIndexTemplatesRequest,
     ) -> MetastoreResult<ListIndexTemplatesResponse> {
+        self.adopt_indexes_from_manifest().await?;
         let inner_rlock_guard = self.state.read().await;
 
         let index_templates_json: Vec<String> = inner_rlock_guard
@@ -3033,6 +3040,105 @@ mod tests {
                 .iter()
                 .any(|metadata| metadata.index_id() == index_id),
             "the index stayed invisible after the create finished: {listed:?}"
+        );
+    }
+
+    /// A node that has not written since another node added a template still matches it.
+    ///
+    /// Templates live in the same manifest as the indexes, and the control plane creates an index
+    /// from the template this lookup returns. A stale view would not fail loudly: it would create
+    /// the index without the template another node added.
+    #[tokio::test]
+    async fn test_a_node_that_never_wrote_still_matches_a_template_another_node_added() {
+        use quickwit_proto::metastore::{
+            CreateIndexTemplateRequest, FindIndexTemplateMatchesRequest,
+        };
+
+        let storage = Arc::new(RamStorage::default());
+        let mut node_a = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_a.set_distributed(true);
+        node_a.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        // Started before the template exists, and it never lists anything.
+        let mut node_b = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_b.set_distributed(true);
+        node_b.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        // One node per reader under test, each started before the template exists and each only
+        // calling its own reader: a call to another reader would fill the cache for it.
+        let mut node_c = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_c.set_distributed(true);
+        node_c.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        let mut node_d = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_d.set_distributed(true);
+        node_d.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+
+        let template_id = "test-late-template";
+        let template =
+            quickwit_config::IndexTemplate::for_test(template_id, &["test-template-*"], 60);
+        node_a
+            .create_index_template(CreateIndexTemplateRequest {
+                index_template_json: serde_json::to_string(&template).unwrap(),
+                overwrite: false,
+            })
+            .await
+            .unwrap();
+
+        let matches = node_b
+            .find_index_template_matches(FindIndexTemplateMatchesRequest {
+                index_ids: vec!["test-template-index".to_string()],
+            })
+            .await
+            .unwrap()
+            .matches;
+        assert_eq!(
+            matches.len(),
+            1,
+            "the node has to adopt the template another node added: {matches:?}"
+        );
+        assert_eq!(matches[0].template_id, template_id);
+
+        // The two management readers adopt as well, each on a node that has never read anything.
+        let fetched = node_c
+            .get_index_template(GetIndexTemplateRequest {
+                template_id: template_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            fetched.index_template_json.contains(template_id),
+            "reading one template has to adopt it: {}",
+            fetched.index_template_json
+        );
+        let listed = node_d
+            .list_index_templates(ListIndexTemplatesRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .index_templates_json
+                .iter()
+                .any(|json| json.contains(template_id)),
+            "listing the templates has to adopt them: {:?}",
+            listed.index_templates_json
         );
     }
 
