@@ -1359,7 +1359,9 @@ impl FileBackedMetastore {
                     .collect()
             } else {
                 // We do not have an explicit list of index_uids with the query, so we search for
-                // all indexes.
+                // all indexes — which is the moment to notice one another node created (see
+                // `adopt_indexes_from_manifest`); the compaction planner reads this way.
+                self.adopt_indexes_from_manifest().await?;
                 let inner_rlock_guard = self.state.read().await;
                 inner_rlock_guard
                     .indexes
@@ -1887,6 +1889,9 @@ impl MetastoreService for FileBackedMetastore {
     ) -> MetastoreResult<ListIndexStatsResponse> {
         let index_id_matcher =
             IndexIdMatcher::try_from_index_id_patterns(&request.index_id_patterns)?;
+        // Listing stats is a listing: adopt what another node created, the way the index listing
+        // does, before reading the cached set.
+        self.adopt_indexes_from_manifest().await?;
         let index_ids: Vec<IndexId> = {
             let inner_rlock_guard = self.state.read().await;
             inner_rlock_guard
@@ -3022,7 +3027,7 @@ mod tests {
             .indexes
             .insert(index_id.to_string(), IndexStatus::Active);
         save_manifest(&*storage, &manifest).await.unwrap();
-        let listed = listed_by_b(node_b).await;
+        let listed = listed_by_b(node_b.clone()).await;
         assert!(
             listed
                 .iter()
@@ -3056,6 +3061,25 @@ mod tests {
             bucket_secs: 60,
             num_stripes: 2,
         });
+        // Two more nodes, started before the index exists like the one above: their caches stay
+        // empty until the listing under test fills them, which is what makes the assertions about
+        // `list_index_stats` and the listing that names no index load-bearing.
+        let mut node_c = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_c.set_distributed(true);
+        node_c.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        let mut node_d = FileBackedMetastore::try_new(storage.clone(), None)
+            .await
+            .unwrap();
+        node_d.set_distributed(true);
+        node_d.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
 
         let listed_by_b = |metastore: FileBackedMetastore| async move {
             metastore
@@ -3073,17 +3097,71 @@ mod tests {
 
         let index_id = "test-late-adoption";
         let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
-        node_a
+        let index_uid = node_a
             .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
             .await
-            .unwrap();
+            .unwrap()
+            .index_uid()
+            .clone();
 
-        let listed = listed_by_b(node_b).await;
+        let listed = listed_by_b(node_b.clone()).await;
         assert!(
             listed
                 .iter()
                 .any(|metadata| metadata.index_id() == index_id),
             "a node that never wrote has to adopt the index: {listed:?}"
+        );
+        // A node whose cache has never been filled adopts through the stats listing too, and the
+        // compaction planner reads splits through the listing that names no index. Both get their
+        // own fresh node: a listing on this one would have filled the cache for them.
+        let stats = node_c
+            .list_index_stats(ListIndexStatsRequest {
+                index_id_patterns: vec![index_id.to_string()],
+            })
+            .await
+            .unwrap();
+        assert!(
+            stats.index_stats.iter().any(|stats| stats
+                .index_uid
+                .as_ref()
+                .map(|uid| uid.index_id.as_str())
+                == Some(index_id)),
+            "listing stats has to adopt the index too: {:?}",
+            stats.index_stats
+        );
+        // A split to find, published before `node_d` reads anything.
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-adoption"));
+        node_a
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        node_a
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid),
+                staged_split_ids: vec!["split-adoption".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let split_ids = node_d
+            .list_splits(
+                ListSplitsRequest::try_from_list_splits_query(&ListSplitsQuery::for_all_indexes())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collect_split_ids()
+            .await
+            .unwrap();
+        assert!(
+            split_ids
+                .iter()
+                .any(|split_id| split_id == &SplitId::from("split-adoption")),
+            "the listing that names no index has to adopt the index and find its split: \
+             {split_ids:?}"
         );
     }
 
