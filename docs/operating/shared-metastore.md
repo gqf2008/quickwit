@@ -59,6 +59,7 @@ searchers need to notice indexes created by other nodes.
 | -------- | ------ |
 | 3 nodes publishing into one index on R2, 2 minutes | 32,880 acknowledged = 32,880 searchable, zero actor faults |
 | 5 nodes publishing into one manifest-layout index on R2, 2 minutes | 54,240 acknowledged = 54,240 searchable, zero actor faults, zero ERROR-level lines |
+| 5 nodes publishing into one manifest-layout index on R2, 2 minutes, with the shard state in its own objects (`89da92b`) | 56,780 acknowledged = 56,780 searchable on **all five** nodes, zero duplicated documents in a 105-document sample, zero ingest errors, zero actor faults; root compare-and-swap retries 6/7/2/5/7 per node and none exhausted, against 40/50/18/54/39 and 1-2 exhausted for the same scenario on a binary from before the shard state moved (`04ea1598b`, its run in the same harness) |
 | GC/retention load, 3 nodes, ~14 minutes | zero actor faults, delete tasks progressing on every node |
 | Metastore outage, 5 minutes, ingest continuing | 600/600 acknowledged during the outage, all 640 documents searchable 1.5 s after recovery |
 | Rollback drill with a pre-CAS binary | data readable both ways; mixed versions silently lose updates (documented) |
@@ -70,9 +71,16 @@ acknowledged while a merge is in flight; the number to compare against the ackno
 index's static state, which the row's two numbers are (33 published splits holding 54,240 documents
 in that run). The other rows are from the same kind of run and the same harness.
 
+The five-node run in the row added above is the acceptance run for the shard state. That state used
+to live in `root.json`, so every node publishing any shard rewrote that one object; it now lives in
+one object per shard, which is what took the compare-and-swap retries from 30-56 to 2-7 per node and
+the exhausted ones to zero. Compare *settled* numbers: a node that samples while a merge is in
+flight can count more documents than were acknowledged for one sample and is back to the
+acknowledged count at the next one, so the harness only stops after every node's count has been
+unchanged for three samples and counts duplicates by per-document tokens rather than by one reading.
+
 The manifest layout prunes the reads that carry a time window. The reads that carry none — the index
-metadata, the delete tasks, the last delete opstamp and the shards — all live in `root.json`, and a
-node reads the root for them instead of the whole index: measured on the same R2 bucket with 4 000
+metadata and the delete tasks — live in `root.json`, and a node reads the root for them instead of the whole index: measured on the same R2 bucket with 4 000
 splits (289 objects across the root, 32 manifests, the WAL tail and the segments), the first
 `index_metadata` after a fresh start takes **645 ms**, against **2.96 s** for the same test before
 this change; on the same node the delete-task reads after it take a few microseconds, and a repeated
@@ -234,8 +242,19 @@ built for large indexes:
 <index_id>/v3/manifest-<stripe>.json              mutable: references only, one compare-and-swap
 <index_id>/v3/wal-<stripe>/<generation>-<id>.json immutable: one object per published batch
 <index_id>/v3/segments/<stripe>/<bucket>/<generation>-<id>.json immutable: one per time bucket
+<index_id>/v3/shards/<source>/<shard>.json        mutable: one shard's state and publish position
 <index_id>/v3/root.json                           metadata, sources, checkpoints, delete tasks
 ```
+
+The shard state is deliberately not in the root: a publish changes it, and keeping it there made
+every node publishing any shard rewrite the one hot root object. A reader merges the shard objects
+over the copy an older root may still carry; a writer writes the objects of the shards whose state
+changed, compares and swaps on the object's own version (two writers of the same shard cannot both
+win), and only then commits the root, which an ordinary publish leaves untouched. A shard whose
+object disappears or cannot be read is treated as a missing shard rather than as a missing index —
+the shard's object is deleted right after the root commit when the shard is retired — and a shard
+whose object carries no version is readable but refuses to be written, rather than being written
+without a compare-and-swap.
 
 Segments and WAL objects live under the stripe that wrote them and are collected against that
 stripe's own fold generation: a stripe keeps the two generations after its latest fold, which is the

@@ -1,11 +1,15 @@
 # Splits as manifests, take two: getting the shard state out of the root
 
-> Status: implemented. Steps 1 and 2 landed on `main`
-> (`test_a_publish_that_marked_a_replaced_split_and_lost_the_other_stripe_replays`, and the
-> `is_replay` field the publisher sets from its second attempt), the read cost of step 3 was
-> measured on a real bucket, and step 4 — the shard state in one object per shard — is on
-> `feat/metastore-shard-objects`. The run, the logs and the reviews are under
-> `qw-metastore-manifest-root-contention`.
+> Status: implemented and merged (`main` at `89da92b9d`). Step 1 (`test_a_publish_that_marked_a_replaced_split_and_lost_the_other_stripe_replays`)
+> and step 2 (the `is_replay` field the publisher sets from its second attempt) on `main`, the read
+> cost of step 3 measured on a real bucket, and step 4 — the shard state in one object per shard —
+> on `main` with its acceptance run: five nodes, one index, two minutes of ingest against R2,
+> 56 780 acknowledged, all five nodes reporting 56 780 documents with no duplicated document in a
+> 105-document sample, zero actor faults, and the root compare-and-swap retries down to 6/7/2/5/7
+> per node with none exhausted (40/50/18/54/39 and 1-2 exhausted for the same scenario on a binary
+> from before the state moved, `04ea1598b`). The runs,
+> the logs and the reviews are under `qw-metastore-manifest-root-contention` and
+> `qw-metastore-production-followups`.
 
 ## What the run found
 
@@ -66,8 +70,8 @@ into one compare-and-swap, so a lost race means *nothing* happened and the retry
    its own it does not help while the root keeps losing, because the checkpoint is the payload of the
    commit that keeps failing.
 3. **Measure the read cost of moving the state** on a real bucket before writing the code, and decide
-   there whether a reader loads shard objects eagerly or on demand. Today the shard state rides along
-   with the root, and the readers that pay for the root are: every read that materialises an index
+   there whether a reader loads shard objects eagerly or on demand. Before step 4 the shard state
+   rode along with the root, and the readers that paid for the root were: every read that materialises an index
    (`index_metadata`, `list_indexes_metadata`, the control plane's reload — all through `load_index`),
    the mutations that are not split mutations (shard life cycle, sources, delete tasks — also through
    `load_index`), and a v3 split mutation, which reads the root plus the stripes it touches. Moving
@@ -130,6 +134,17 @@ that materialises the index — `index_metadata`, `list_indexes_metadata`, the c
 without the shard objects (`load_root_metadata_only`), so the read they were just optimised for did
 not become expensive again.
 
+**A shard object that is missing is a missing shard, not a missing index.** The object of a retired
+shard is deleted right after the root commit, so a reader whose listing and read straddle that
+deletion will list an object it can no longer fetch; the same goes for an object written in a format
+this node does not know. Turning either into an error makes `load_root` fail, and both the search
+path and the ingest path act on that failure as "this index does not exist" — the node stops seeing
+the index at all. The read path therefore treats a missing object as an absent shard, logs and skips
+an object it cannot read, and keeps a shard whose object carries no version readable while refusing
+to *write* it: a shard state is changed under the version it was read at, and an unconditional write
+would let two writers that read the same shard both win. `test_a_shard_object_that_disappears_does_not_hide_the_index`
+covers the first of those, and the review that asked for it is `f5aef6b6`.
+
 **Compatibility.** A root written before the change carries the state, so reads take the root's copy
 as a base and let the objects override it; writes move the state into the objects and clear the
 root's copy. One revision at a time serves an index in this layout (already the rule in the
@@ -144,12 +159,15 @@ individually.
 ## Acceptance
 
 - The five-node run, same harness, same bucket, same 120 s of ingest: **zero actor faults and the
-  hit count equal to the acknowledged count** (today: 4 faults, +1 180 hits). Step 1 removes one way
+  hit count equal to the acknowledged count** (met on `89da92b9d`: 56 780 acknowledged = 56 780
+  searchable on every node, no duplicated document in a 105-document sample; the run before step 4
+  showed 4 faults and +1 180 hits). Step 1 removes one way
   a merge faults — a replay that stopped at the marking step — but a merge that keeps losing the root
   still ends with a fresh retry that cannot finish, and neither do the three `Publisher` faults.
   Step 2 is what makes those finishable; step 4 is what stops them from happening.
 - The metastore suite on the three layouts, plus: a replay that meets an already marked replaced
   split (step 1, done), a failpoint on the shard-object commit that a replay carrying the step-2
-  field has to survive, an `acquire_shards` racing a publish on the same shard, and — once step 4
-  lands — an assertion that a publish whose only persisted change is a shard's state does not write
-  `root.json`.
+  field has to survive, an `acquire_shards` racing a publish on the same shard, and an assertion that
+  a publish whose only persisted change is a shard's state does not write `root.json`
+  (`test_a_shard_mutation_does_not_touch_the_root`). Still missing from that list: a failpoint on the
+  shard-object commit.
