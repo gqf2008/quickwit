@@ -29,14 +29,13 @@ use quickwit_config::{
     DocMapping, IndexingSettings, IngestSettings, RetentionPolicy, SearchSettings, SourceConfig,
 };
 use quickwit_parquet_engine::split::ParquetSplitMetadata;
-use quickwit_proto::ingest::Shard;
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, DeleteQuery, DeleteShardsRequest,
     DeleteShardsResponse, DeleteTask, EntityKind, IndexStats, ListShardsSubrequest,
     ListShardsSubresponse, MetastoreError, MetastoreResult, OpenShardSubrequest,
     OpenShardSubresponse, PruneShardsRequest, SplitStats,
 };
-use quickwit_proto::types::{IndexUid, PublishToken, ShardId, SourceId, SplitId};
+use quickwit_proto::types::{IndexUid, PublishToken, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
 use serialize::VersionedFileBackedIndex;
 use shards::Shards;
@@ -306,72 +305,6 @@ impl FileBackedIndex {
     /// Marks the file as `recently_modified`.
     pub fn set_recently_modified(&mut self) {
         self.recently_modified = true;
-    }
-
-    /// Every shard this index holds, with the identity its own object is named by.
-    pub(crate) fn shard_states(&self) -> Vec<(SourceId, ShardId, Shard)> {
-        self.per_source_shards
-            .iter()
-            .flat_map(|(source_id, shards)| {
-                shards
-                    .iter_shards()
-                    .map(|shard| (source_id.clone(), shard.shard_id().clone(), shard.clone()))
-            })
-            .collect()
-    }
-
-    /// Takes the per-source shard state out of the index.
-    ///
-    /// The manifest layout keeps it in one object per shard, so the root must not carry a second
-    /// copy: a stale copy in the root is the very churn those objects remove.
-    pub(crate) fn take_source_shards(&mut self) -> HashMap<SourceId, Shards> {
-        std::mem::take(&mut self.per_source_shards)
-    }
-
-    pub(crate) fn put_source_shards(&mut self, per_source_shards: HashMap<SourceId, Shards>) {
-        self.per_source_shards = per_source_shards;
-    }
-
-    /// Replaces each source's shard state with the shards read from their own objects, over the
-    /// copy a root written before the change may still carry.
-    pub(crate) fn put_shard_objects(
-        &mut self,
-        shard_objects: &std::collections::BTreeMap<
-            SourceId,
-            std::collections::BTreeMap<ShardId, Shard>,
-        >,
-    ) {
-        let source_ids: std::collections::BTreeSet<SourceId> = self
-            .per_source_shards
-            .keys()
-            .cloned()
-            .chain(shard_objects.keys().cloned())
-            .collect();
-        for source_id in source_ids {
-            let mut per_shard: std::collections::BTreeMap<ShardId, Shard> = self
-                .per_source_shards
-                .get(&source_id)
-                .map(|shards| {
-                    shards
-                        .iter_shards()
-                        .map(|shard| (shard.shard_id().clone(), shard.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Some(from_objects) = shard_objects.get(&source_id) {
-                per_shard.extend(
-                    from_objects
-                        .iter()
-                        .map(|(shard_id, shard)| (shard_id.clone(), shard.clone())),
-                );
-            }
-            let shards = Shards::from_shards_vec(
-                self.metadata.index_uid.clone(),
-                source_id.clone(),
-                per_shard.into_values().collect(),
-            );
-            self.per_source_shards.insert(source_id, shards);
-        }
     }
 
     /// Index ID accessor.

@@ -1025,7 +1025,7 @@ impl FileBackedMetastore {
                 .read_any(index_id, None, |index| index.get_stats())
                 .await;
         };
-        let (root_info, _, _) = layout.load_root_metadata_only(&*self.storage).await?;
+        let (root_info, _, _) = layout.load_root(&*self.storage).await?;
         let index_uid = root_info.index.index_uid().clone();
         let splits = layout.load_split_map(&*self.storage).await?;
         Ok(file_backed_index::index_stats_from_splits(
@@ -1103,7 +1103,7 @@ impl FileBackedMetastore {
             return Ok(None);
         };
         // The root carries the incarnation the request may name, so it is read either way.
-        let (root_info, _, _) = layout.load_root_metadata_only(&*self.storage).await?;
+        let (root_info, _, _) = layout.load_root(&*self.storage).await?;
         if let Some(incarnation_id) = incarnation_id_opt
             && root_info.index.index_uid().incarnation_id != incarnation_id
         {
@@ -1154,7 +1154,6 @@ impl FileBackedMetastore {
             // told, because refusing them would fail an RPC whose publication already happened.
             let is_replay = attempt > 1 || caller_replay;
             let (root_info, root_version, root_bytes) = layout.load_root(&*self.storage).await?;
-            let loaded_shard_objects = root_info.shard_objects;
             let mut index = root_info.index;
             if index.index_uid() != index_uid {
                 return Err(MetastoreError::NotFound(EntityKind::Index {
@@ -1200,13 +1199,7 @@ impl FileBackedMetastore {
             // The rest of the index (metadata, sources, checkpoints, delete tasks) keeps its own
             // small compare-and-swap; it is only written when it actually changed.
             if let Err(error) = layout
-                .store_root(
-                    &*self.storage,
-                    &mut index,
-                    &loaded_shard_objects,
-                    &root_bytes,
-                    &root_version,
-                )
+                .store_root(&*self.storage, &mut index, &root_bytes, &root_version)
                 .await
             {
                 if is_manifest_conflict(&error) && attempt < DISTRIBUTED_MAX_ATTEMPTS {
@@ -1259,7 +1252,7 @@ impl FileBackedMetastore {
                 .insert(index_id.to_string(), None);
             return Ok(None);
         }
-        let (root_info, _, _) = probe.load_root_metadata_only(&*self.storage).await?;
+        let (root_info, _, _) = probe.load_root(&*self.storage).await?;
         let layout = manifest_layout::ManifestLayout::new(
             index_id,
             root_info.bucket_secs,
@@ -2689,10 +2682,10 @@ mod tests {
 
     use futures::executor::block_on;
     use quickwit_common::uri::{Protocol, Uri};
-    use quickwit_config::{INGEST_V2_SOURCE_ID, IndexConfig, SourceConfig};
-    use quickwit_proto::ingest::{Shard, ShardState};
+    use quickwit_config::IndexConfig;
+    use quickwit_proto::ingest::Shard;
     use quickwit_proto::metastore::{DeleteQuery, MetastoreError};
-    use quickwit_proto::types::{Position, ShardId, SourceId};
+    use quickwit_proto::types::SourceId;
     use quickwit_query::query_ast::qast_helper;
     use quickwit_storage::{LocalFileStorage, MockStorage, RamStorage, Storage, StorageErrorKind};
     use rand::RngExt;
@@ -2751,94 +2744,6 @@ mod tests {
             .collect();
         splits.sort();
         Ok(splits)
-    }
-
-    /// A mutation that only changes a shard writes that shard's own object and leaves the root
-    /// alone.
-    ///
-    /// This is the property the five-node run needs: before the shard state moved out of the root,
-    /// every node publishing any shard of any source wrote the one hot root object, lost the
-    /// compare-and-swap and replayed. The root's version is what tells the two apart — a skipped
-    /// compare-and-swap leaves it where it was.
-    #[tokio::test]
-    async fn test_a_shard_mutation_does_not_touch_the_root() {
-        let storage = Arc::new(RamStorage::default());
-        let mut metastore = FileBackedMetastore::try_new(storage.clone(), None)
-            .await
-            .unwrap();
-        metastore.set_distributed(true);
-        metastore.set_index_layout(IndexLayout::ManifestSegments {
-            bucket_secs: 60,
-            num_stripes: 2,
-        });
-
-        let index_id = "test-shard-objects";
-        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
-        let index_uid = metastore
-            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
-            .await
-            .unwrap()
-            .index_uid()
-            .clone();
-        let source_id = SourceId::from(INGEST_V2_SOURCE_ID);
-        metastore
-            .add_source(AddSourceRequest {
-                index_uid: Some(index_uid.clone()),
-                source_config_json: serde_json::to_string(&SourceConfig::ingest_v2()).unwrap(),
-            })
-            .await
-            .unwrap();
-
-        let root_path = Path::new("test-shard-objects/v3/root.json");
-        let (_, root_version_before) = storage.get_all_with_version(root_path).await.unwrap();
-        // The shard object is named after its source, which for an ingest-v2 source is
-        // `_ingest-source`.
-        let shard_path = format!("test-shard-objects/v3/shards/{source_id}/01J0SHARD.json");
-
-        let shard = |publish_position_inclusive: Position| Shard {
-            index_uid: Some(index_uid.clone()),
-            source_id: source_id.clone(),
-            shard_id: Some(ShardId::from("01J0SHARD")),
-            shard_state: ShardState::Open as i32,
-            ingester_id: "test-ingester".to_string(),
-            publish_position_inclusive: Some(publish_position_inclusive),
-            ..Default::default()
-        };
-        metastore
-            .insert_shards(&index_uid, &source_id, vec![shard(Position::Beginning)])
-            .await;
-        assert!(
-            storage.exists(Path::new(&shard_path)).await.unwrap(),
-            "the shard has an object of its own"
-        );
-        let (_, root_version_after_open) = storage.get_all_with_version(root_path).await.unwrap();
-        assert_eq!(
-            root_version_before, root_version_after_open,
-            "opening a shard must not write the root"
-        );
-        let object_after_open = storage.get_all(Path::new(&shard_path)).await.unwrap();
-
-        // A second mutation of the same shard: the object follows it, the root does not.
-        metastore
-            .insert_shards(&index_uid, &source_id, vec![shard(Position::offset(7u64))])
-            .await;
-        let object_after_publish = storage.get_all(Path::new(&shard_path)).await.unwrap();
-        assert_ne!(
-            object_after_open.as_slice(),
-            object_after_publish.as_slice(),
-            "the shard object carries the new state"
-        );
-        let (_, root_version_after_publish) =
-            storage.get_all_with_version(root_path).await.unwrap();
-        assert_eq!(
-            root_version_before, root_version_after_publish,
-            "publishing into a shard must not write the root"
-        );
-        assert_eq!(
-            metastore.list_all_shards(&index_uid, &source_id).await[0].publish_position_inclusive,
-            Some(Position::offset(7u64)),
-            "the state read back is the one in the object"
-        );
     }
 
     // Hook of the layout itself: the suite above runs on whichever layout the environment selects,

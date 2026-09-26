@@ -110,11 +110,6 @@ impl Shards {
         self.shards.is_empty()
     }
 
-    /// The shards this source holds, in no particular order.
-    pub(super) fn iter_shards(&self) -> impl Iterator<Item = &Shard> {
-        self.shards.values()
-    }
-
     fn get_shard(&self, shard_id: &ShardId) -> MetastoreResult<&Shard> {
         self.shards.get(shard_id).ok_or_else(|| {
             let queue_id = queue_id(&self.index_uid, &self.source_id, shard_id);

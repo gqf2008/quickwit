@@ -57,9 +57,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use futures::TryStreamExt;
-use quickwit_proto::ingest::Shard;
 use quickwit_proto::metastore::{MetastoreError, MetastoreResult, serde_utils};
-use quickwit_proto::types::{ShardId, SourceId, SplitId};
+use quickwit_proto::types::SplitId;
 use quickwit_storage::{ObjectVersion, OwnedBytes, Storage, StorageErrorKind};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -70,22 +69,6 @@ use crate::Split;
 
 /// Version of the objects written by this layout. A reader refuses what it does not know.
 pub(crate) const MANIFEST_LAYOUT_FORMAT_VERSION: u32 = 1;
-
-/// Format version of the object that carries one shard's state.
-pub(crate) const SHARD_OBJECT_FORMAT_VERSION: u32 = 1;
-
-/// Every shard, as it was read from its own object: source, shard, state.
-pub(crate) type ShardObjects = BTreeMap<SourceId, BTreeMap<ShardId, Shard>>;
-
-/// One shard's state, stored on its own so that publishing it does not write the root.
-///
-/// The source's checkpoint is rebuilt from the shards' publish positions, exactly as the root's
-/// inline copy is read back today, so the object holds the shard and nothing else.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShardObject {
-    format_version: u32,
-    shard: Shard,
-}
 
 /// Generations of segments kept after a fold, so a reader that lost a race can still finish.
 const SEGMENT_GRACE_GENERATIONS: u64 = 2;
@@ -269,9 +252,6 @@ pub(crate) struct ManifestWriteContext {
     pub layout: ManifestLayout,
     pub root_version: ObjectVersion,
     pub root_bytes: OwnedBytes,
-    /// The shard states the root's index was completed with, so a write can tell which objects
-    /// changed and which are obsolete.
-    pub shard_objects: ShardObjects,
 }
 
 /// What the root says about the index: its non-split state and the layout parameters.
@@ -280,21 +260,6 @@ pub(crate) struct ManifestRootInfo {
     pub index: FileBackedIndex,
     pub bucket_secs: i64,
     pub num_stripes: usize,
-    /// The shard states read from their own objects, as they were found.
-    pub shard_objects: ShardObjects,
-}
-
-/// Splits an object path under the shard prefix into the source and the shard it names.
-fn shard_object_ids(prefix: &Path, path: &Path) -> Option<(SourceId, ShardId)> {
-    let relative = path.strip_prefix(prefix).ok()?;
-    let mut components = relative.components();
-    let source_id = components.next()?.as_os_str().to_str()?;
-    let file_name = components.next()?.as_os_str().to_str()?;
-    if components.next().is_some() {
-        return None;
-    }
-    let shard_id = file_name.strip_suffix(".json")?;
-    Some((source_id.to_string(), ShardId::from(shard_id)))
 }
 
 fn internal(message: impl Into<String>, cause: impl Into<String>) -> MetastoreError {
@@ -368,20 +333,6 @@ impl ManifestLayout {
         self.prefix().join("segments").join(format!("{stripe:03}"))
     }
 
-    fn shards_prefix(&self) -> PathBuf {
-        self.prefix().join("shards")
-    }
-
-    fn source_shards_prefix(&self, source_id: &SourceId) -> PathBuf {
-        self.shards_prefix().join(source_id)
-    }
-
-    /// Where one shard's state lives. Source ids and shard ids are path-safe identifiers.
-    pub(crate) fn shard_path(&self, source_id: &SourceId, shard_id: &ShardId) -> PathBuf {
-        self.source_shards_prefix(source_id)
-            .join(format!("{shard_id}.json"))
-    }
-
     /// Bucket a split belongs to.
     ///
     /// A split without a time range matches every query (that is what the metastore's predicate
@@ -435,11 +386,7 @@ impl ManifestLayout {
         index: &FileBackedIndex,
     ) -> MetastoreResult<()> {
         let mut index_without_splits = index.clone();
-        // An index is created without shards in practice, but the state must not be left behind in
-        // the root either: it belongs to the shard objects, and a root that carried a copy would
-        // make the next publish write it.
         let splits = index_without_splits.take_splits();
-        let source_shards = index_without_splits.take_source_shards();
         let root = ManifestRoot {
             format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
             bucket_secs: self.bucket_secs,
@@ -449,9 +396,6 @@ impl ManifestLayout {
         let root_bytes = serde_utils::to_json_bytes_pretty(&root)?;
         let mut restore_splits = root.index;
         restore_splits.put_splits(splits);
-        restore_splits.put_source_shards(source_shards);
-        self.sync_shard_objects(storage, &restore_splits, &ShardObjects::new())
-            .await?;
         // Manifests first, root last: the root is what makes the index exist, so an interrupted
         // create leaves a state a retry can finish instead of an index that exists but cannot be
         // read.
@@ -467,26 +411,6 @@ impl ManifestLayout {
     pub(crate) async fn load_root(
         &self,
         storage: &dyn Storage,
-    ) -> MetastoreResult<(ManifestRootInfo, ObjectVersion, OwnedBytes)> {
-        self.load_root_with_shards(storage, true).await
-    }
-
-    /// Reads the root without the shard objects.
-    ///
-    /// The readers that only name the index (its stats, a listing that filters by a time window)
-    /// do not need the shard state, and reading it would add a list and one read per shard to a
-    /// path that was just measured at 645 ms for a 4 000-split index.
-    pub(crate) async fn load_root_metadata_only(
-        &self,
-        storage: &dyn Storage,
-    ) -> MetastoreResult<(ManifestRootInfo, ObjectVersion, OwnedBytes)> {
-        self.load_root_with_shards(storage, false).await
-    }
-
-    async fn load_root_with_shards(
-        &self,
-        storage: &dyn Storage,
-        load_shard_objects: bool,
     ) -> MetastoreResult<(ManifestRootInfo, ObjectVersion, OwnedBytes)> {
         let path = self.root_path();
         let (bytes, version_opt) = storage
@@ -511,132 +435,12 @@ impl ManifestLayout {
                 format!("no version for `{}`", path.display()),
             )
         })?;
-        let shard_objects = if load_shard_objects {
-            self.load_shard_objects(storage).await?
-        } else {
-            ShardObjects::new()
-        };
-        let mut index = root.index;
-        if load_shard_objects {
-            index.put_shard_objects(&shard_objects);
-        }
         let info = ManifestRootInfo {
-            index,
-            shard_objects,
+            index: root.index,
             bucket_secs: root.bucket_secs,
             num_stripes: root.num_stripes,
         };
         Ok((info, version, bytes))
-    }
-
-    /// Every shard whose state was written to its own object, keyed by source.
-    ///
-    /// A root written before the change still carries its shards inline; those are the base the
-    /// objects are merged over, and a write moves them into objects of their own.
-    pub(crate) async fn load_shard_objects(
-        &self,
-        storage: &dyn Storage,
-    ) -> MetastoreResult<ShardObjects> {
-        let prefix = self.shards_prefix();
-        let mut pages = storage.list(&prefix);
-        let mut paths = Vec::new();
-        loop {
-            let page = pages.try_next().await.map_err(|error| {
-                internal("failed to list the shards of the index", error.to_string())
-            })?;
-            let Some(page) = page else {
-                break;
-            };
-            for metadata in page {
-                paths.push(metadata.path);
-            }
-        }
-        let mut shard_objects = ShardObjects::new();
-        for path in paths {
-            let (source_id, shard_id) = shard_object_ids(&prefix, &path).ok_or_else(|| {
-                internal(
-                    "unexpected object in the shard state of the index",
-                    format!("`{}` is not `<source>/<shard>.json`", path.display()),
-                )
-            })?;
-            let bytes = storage
-                .get_all(&path)
-                .await
-                .map_err(|error| map_storage_error(&self.index_id, error))?;
-            let object: ShardObject = serde_utils::from_json_bytes(&bytes)?;
-            if object.format_version != SHARD_OBJECT_FORMAT_VERSION {
-                return Err(internal(
-                    "unknown shard state format",
-                    format!(
-                        "`{}` says `{}`, this node understands `{}`",
-                        path.display(),
-                        object.format_version,
-                        SHARD_OBJECT_FORMAT_VERSION
-                    ),
-                ));
-            }
-            if object.shard.shard_id() != shard_id {
-                return Err(internal(
-                    "a shard object names another shard",
-                    format!("`{}` holds `{}`", path.display(), object.shard.shard_id()),
-                ));
-            }
-            shard_objects
-                .entry(source_id)
-                .or_default()
-                .insert(shard_id, object.shard);
-        }
-        Ok(shard_objects)
-    }
-
-    /// Writes the shard objects a mutation changed or created, and answers with the objects that
-    /// are no longer needed.
-    ///
-    /// A shard that is in the index but not in `loaded` has never been written to its own object —
-    /// either it is new or an older root carried it inline — so it is written too. The obsolete
-    /// objects are returned rather than deleted: their deletion only makes sense once the root
-    /// commit went through, because until then a reader may still resolve the shard through the
-    /// root.
-    async fn sync_shard_objects(
-        &self,
-        storage: &dyn Storage,
-        index: &FileBackedIndex,
-        loaded: &ShardObjects,
-    ) -> MetastoreResult<Vec<PathBuf>> {
-        let current: BTreeMap<(SourceId, ShardId), Shard> = index
-            .shard_states()
-            .into_iter()
-            .map(|(source_id, shard_id, shard)| ((source_id, shard_id), shard))
-            .collect();
-        for ((source_id, shard_id), shard) in &current {
-            let unchanged = matches!(
-                loaded
-                    .get(source_id)
-                    .and_then(|per_shard| per_shard.get(shard_id)),
-                Some(loaded_shard) if loaded_shard == shard
-            );
-            if unchanged {
-                continue;
-            }
-            let object = ShardObject {
-                format_version: SHARD_OBJECT_FORMAT_VERSION,
-                shard: shard.clone(),
-            };
-            let bytes = serde_utils::to_json_bytes_pretty(&object)?;
-            storage
-                .put(&self.shard_path(source_id, shard_id), Box::new(bytes))
-                .await
-                .map_err(|error| map_storage_error(&self.index_id, error))?;
-        }
-        let mut obsolete = Vec::new();
-        for (source_id, per_shard) in loaded {
-            for shard_id in per_shard.keys() {
-                if !current.contains_key(&(source_id.clone(), shard_id.clone())) {
-                    obsolete.push(self.shard_path(source_id, shard_id));
-                }
-            }
-        }
-        Ok(obsolete)
     }
 
     /// Commits the root if it changed since it was read.
@@ -644,15 +448,10 @@ impl ManifestLayout {
         &self,
         storage: &dyn Storage,
         index: &mut FileBackedIndex,
-        loaded_shard_objects: &ShardObjects,
         previous_root_bytes: &OwnedBytes,
         version: &ObjectVersion,
     ) -> MetastoreResult<()> {
         let splits = index.take_splits();
-        // The shard state does not go into the root: it lives in one object per shard, written
-        // below. An ordinary publish then leaves the root untouched, which is the point — the
-        // root is a single hot object every node used to write.
-        let source_shards = index.take_source_shards();
         let root = ManifestRoot {
             format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
             bucket_secs: self.bucket_secs,
@@ -661,17 +460,8 @@ impl ManifestLayout {
         };
         let root_bytes = serde_utils::to_json_bytes_pretty(&root);
         index.put_splits(splits);
-        index.put_source_shards(source_shards);
         let root_bytes = root_bytes?;
-        // The shard objects are written before the root: a crash in between leaves a reader with
-        // the new shard state and the old root, which is what the caller's replay expects. The
-        // other order would lose the state of a shard the root no longer carries.
-        let obsolete_shard_objects = self
-            .sync_shard_objects(storage, index, loaded_shard_objects)
-            .await?;
         if root_bytes.as_slice() == previous_root_bytes.as_slice() {
-            self.delete_shard_objects(storage, obsolete_shard_objects)
-                .await?;
             return Ok(());
         }
         #[cfg(test)]
@@ -687,23 +477,6 @@ impl ManifestLayout {
             .put_if_version_matches(&self.root_path(), Box::new(root_bytes), version)
             .await
             .map_err(|error| map_storage_error(&self.index_id, error))?;
-        self.delete_shard_objects(storage, obsolete_shard_objects)
-            .await?;
-        Ok(())
-    }
-
-    /// Removes the shard objects a mutation made obsolete (a deleted or pruned shard).
-    async fn delete_shard_objects(
-        &self,
-        storage: &dyn Storage,
-        paths: Vec<PathBuf>,
-    ) -> MetastoreResult<()> {
-        for path in paths {
-            storage
-                .delete(&path)
-                .await
-                .map_err(|error| map_storage_error(&self.index_id, error))?;
-        }
         Ok(())
     }
 
@@ -1369,7 +1142,7 @@ mod tests {
     use quickwit_storage::RamStorage;
 
     use super::*;
-    use crate::{IndexMetadata, SplitMetadata, SplitState};
+    use crate::{SplitMetadata, SplitState};
 
     const BUCKET_SECS: i64 = 3_600;
 
@@ -1401,170 +1174,6 @@ mod tests {
         for stripe in 0..layout.num_stripes {
             layout.fold(storage, stripe).await.unwrap();
         }
-    }
-
-    /// An index with one ingest-v2 source and one open shard in it.
-    fn index_with_one_shard() -> (FileBackedIndex, SourceId, ShardId) {
-        use quickwit_config::{SourceConfig, SourceParams};
-        use quickwit_proto::ingest::ShardState;
-        use quickwit_proto::types::Position;
-
-        const SOURCE_ID: &str = "ingest-v2";
-        let mut index_metadata = IndexMetadata::for_test("test-index", "ram:///indexes/test-index");
-        index_metadata.sources.insert(
-            SOURCE_ID.to_string(),
-            SourceConfig::for_test(SOURCE_ID, SourceParams::Ingest),
-        );
-        let mut index = FileBackedIndex::from(index_metadata);
-        let source_id = SOURCE_ID.to_string();
-        let shard_id = ShardId::from("01J0SHARD");
-        let shard = Shard {
-            index_uid: index.index_uid().clone().into(),
-            source_id: source_id.clone(),
-            shard_id: Some(shard_id.clone()),
-            shard_state: ShardState::Open as i32,
-            publish_position_inclusive: Some(Position::Beginning),
-            ..Default::default()
-        };
-        index.put_shard_objects(&BTreeMap::from([(
-            source_id.clone(),
-            BTreeMap::from([(shard_id.clone(), shard)]),
-        )]));
-        (index, source_id, shard_id)
-    }
-
-    /// The state of a shard lives in its own object: changing it writes that object and leaves the
-    /// root's bytes alone. That is what stops the nodes publishing different shards of a source
-    /// from contending on one object.
-    #[tokio::test]
-    async fn test_changing_a_shard_writes_its_object_and_not_the_root() {
-        use quickwit_proto::types::Position;
-
-        let layout = layout();
-        let storage = RamStorage::default();
-        let (index, source_id, shard_id) = index_with_one_shard();
-        layout.create_index(&storage, &index).await.unwrap();
-
-        let root_bytes = storage.get_all(&layout.root_path()).await.unwrap();
-        let root = String::from_utf8(root_bytes.to_vec()).unwrap();
-        assert!(
-            !root.contains("\"shards\""),
-            "the root must not carry the shard state: {root}"
-        );
-        assert!(
-            storage
-                .exists(&layout.shard_path(&source_id, &shard_id))
-                .await
-                .unwrap(),
-            "the shard has an object of its own"
-        );
-
-        // Move the shard's publish position, the change a publish makes.
-        let (root_info, version, previous_root_bytes) = layout.load_root(&storage).await.unwrap();
-        let loaded = root_info.shard_objects.clone();
-        let mut index = root_info.index;
-        let mut shard = index.shard_states()[0].2.clone();
-        shard.publish_position_inclusive = Some(Position::offset(7u64));
-        index.put_shard_objects(&BTreeMap::from([(
-            source_id.clone(),
-            BTreeMap::from([(shard_id.clone(), shard)]),
-        )]));
-        layout
-            .store_root(
-                &storage,
-                &mut index,
-                &loaded,
-                &previous_root_bytes,
-                &version,
-            )
-            .await
-            .unwrap();
-
-        let root_after = storage.get_all(&layout.root_path()).await.unwrap();
-        assert_eq!(
-            root_after.as_slice(),
-            previous_root_bytes.as_slice(),
-            "a publish must not rewrite the root"
-        );
-        let (reloaded, _, _) = layout.load_root(&storage).await.unwrap();
-        assert_eq!(
-            reloaded.index.shard_states()[0]
-                .2
-                .publish_position_inclusive,
-            Some(Position::offset(7u64)),
-            "the object is what carries the new state"
-        );
-    }
-
-    /// A root written before the change still carries its shards inline. Reading takes them as the
-    /// base, and the next write moves every shard it did not touch into an object of its own, so
-    /// nothing is lost when the root stops carrying them.
-    #[tokio::test]
-    async fn test_a_root_with_inline_shards_is_migrated_by_the_next_write() {
-        use quickwit_proto::types::Position;
-
-        let layout = layout();
-        let storage = RamStorage::default();
-        let (index, source_id, shard_id) = index_with_one_shard();
-        // Write the root the way a node running the old code did: the shards are inside it.
-        let index_without_splits = index.clone();
-        let root = ManifestRoot {
-            format_version: MANIFEST_LAYOUT_FORMAT_VERSION,
-            bucket_secs: layout.bucket_secs,
-            num_stripes: layout.num_stripes,
-            index: index_without_splits,
-        };
-        let root_bytes = serde_utils::to_json_bytes_pretty(&root).unwrap();
-        storage
-            .put(&layout.root_path(), Box::new(root_bytes))
-            .await
-            .unwrap();
-        let (root_info, version, previous_root_bytes) = layout.load_root(&storage).await.unwrap();
-        assert_eq!(
-            root_info.shard_objects.len(),
-            0,
-            "the old root has no shard objects yet"
-        );
-        assert_eq!(
-            root_info.index.shard_states().len(),
-            1,
-            "the inline copy is the base"
-        );
-        let loaded = root_info.shard_objects.clone();
-        let mut index = root_info.index;
-        // Touch nothing: even so, the write has to materialise the inline shard, or the root would
-        // drop a state that no object carries.
-        layout
-            .store_root(
-                &storage,
-                &mut index,
-                &loaded,
-                &previous_root_bytes,
-                &version,
-            )
-            .await
-            .unwrap();
-        assert!(
-            storage
-                .exists(&layout.shard_path(&source_id, &shard_id))
-                .await
-                .unwrap(),
-            "the inline shard moved into its own object"
-        );
-        let root_after = storage.get_all(&layout.root_path()).await.unwrap();
-        let root_after = String::from_utf8(root_after.to_vec()).unwrap();
-        assert!(
-            !root_after.contains("\"shards\""),
-            "the migrated root no longer carries the shard state: {root_after}"
-        );
-        let (reloaded, _, _) = layout.load_root(&storage).await.unwrap();
-        assert_eq!(reloaded.index.shard_states().len(), 1);
-        assert_eq!(
-            reloaded.index.shard_states()[0]
-                .2
-                .publish_position_inclusive,
-            Some(Position::Beginning)
-        );
     }
 
     /// A split whose range starts in one bucket and reaches into the next must be returned by a
