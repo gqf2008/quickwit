@@ -91,6 +91,20 @@ pub(super) static MANIFEST_FOLD_FAILURES_TOTAL: LazyCounter = lazy_counter!(
     subsystem: "metastore",
 );
 
+/// Number of times a listing read the manifest to adopt the index and template sets.
+///
+/// A listing adopts the index set and the template set from the manifest, which is what lets a
+/// long-running node see what another node created; the cost is one read of `manifest.json` per
+/// such call. This counter is how that cost is measured before deciding whether to add a TTL or a
+/// conditional read.
+pub(super) static MANIFEST_ADOPTIONS_TOTAL: LazyCounter = lazy_counter!(
+    name: "file_backed_manifest_adoptions_total",
+    description: "Number of times a file-backed metastore listing read `manifest.json` to adopt the \
+                  index set and the template set another node may have changed. One per listing \
+                  that walks the index set, plus the template readers.",
+    subsystem: "metastore",
+);
+
 /// Number of shard objects a reader had to skip.
 ///
 /// A shard object is skipped when it disappeared between the listing and the read (the normal fate

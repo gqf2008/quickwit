@@ -741,6 +741,7 @@ impl FileBackedMetastore {
         // The manifest is read under the lock: a writer reloads and rewrites it while holding it,
         // so reading before the lock could rebuild the state from a manifest that is
         // already gone.
+        metrics::MANIFEST_ADOPTIONS_TOTAL.inc();
         let (manifest, _) = load_manifest_with_version(&*self.storage).await?;
         // The manifest is the index set, so this rebuilds it rather than only adding what is
         // missing: an index this node listed while another node was still creating it would
@@ -3196,6 +3197,8 @@ mod tests {
                 .await
                 .unwrap()
         };
+        let adoptions_before =
+            crate::metastore::file_backed::metrics::MANIFEST_ADOPTIONS_TOTAL.get();
         assert!(
             listed_by_b(node_b.clone()).await.is_empty(),
             "the node starts with an empty metastore"
@@ -3216,6 +3219,12 @@ mod tests {
                 .iter()
                 .any(|metadata| metadata.index_id() == index_id),
             "a node that never wrote has to adopt the index: {listed:?}"
+        );
+        assert!(
+            crate::metastore::file_backed::metrics::MANIFEST_ADOPTIONS_TOTAL.get()
+                - adoptions_before
+                >= 1,
+            "the read a listing pays for adopting has to be visible outside the logs"
         );
         // A node whose cache has never been filled adopts through the stats listing too, and the
         // compaction planner reads splits through the listing that names no index. Both get their

@@ -83,6 +83,7 @@ stripe into a segment), and how often a reader had to skip a shard object it cou
 | `quickwit_metastore` | `file_backed_manifest_folds_total` | Number of manifest-layout stripes folded into a segment | `counter` |
 | `quickwit_metastore` | `file_backed_manifest_fold_failures_total` | Number of folds of a manifest-layout stripe that failed and were left for the next write | `counter` |
 | `quickwit_metastore` | `file_backed_shard_objects_skipped_total` | Number of manifest-layout shard objects a reader skipped (deleted, unreadable, unknown format, misnamed, or naming another shard); the index still loads without them | `counter` |
+| `quickwit_metastore` | `file_backed_manifest_adoptions_total` | Number of times a listing read `manifest.json` to adopt the index and template sets another node may have changed | `counter` |
 
 ## Rest API Metrics
 
