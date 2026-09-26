@@ -357,6 +357,7 @@ pub(super) async fn load_manifest_index_if_exists(
         layout,
         root_version,
         root_bytes,
+        shard_objects: root_info.shard_objects,
     };
     Ok(Some((index, context)))
 }
@@ -388,7 +389,13 @@ pub(super) async fn store_manifest_index(
         layout.publish_ops(storage, ops).await?;
     }
     layout
-        .store_root(storage, index, &context.root_bytes, &context.root_version)
+        .store_root(
+            storage,
+            index,
+            &context.shard_objects,
+            &context.root_bytes,
+            &context.root_version,
+        )
         .await
 }
 
