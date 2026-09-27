@@ -1750,6 +1750,14 @@ mod tests {
         ManifestLayout::new("test-index", BUCKET_SECS, 2)
     }
 
+    /// One stripe per thing a multi-product merge commits: the two products and the marking of the
+    /// split they replace. With the products in one stripe the mutation takes the single-product
+    /// path, which commits its marks with the product and never opens the window this test is
+    /// about.
+    fn multi_product_layout() -> ManifestLayout {
+        ManifestLayout::new("test-index", BUCKET_SECS, 3)
+    }
+
     fn split(split_id: &str, time_range: Option<std::ops::RangeInclusive<i64>>) -> Split {
         Split {
             split_state: SplitState::Published,
@@ -2887,16 +2895,21 @@ mod tests {
     }
 
     /// Several products cannot all be atomic with the marking of the splits they replace, so the
-    /// marking commits after the last one. What a reader catches in between is the products with
-    /// their sources still published — duplicated hits, never a missing document.
+    /// products commit first and the markings after them. What a reader catches in between is the
+    /// products with their sources still published — duplicated hits, never a missing document.
+    ///
+    /// The products sit in two different stripes on purpose, so that the mutation really takes the
+    /// two-pass path and the failure lands on the pass that carries the markings: with everything
+    /// in one stripe, or with the failure in the first pass, nothing would be committed and the
+    /// assertions below would hold whatever the mutation did.
     #[tokio::test]
     async fn test_a_multi_product_merge_never_hides_documents() {
-        let layout = layout();
+        let layout = multi_product_layout();
         let storage = RamStorage::default();
         layout.create(&storage).await.unwrap();
         let source_id = split_id_in_stripe(&layout, 0, "source");
         let first_product_id = split_id_in_stripe(&layout, 1, "product-a");
-        let last_product_id = split_id_in_stripe(&layout, 1, "product-b");
+        let last_product_id = split_id_in_stripe(&layout, 2, "product-b");
         let time_range = Some(1_700_000_000..=1_700_000_060);
         publish_and_fold(
             &layout,
@@ -2905,7 +2918,9 @@ mod tests {
         )
         .await;
 
-        test_hooks::fail_next_commit_for_stripe(layout.stripe_of(last_product_id.as_str()));
+        // The marking is what the second pass commits, so failing it leaves both products committed
+        // and the source published.
+        test_hooks::fail_next_commit_for_stripe(layout.stripe_of(source_id.as_str()));
         let result = layout
             .publish_ops(
                 &storage,
@@ -2927,6 +2942,12 @@ mod tests {
             .filter(|split| split.split_state == SplitState::Published)
             .map(|split| split.split_id().to_string())
             .collect();
+        assert!(
+            published.contains(&first_product_id.to_string())
+                && published.contains(&last_product_id.to_string()),
+            "both products have to be visible before the markings commit, otherwise the window \
+             would hide documents instead of duplicating them: {published:?}"
+        );
         assert!(
             published.contains(&source_id.to_string()),
             "the split the merge replaces has to stay visible until the marking lands: \
