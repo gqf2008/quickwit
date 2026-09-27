@@ -109,12 +109,12 @@ the first measurement of the shape rather than a list of what is missing:
    bucket width, in the index's own layout, so a reader learns it from the index metadata instead of
    discovering it with a `list`.
 2. **The metastore above the storage.** The five split mutations (stage, publish, mark for deletion,
-   delete, and the delete-task opstamp update) no longer load the index: they read the splits they
-   name, through the manifests and the segments whose id range can hold them, publish what changed as
-   WAL appends plus **one compare-and-swap per stripe they touched**, and read with the query's window
-   (`manifest_layout.rs::publish_ops`, `ManifestLayout::list_splits`). The numbers above stay the
-   *layout's* numbers — the spike counts storage calls, while the metastore also loads the index root
-   and looks the splits up, so what the whole metastore costs is measured in
+   delete, and the delete-task opstamp update) no longer load the whole split map: they read the
+   splits they name, through the manifests and the segments whose id range can hold them, publish what
+   changed as WAL appends plus **one compare-and-swap per stripe each of their passes touches**, and
+   read with the query's window (`manifest_layout.rs::publish_ops`, `ManifestLayout::list_splits`).
+   The numbers above stay the *layout's* numbers — the spike counts storage calls, while the metastore
+   also loads the index root and looks the splits up, so what the whole metastore costs is measured in
    `docs/operating/shared-metastore.md`, not here.
 
 ## Porting plan, item by item
@@ -134,8 +134,11 @@ deployment sizes from, is `docs/operating/shared-metastore.md`.
    never collect at all while one stripe of the index has not folded yet.
 2. **Split operations** (`file_backed/`) — **landed**: `stage_splits`, `publish_splits`,
    `mark_splits_for_deletion`, `delete_splits` and `update_splits_delete_opstamp` are WAL appends plus
-   one compare-and-swap per stripe they touch, in the sharded/distributed path and under the existing
-   bounded replay. `FileBackedIndex` stays as the single-node, in-memory model.
+   one compare-and-swap per stripe each of their passes touches, in the sharded/distributed path and
+   under the existing bounded replay. A merge is the one mutation with more than one pass: the stripes
+   that own the splits it replaces record the marking after the stripe carrying the product commits,
+   and a single-product merge then clears the marks it wrote with one more compare-and-swap.
+   `FileBackedIndex` stays as the single-node, in-memory model.
 3. **Read path** — **landed**: `list_splits(query)` reads the manifests (in parallel, so all stripes
    share one round trip), prunes the buckets the query's time range cannot touch, and fetches the
    segments that remain plus the WAL tail, so it never builds the whole map.
