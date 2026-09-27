@@ -54,6 +54,10 @@ use quickwit_storage::{ObjectVersion, S3CompatibleObjectStorage, Storage, Storag
 
 const TEST_BUCKET_URI: &str = "s3://quickwit-integration-tests";
 
+/// Objects written under an index prefix to push its listing past the endpoint's page size (the S3
+/// API caps a page at 1 000 keys).
+const DELETE_PAGE_FILLER_OBJECTS: usize = 1_001;
+
 /// Bucket the tests write into.
 ///
 /// Defaults to the bucket the other S3 integration tests use; `QW_TEST_S3_BUCKET_URI` points the
@@ -427,6 +431,77 @@ async fn test_sharded_layout_on_s3_endpoint() -> anyhow::Result<()> {
         !metastore_d.index_exists(&index_id).await?,
         "a node that starts after the delete still sees the index: something was left behind"
     );
+    Ok(())
+}
+
+/// Deleting an index whose prefix holds more objects than one listing page still empties it.
+///
+/// Both layouts delete by walking the prefix listing, and a page boundary is exactly where an index
+/// would be left partly behind. Every other test here leaves a handful of objects, so this one
+/// writes enough of them to make the endpoint hand the listing back in pages and checks that it did
+/// — otherwise the test would pass without ever reaching the boundary it is about.
+///
+/// No ceiling of its own: a request that stalls is cut by the storage's read timeout (see
+/// `DEFAULT_S3_READ_TIMEOUT`), which fails the run with the request's own error rather than hiding
+/// it behind unhelpful silence.
+#[tokio::test]
+async fn test_deleting_an_index_with_more_objects_than_one_page() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!(
+            "skipping test_deleting_an_index_with_more_objects_than_one_page: QW_S3_ENDPOINT is \
+             not set"
+        );
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/delete-pages", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    metastore.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
+
+    let index_id = append_random_suffix("delete-pages-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid: IndexUid = metastore
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    // Markers under the index prefix, shaped like the slots this layout writes. They are not
+    // created by the layout — what is under test is the walk over the listing, not what the objects
+    // mean — and the assertion below covers `<index_id>/`, not the shared root manifest.
+    let filler_paths: Vec<PathBuf> = (0..DELETE_PAGE_FILLER_OBJECTS)
+        .map(|number| PathBuf::from(format!("{index_id}/v2/splits/slots/{number:05}.json")))
+        .collect();
+    // Four at a time: this environment's path to the bucket has stalled under a burst of concurrent
+    // small writes (761 of 1 100 objects landed before a request hung before the storage had a read
+    // timeout to cut it), and the test is about the delete, not about the write burst.
+    for chunk in filler_paths.chunks(4) {
+        futures::future::try_join_all(
+            chunk
+                .iter()
+                .map(|path| storage.put(path, Box::new(b"{}".to_vec()))),
+        )
+        .await?;
+    }
+
+    let (first_page, total) = page_shape(&*storage, Path::new(&index_id)).await?;
+    assert!(
+        total > first_page,
+        "the endpoint has to hand the prefix back in more than one page for this test to mean \
+         anything, and it returned {total} object(s) in the first page"
+    );
+
+    metastore
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    assert_index_left_nothing_behind(
+        &*storage,
+        &index_id,
+        "deleting an index whose objects do not fit in one listing page",
+    )
+    .await?;
     Ok(())
 }
 
@@ -1178,6 +1253,20 @@ async fn objects_under(storage: &dyn Storage, prefix: &Path) -> anyhow::Result<V
         }
     }
     Ok(paths)
+}
+
+/// How the endpoint splits `prefix` into pages: the size of the first page and the total number of
+/// objects. A test that means to exercise a page boundary has to know it got one.
+async fn page_shape(storage: &dyn Storage, prefix: &Path) -> anyhow::Result<(usize, usize)> {
+    let mut pages = storage.list(prefix);
+    let mut first_page = None;
+    let mut total = 0;
+    while let Some(page) = futures::StreamExt::next(&mut pages).await {
+        let page_len = page?.len();
+        first_page.get_or_insert(page_len);
+        total += page_len;
+    }
+    Ok((first_page.unwrap_or(0), total))
 }
 
 /// Asserts that deleting the index left nothing at all under `<index_id>/`.
