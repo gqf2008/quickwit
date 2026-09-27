@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped writes are visible from Prometheus. A third counter, `..._replay_tolerated_splits_total`, counts the
   split state changes a replayed publish found already applied, so the tolerance granted by `is_replay` is
   visible instead of silent. (walgit: `qw-metastore-cas-observability`, `qw-metastore-replay-visibility`)
+- Monitoring: the metastore Grafana dashboard now panels those counters — compare-and-swap conflicts, writes
+  dropped after the replay budget, replayed publishes, manifest and shard folds with their failures, shard
+  objects a reader skipped, and the manifest reads a listing pays for adoption — so a shared object-storage
+  metastore's contention and dropped writes are visible where an operator looks, not only in Prometheus.
+  (walgit: `qw-metastore-dashboard-counters`)
 - **Metastore: a third layout for very large indexes, where the manifest holds references instead of the
   split map.** `QW_METASTORE_MANIFEST_LAYOUT=true` makes a node create indexes with one manifest per stripe
   (`v3/manifest-<stripe>.json`), an immutable WAL object per published batch and one segment per time bucket,
