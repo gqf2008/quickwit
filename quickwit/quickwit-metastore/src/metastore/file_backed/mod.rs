@@ -1227,6 +1227,9 @@ impl FileBackedMetastore {
             // skips an index that is not there. A read that does name an index keeps reporting the
             // state: whoever asked for that index has to learn it is not readable, rather than read
             // an empty split list as "no data".
+            //
+            // Only the `read_any` arm below can see that state: the layout arm reads objects, and
+            // `get_index_mutex` — the one producer of the error — is behind `read_any`.
             let read_is_a_listing = incarnation_id_opt.is_none();
             // An index stored in the manifest layout is read from its segments, pruned by the
             // query's window, instead of being materialised: that is the whole point of the layout.
@@ -1240,7 +1243,6 @@ impl FileBackedMetastore {
                 }
                 Ok(None) => {}
                 Err(MetastoreError::NotFound(_)) => continue,
-                Err(error) if read_is_a_listing && is_transitioning_state_error(&error) => continue,
                 Err(error) => return Err(error),
             }
             match self
@@ -6609,8 +6611,9 @@ mod tests {
             .await
             .expect_err("a read that names the index has to report the state");
         assert!(
-            matches!(error, MetastoreError::Internal { .. }),
-            "the state is a failure for the caller that asked for this index: {error:?}"
+            is_transitioning_state_error(&error),
+            "the failure has to be the transitioning state itself, not something else that \
+             happens to be internal: {error:?}"
         );
         Ok(())
     }
