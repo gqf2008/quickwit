@@ -108,10 +108,14 @@ the first measurement of the shape rather than a list of what is missing:
    `QW_METASTORE_MANIFEST_STRIPES` (default 32, sized from the writer count) and is recorded, with the
    bucket width, in the index's own layout, so a reader learns it from the index metadata instead of
    discovering it with a `list`.
-2. **The metastore above the storage.** The five split mutations and `list_splits(query)` are WAL
-   appends plus one manifest compare-and-swap and a pruned read (`manifest_layout.rs::publish_ops`,
-   `ManifestLayout::list_splits`), so the numbers above are the metastore's numbers and not only the
-   layout's.
+2. **The metastore above the storage.** The five split mutations (stage, publish, mark for deletion,
+   delete, and the delete-task opstamp update) no longer load the index: they read the splits they
+   name, through the manifests and the segments whose id range can hold them, publish what changed as
+   WAL appends plus **one compare-and-swap per stripe they touched**, and read with the query's window
+   (`manifest_layout.rs::publish_ops`, `ManifestLayout::list_splits`). The numbers above stay the
+   *layout's* numbers — the spike counts storage calls, while the metastore also loads the index root
+   and looks the splits up, so what the whole metastore costs is measured in
+   `docs/operating/shared-metastore.md`, not here.
 
 ## Porting plan, item by item
 
@@ -120,33 +124,40 @@ not mistaken for the implementation. The operator's view of the same layout, wit
 deployment sizes from, is `docs/operating/shared-metastore.md`.
 
 1. **Layout module** (`file_backed/manifest_layout.rs`) — **landed**: manifest, WAL objects,
-   per-time-bucket segments, fold and the windowed read, hardened with a format version, torn-write
-   handling as in `LESSON_条件写失败后不得清理自己写的对象.md`, and the collection of superseded
-   segments and WAL objects against the stripe's own fold generation: segments and WAL objects belong
-   to the stripe that wrote them, in its own directory, because stripes fold at different rates and a
-   shared watermark would either collect what a slow stripe is still reading or never collect at all
-   while one stripe of the index has not folded yet.
+   per-time-bucket segments, fold and the windowed read, with a format version on the root, the
+   manifests and the segments, checked when they are read; the torn-write rules of
+   `LESSON_条件写失败后不得清理自己写的对象.md` (a publish that loses its compare-and-swap leaves the
+   WAL object it wrote for a later fold to collect, it does not delete it); and the collection of
+   superseded segments and WAL objects against the stripe's own fold generation: segments and WAL
+   objects belong to the stripe that wrote them, in its own directory, because stripes fold at
+   different rates and a shared watermark would either collect what a slow stripe is still reading or
+   never collect at all while one stripe of the index has not folded yet.
 2. **Split operations** (`file_backed/`) — **landed**: `stage_splits`, `publish_splits`,
-   `mark_splits_for_deletion` and `delete_splits` are WAL appends plus one manifest compare-and-swap in
-   the sharded/distributed path, with the existing bounded replay. `FileBackedIndex` stays as the
-   single-node, in-memory model.
+   `mark_splits_for_deletion`, `delete_splits` and `update_splits_delete_opstamp` are WAL appends plus
+   one compare-and-swap per stripe they touch, in the sharded/distributed path and under the existing
+   bounded replay. `FileBackedIndex` stays as the single-node, in-memory model.
 3. **Read path** — **landed**: `list_splits(query)` reads the manifests (in parallel, so all stripes
    share one round trip), prunes the buckets the query's time range cannot touch, and fetches the
    segments that remain plus the WAL tail, so it never builds the whole map.
-4. **Retention** — **landed as promised**: a delete appends a removal record and rewrites nothing;
-   what the layout deletes is superseded segments and WAL objects, per stripe.
+4. **Retention** — **landed as promised**: a delete appends a removal record and rewrites no segment;
+   the bucket's segment is rewritten by the next fold that supersedes it, and what the layout collects
+   is superseded segments and WAL objects, per stripe.
 5. **Migration** — **still open**: an index created in an older layout stays in it. The layout is
    recorded in the index's own objects, so a node reads an index whichever layout created it and the
-   layouts coexist in one prefix; a deployment that wants this layout for an index that already
-   exists rebuilds that index.
-6. **Evidence before wiring it in** — **landed**: round trips and bytes on a real bucket, the conflict
-   rate at N writers, and the fold path's writes, reads and collection, all from
+   layouts coexist in one prefix. What not migrating costs is what the other layouts cost: their reads
+   materialise the whole split map, their mutations reload it and every node holds it in memory, so an
+   index left alone keeps all of that and gets none of this layout's windowed reads. A deployment that
+   wants this layout for an index that already exists rebuilds that index.
+6. **Evidence before wiring it in** — **landed**: latency and bytes per publish on a real bucket, the
+   conflict rate at N writers, and the fold path's writes, reads and collection, all from
    `quickwit-metastore/tests/s3_shared_metastore.rs`; the shared metastore suite runs on this layout
-   next to the other two (`.github/workflows/ci.yml`, `QW_METASTORE_TEST_MANIFEST_LAYOUT`).
+   next to the other two (`.github/workflows/ci.yml`, `QW_METASTORE_TEST_MANIFEST_LAYOUT`). The round
+   trips stay counted by the spike above, which is where that number comes from.
 
-One contract is invisible in every number above, and a merge is the operation that depends on it: a
-**multi-product** merge can return the same document twice for as long as its second pass takes to
-commit — it never hides one — while a single-product merge carries its marking in the same
-compare-and-swap as the product it publishes. The mechanism, the two reader-side designs that were
-tried and rejected, and the probes that measured each one are in
+One contract is invisible in every number above, and a merge is the operation that depends on it: in a
+**multi-product** merge the products commit first and the markings after them, so from the commit of
+the first product until the commit of the last marking a reader can return the same document twice —
+it never hides one — while a single-product merge carries its marking in the same compare-and-swap as
+the product it publishes. The mechanism, the two reader-side designs that were tried and rejected, and
+the probes that measured each one are in
 [`metastore-v3-merge-visibility.md`](metastore-v3-merge-visibility.md).
