@@ -340,8 +340,10 @@ impl Shards {
         if let Err(error) = self.checkpoint.check_compatibility(&checkpoint_delta) {
             // A replay carries the delta an earlier attempt of this same writer applied, so the
             // checkpoint is already where the delta would move it: that is done, not incompatible.
-            // The token check above is what makes that safe; a fresh request and a competing writer
-            // both keep getting the error below.
+            // What makes that safe is the proof the caller asked for before it passed
+            // `tolerate_already_applied`; the token check above is a necessary condition (the
+            // caller still holds the shard), not ownership of the delta. A fresh request, a
+            // competing writer and a takeover all keep getting the error below.
             if tolerate_already_applied && self.checkpoint.contains_delta(&checkpoint_delta) {
                 return Ok(MutationOccurred::No(()));
             }

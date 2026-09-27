@@ -345,9 +345,11 @@ impl SourceCheckpoint {
     /// so a replay asks this first and skips the application instead.
     ///
     /// Hidden contract: the positions say *a* delta moved the checkpoint here, not *whose* delta it
-    /// was. A caller therefore only asks this once it has a proof that the publish is its own — see
-    /// `publish_splits_with_retry_tolerance`, which requires the splits of the request to be
-    /// published already, on both delta paths.
+    /// was. A caller therefore only asks this once it knows what skipping means: either the publish
+    /// is provably its own (the splits it publishes are published already, which only its earlier
+    /// attempt can have done) or the request changes no split state at all, so skipping an applied
+    /// delta is a no-op. Both delta paths are gated on that — see
+    /// `publish_splits_with_retry_tolerance`.
     pub fn contains_delta(&self, delta: &SourceCheckpointDelta) -> bool {
         delta
             .per_partition
