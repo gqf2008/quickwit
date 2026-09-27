@@ -817,7 +817,9 @@ async fn test_sharded_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
         ROUNDS * SPLITS_PER_ROUND,
         "the splits must survive the folds"
     );
-    // A window the splits cannot fall in is pruned by the segment's own time range.
+    // A window the splits cannot fall in is filtered out by the split's own time range. (This
+    // layout has no segment-level time pruning to test: the manifest layout's fold test asserts
+    // that, and its segments carry a time range this one does not.)
     let other_window = ListSplitsQuery::for_index(index_uid.clone())
         .with_time_range_start_gte(0)
         .with_time_range_end_lt(3_600);
