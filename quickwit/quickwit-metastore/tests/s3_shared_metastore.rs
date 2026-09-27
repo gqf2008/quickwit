@@ -683,6 +683,164 @@ async fn test_manifest_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The sharded layout's fold, against a bucket rather than against RAM.
+///
+/// A slot folds once its file holds 512 entries, so an index created with a single slot folds on
+/// its first batch of 600 splits: the segment has to land under that slot's own directory, the
+/// splits have to stay readable from it, and the folds that follow have to collect the generations
+/// outside the grace period. Folding is a compare-and-swap on the view and a delete of the
+/// superseded segments, which is exactly the part that has to be seen against a bucket.
+#[tokio::test]
+async fn test_sharded_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!("skipping test_sharded_layout_fold_on_s3_endpoint: QW_S3_ENDPOINT is not set");
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/sharded-fold", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    // One slot: every split of a batch hashes into it, so the batch itself is what makes the slot
+    // fold, the way one stripe does in the manifest layout's own fold test.
+    metastore.set_index_layout(IndexLayout::Sharded { num_slots: 1 });
+    let index_id = append_random_suffix("sharded-fold-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid = metastore
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+
+    const ROUNDS: usize = 3;
+    const SPLITS_PER_ROUND: usize = 600;
+    for round in 0..ROUNDS {
+        let splits_metadata: Vec<SplitMetadata> = (0..SPLITS_PER_ROUND)
+            .map(|index| SplitMetadata {
+                footer_offsets: 0..10,
+                split_id: format!("sharded-fold-{round}-{index}").into(),
+                num_docs: 1,
+                time_range: Some(1_700_000_000..=1_700_000_060),
+                ..Default::default()
+            })
+            .collect();
+        let staged_split_ids: Vec<String> = splits_metadata
+            .iter()
+            .map(|split_metadata| split_metadata.split_id.to_string())
+            .collect();
+        metastore
+            .stage_splits(StageSplitsRequest::try_from_splits_metadata(
+                index_uid.clone(),
+                splits_metadata,
+            )?)
+            .await?;
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids,
+                ..Default::default()
+            })
+            .await?;
+    }
+
+    // The segments of that one slot, and only those: one per fold, two kept once the collection has
+    // run — the generations the grace period covers.
+    let segments = object_snapshot(
+        &*storage,
+        Path::new(&format!("{index_id}/v2/splits/segments/00000")),
+    )
+    .await?;
+    assert_eq!(
+        segments.len(),
+        2,
+        "the folds write one segment each, and the collection keeps the two the grace period \
+         covers: {:?}",
+        segments.keys()
+    );
+    // The view's bookmark for that slot records what the fold took over: the highest sequence it
+    // folded and the version of the slot file it folded. A reader that lists that same version
+    // skips the file without downloading it, which is why the file itself still holds the batch.
+    let view = storage
+        .get_all(Path::new(&format!("{index_id}/v2/splits/view.json")))
+        .await?;
+    let view: serde_json::Value = serde_json::from_slice(&view)?;
+    let view_generation = view["generation"].as_u64().unwrap_or(0);
+    assert!(
+        view_generation >= 1,
+        "the batches crossed the fold threshold, so the view moved on: generation \
+         {view_generation}"
+    );
+    let bookmarks = view["slots"]
+        .as_object()
+        .expect("the view names the slots it folded");
+    assert_eq!(
+        bookmarks.len(),
+        1,
+        "only the slot that folded is in the view"
+    );
+    let bookmark = bookmarks.get("0").expect("slot 0 is the only slot");
+    let folded_seq = bookmark["folded_seq"].as_u64().unwrap_or(0);
+    assert!(
+        // Staging a split writes one entry and publishing it another, so a batch of splits writes
+        // two entries per split; what matters here is that the folds took over at least the
+        // publishing of every one of them.
+        folded_seq >= (ROUNDS * SPLITS_PER_ROUND) as u64,
+        "every split the batches published has to be folded, and the folds reached {folded_seq}"
+    );
+    assert!(
+        bookmark["segment"].as_str().is_some(),
+        "the bookmark has to name the segment that holds the folded snapshot"
+    );
+    let slot_file = storage
+        .get_all(Path::new(&format!("{index_id}/v2/splits/slots/00000.json")))
+        .await?;
+    let slot_file: serde_json::Value = serde_json::from_slice(&slot_file)?;
+    let slot_file_generation = slot_file["base_generation"].as_u64().unwrap_or(u64::MAX);
+    assert!(
+        // The last write to the slot happened before the last fold took it over, so the file is
+        // written against that view or an older one — never against a newer one, which is what
+        // would make a reader's view stale.
+        slot_file_generation <= view_generation,
+        "the slot file was written against generation {slot_file_generation}, the view is at \
+         {view_generation}"
+    );
+
+    // Every split is still readable, from the segments the folds wrote.
+    let window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(1_699_999_000)
+        .with_time_range_end_lt(1_700_010_000);
+    let split_ids = metastore
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(&window)?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert_eq!(
+        split_ids.len(),
+        ROUNDS * SPLITS_PER_ROUND,
+        "the splits must survive the folds"
+    );
+    // A window the splits cannot fall in is pruned by the segment's own time range.
+    let other_window = ListSplitsQuery::for_index(index_uid.clone())
+        .with_time_range_start_gte(0)
+        .with_time_range_end_lt(3_600);
+    let other_split_ids = metastore
+        .list_splits(ListSplitsRequest::try_from_list_splits_query(
+            &other_window,
+        )?)
+        .await?
+        .collect_split_ids()
+        .await?;
+    assert!(
+        other_split_ids.is_empty(),
+        "a window outside the segment must be pruned"
+    );
+
+    metastore
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    Ok(())
+}
+
 /// What the reads that need no split data cost on a real endpoint, cold and warm.
 ///
 /// The meta question behind the manifest layout is how much of an index a read has to touch. A
