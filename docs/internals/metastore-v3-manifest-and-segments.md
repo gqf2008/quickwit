@@ -101,39 +101,52 @@ stripes hit the rate with no conflicts at all, at the minimum of three storage c
 of the port, not an optimisation; `objsearch`'s group commit is the alternative for a single-writer
 process, and it is not available to independent Quickwit nodes.
 
-Two things the spike still does **not** settle, and that a production port has to:
+Both things this spike could not settle are settled by the port that followed, so the spike is now
+the first measurement of the shape rather than a list of what is missing:
 
-1. **How many stripes**, and how a reader finds them: eight was enough for five writers at 12/s, but
-   the count has to be a function of the writer count and the round trip, and a reader has to
-   discover the stripes cheaply (one `list`, or a fixed count known from the manifest).
-2. **The metastore above the storage.** `mutate_distributed` today loads the whole index, applies a
-   closure and writes it back; `list_splits` collects everything matching. Those two call sites are
-   what force `O(index)` — the layout alone does not remove them. The port has to turn the split
-   path into operations (`stage`/`publish`/`mark for deletion`/`delete` as WAL records,
-   `list_splits(query)` as manifest + pruned segments) before any of the numbers above become the
-   metastore's numbers.
+1. **How many stripes**, and how a reader finds them: the count is set per index by
+   `QW_METASTORE_MANIFEST_STRIPES` (default 32, sized from the writer count) and is recorded, with the
+   bucket width, in the index's own layout, so a reader learns it from the index metadata instead of
+   discovering it with a `list`.
+2. **The metastore above the storage.** The five split mutations and `list_splits(query)` are WAL
+   appends plus one manifest compare-and-swap and a pruned read (`manifest_layout.rs::publish_ops`,
+   `ManifestLayout::list_splits`), so the numbers above are the metastore's numbers and not only the
+   layout's.
 
-## Porting plan
+## Porting plan, item by item
 
-Landed in batch-27: the layout module, the pruned read path, and the subset mutation path (a
-publish/can stage/mark/delete reads only the splits it names, through the id ranges the manifests carry,
-and runs the same mutation closure as the other layouts). The rest of this plan is what is left.
+The plan below was written before the port; this is where each item stands, so that the spike above is
+not mistaken for the implementation. The operator's view of the same layout, with the numbers a
+deployment sizes from, is `docs/operating/shared-metastore.md`.
 
-1. **Layout module** (`file_backed/manifest_layout.rs`): manifest, WAL objects, per-time-bucket segments,
-   fold, and the windowed read — essentially the spike, hardened (format version, GC of superseded
-   segments, torn-write handling as in `LESSON_条件写失败后不得清理自己写的对象.md`). Segments and
-   WAL objects belong to the stripe that wrote them, in its own directory, and are collected against
-   that stripe's own fold generation: stripes fold at different rates, so a shared watermark either
-   collects what a slow stripe is still reading or never collects at all while one stripe of the
-   index has not folded yet.
-2. **Split operations** (`file_backed/`): `stage_splits`, `publish_splits`, `mark_splits_for_deletion`,
-   `delete_splits` become WAL appends plus one manifest CAS in the sharded/distributed path, with the
-   existing bounded replay. `FileBackedIndex` stays as the single-node, in-memory model.
-3. **Read path**: `list_splits(query)` reads the manifest, prunes buckets by the query's time range
-   (and by state), streams the matching segments plus the WAL tail, and never builds the whole map.
-4. **Retention**: deleting a bucket is dropping references and deleting objects — no rewrite.
-5. **Migration**: an existing single-object index is folded into segments once, by a reader that can
-   write; the legacy object stays readable until the fold is committed.
-6. **Evidence before wiring it in**: the same three measurements as above on a real bucket
-   (round trips and bytes), a conflict-rate measurement at N writers, and the shared metastore suite
-   run on the new layout the way it now runs on the sharded one.
+1. **Layout module** (`file_backed/manifest_layout.rs`) — **landed**: manifest, WAL objects,
+   per-time-bucket segments, fold and the windowed read, hardened with a format version, torn-write
+   handling as in `LESSON_条件写失败后不得清理自己写的对象.md`, and the collection of superseded
+   segments and WAL objects against the stripe's own fold generation: segments and WAL objects belong
+   to the stripe that wrote them, in its own directory, because stripes fold at different rates and a
+   shared watermark would either collect what a slow stripe is still reading or never collect at all
+   while one stripe of the index has not folded yet.
+2. **Split operations** (`file_backed/`) — **landed**: `stage_splits`, `publish_splits`,
+   `mark_splits_for_deletion` and `delete_splits` are WAL appends plus one manifest compare-and-swap in
+   the sharded/distributed path, with the existing bounded replay. `FileBackedIndex` stays as the
+   single-node, in-memory model.
+3. **Read path** — **landed**: `list_splits(query)` reads the manifests (in parallel, so all stripes
+   share one round trip), prunes the buckets the query's time range cannot touch, and fetches the
+   segments that remain plus the WAL tail, so it never builds the whole map.
+4. **Retention** — **landed as promised**: a delete appends a removal record and rewrites nothing;
+   what the layout deletes is superseded segments and WAL objects, per stripe.
+5. **Migration** — **still open**: an index created in an older layout stays in it. The layout is
+   recorded in the index's own objects, so a node reads an index whichever layout created it and the
+   layouts coexist in one prefix; a deployment that wants this layout for an index that already
+   exists rebuilds that index.
+6. **Evidence before wiring it in** — **landed**: round trips and bytes on a real bucket, the conflict
+   rate at N writers, and the fold path's writes, reads and collection, all from
+   `quickwit-metastore/tests/s3_shared_metastore.rs`; the shared metastore suite runs on this layout
+   next to the other two (`.github/workflows/ci.yml`, `QW_METASTORE_TEST_MANIFEST_LAYOUT`).
+
+One contract is invisible in every number above, and a merge is the operation that depends on it: a
+**multi-product** merge can return the same document twice for as long as its second pass takes to
+commit — it never hides one — while a single-product merge carries its marking in the same
+compare-and-swap as the product it publishes. The mechanism, the two reader-side designs that were
+tried and rejected, and the probes that measured each one are in
+[`metastore-v3-merge-visibility.md`](metastore-v3-merge-visibility.md).
