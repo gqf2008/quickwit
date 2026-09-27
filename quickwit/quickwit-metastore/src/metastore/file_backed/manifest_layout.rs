@@ -66,7 +66,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::file_backed_index::FileBackedIndex;
-use crate::Split;
+use crate::{Split, SplitState};
 
 /// Version of the objects written by this layout. A reader refuses what it does not know.
 pub(crate) const MANIFEST_LAYOUT_FORMAT_VERSION: u32 = 1;
@@ -260,6 +260,18 @@ struct StripeManifest {
     wal_ops: usize,
     /// Bucket width in seconds; a layout constant recorded here so a reader can prune.
     bucket_secs: i64,
+    /// Splits marked for deletion by a merge published out of *this* stripe, before the stripes
+    /// that own them recorded it themselves.
+    ///
+    /// This is what makes a merge visible to a reader in one step: the split a merge creates may
+    /// live in another stripe than the splits it replaces, and the marking of those splits is
+    /// written here, in the same compare-and-swap that publishes the split, so a reader sees both
+    /// or neither. It is a *mark*, not a record: it only changes the state of a split that the
+    /// reader already found, so it can never bring back a split that was deleted, and it does
+    /// not have to survive a fold — the stripe that owns the split records the real state a
+    /// moment later, and the mutation clears these entries as soon as it has.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pending_marks: BTreeSet<SplitId>,
 }
 
 impl StripeManifest {
@@ -272,6 +284,7 @@ impl StripeManifest {
             wal: Vec::new(),
             wal_ops: 0,
             bucket_secs,
+            pending_marks: BTreeSet::new(),
         }
     }
 }
@@ -873,13 +886,129 @@ impl ManifestLayout {
                 .or_default()
                 .push(op);
         }
-        for (stripe, ops) in per_stripe {
-            self.publish(storage, stripe, ops).await?;
+        // A merge publishes a split and marks the splits it replaces, and those two things reach
+        // different stripes. Committing them one stripe at a time would leave a state a reader
+        // cannot resolve on its own: the product alone duplicates the documents, the marking alone
+        // hides them. So the markings ride in the batch of the split the mutation publishes: they
+        // become visible with it, in one commit, whatever window a reader asks about. The stripes
+        // that own the marked splits still commit their own copy afterwards, which is what a point
+        // read (`get_splits_by_id`) sees.
+        //
+        // Hidden contract: the copies are only ever `MarkedForDeletion` records. A published split
+        // is never copied into another stripe, because a copy of it would outlive the split itself
+        // and bring it back after a deletion.
+        let mut created_stripes: Vec<usize> = per_stripe
+            .iter()
+            .filter(|(_, ops)| {
+                ops.iter().any(|op| {
+                    matches!(&op.split, Some(split) if split.split_state == SplitState::Published)
+                })
+            })
+            .map(|(stripe, _)| *stripe)
+            .collect();
+        created_stripes.sort_unstable();
+
+        // What a reader can catch halfway is decided here.
+        //
+        // One product: the marking of the splits it replaces is written as a *mark* in the same
+        // compare-and-swap that publishes it (`StripeManifest::pending_marks`), so a reader sees
+        // the product and the marking together, in any window. A mark only changes the
+        // state of a split the reader already found, so it cannot bring back a deleted one,
+        // and the mutation clears it as soon as the stripes that own the splits recorded
+        // the marking themselves.
+        //
+        // Several products: no single compare-and-swap carries all of them, so the markings are
+        // committed in a second pass, after every product. A reader in between sees the products
+        // with the splits they replace still published, which costs duplicated hits for as long as
+        // that takes — the alternative would hide documents, and a reader cannot recover those.
+        let one_product = created_stripes.len() <= 1;
+        let copy_stripe_opt = created_stripes.last().copied();
+        let mut batches: Vec<(usize, Vec<SplitOp>, BTreeSet<SplitId>)> = Vec::new();
+        if one_product {
+            let mut pending_marks: BTreeSet<SplitId> = BTreeSet::new();
+            if let Some(copy_stripe) = copy_stripe_opt {
+                for op in per_stripe.values().flatten() {
+                    let Some(split) = op.split.as_ref() else {
+                        continue;
+                    };
+                    if split.split_state != SplitState::MarkedForDeletion {
+                        continue;
+                    }
+                    if self.stripe_of(op.split_id.as_str()) == copy_stripe {
+                        // The marking is in the stripe of the product already.
+                        continue;
+                    }
+                    pending_marks.insert(op.split_id.clone());
+                }
+            }
+            let mut stripe_order: Vec<usize> = (0..self.num_stripes).collect();
+            stripe_order.sort_by_key(|stripe| Some(*stripe) != copy_stripe_opt);
+            for stripe in stripe_order {
+                let Some(ops) = per_stripe.remove(&stripe) else {
+                    continue;
+                };
+                let marks = if Some(stripe) == copy_stripe_opt {
+                    pending_marks.clone()
+                } else {
+                    BTreeSet::new()
+                };
+                batches.push((stripe, ops, marks));
+            }
+        } else {
+            let mut first_pass: BTreeMap<usize, Vec<SplitOp>> = BTreeMap::new();
+            let mut second_pass: BTreeMap<usize, Vec<SplitOp>> = BTreeMap::new();
+            for (stripe, ops) in per_stripe {
+                for op in ops {
+                    let is_marking = matches!(&op.split, Some(split)
+                        if split.split_state == SplitState::MarkedForDeletion);
+                    if is_marking {
+                        second_pass.entry(stripe).or_default().push(op);
+                    } else {
+                        first_pass.entry(stripe).or_default().push(op);
+                    }
+                }
+            }
+            batches.extend(
+                first_pass
+                    .into_iter()
+                    .map(|(stripe, ops)| (stripe, ops, BTreeSet::new())),
+            );
+            batches.extend(
+                second_pass
+                    .into_iter()
+                    .map(|(stripe, ops)| (stripe, ops, BTreeSet::new())),
+            );
+        }
+        let mut written_marks: BTreeSet<SplitId> = BTreeSet::new();
+        let mut marked_stripe_opt = None;
+        for (stripe, ops, marks) in batches {
+            if !marks.is_empty() {
+                written_marks.extend(marks.iter().cloned());
+                marked_stripe_opt = Some(stripe);
+            }
+            self.publish(storage, stripe, ops, marks).await?;
+        }
+        if !written_marks.is_empty()
+            && let Some(copy_stripe) = marked_stripe_opt
+        {
+            // The stripes that own the marked splits have recorded them by now; these marks are
+            // redundant. Clearing is best effort, and it only removes the ids this mutation wrote:
+            // another mutation may have written its own marks on the same stripe in between.
+            if let Err(error) = self
+                .clear_pending_marks(storage, copy_stripe, &written_marks)
+                .await
+            {
+                warn!(
+                    index_id = %self.index_id,
+                    stripe = copy_stripe,
+                    %error,
+                    "failed to clear the pending marks of a stripe, they stay until the next mutation"
+                );
+            }
         }
         Ok(())
     }
 
-    /// Every split of the index, read from the segments and the WAL tail.
     pub(crate) async fn load_split_map(
         &self,
         storage: &dyn Storage,
@@ -1017,11 +1146,13 @@ impl ManifestLayout {
         storage: &dyn Storage,
         stripe: usize,
         ops: Vec<SplitOp>,
+        pending_marks: BTreeSet<SplitId>,
     ) -> MetastoreResult<()> {
-        if ops.is_empty() {
+        if ops.is_empty() && pending_marks.is_empty() {
             return Ok(());
         }
         let (mut manifest, version) = self.read_manifest(storage, stripe).await?;
+        manifest.pending_marks.extend(pending_marks);
         let object_id = Uuid::new_v4().to_string();
         // The object is named after the fold generation that will take it over, which is what lets
         // the collection of a later fold tell an old WAL object from a live one. It is *not* the
@@ -1080,6 +1211,37 @@ impl ManifestLayout {
         Ok(())
     }
 
+    /// Clears the pending marks of a stripe, once the stripes that own the splits have recorded the
+    /// marking themselves.
+    ///
+    /// Hidden contract: only the ids this mutation wrote are removed. Another mutation may have
+    /// written its own marks on the same stripe in between, and those are still doing their job.
+    ///
+    /// Best effort by contract: a mark that survives only marks a split that is present anyway, and
+    /// the mutation that wrote it is the one that removes it a moment later.
+    async fn clear_pending_marks(
+        &self,
+        storage: &dyn Storage,
+        stripe: usize,
+        written: &BTreeSet<SplitId>,
+    ) -> MetastoreResult<()> {
+        let (mut manifest, version) = self.read_manifest(storage, stripe).await?;
+        if !manifest.pending_marks.iter().any(|id| written.contains(id)) {
+            return Ok(());
+        }
+        manifest.pending_marks.retain(|id| !written.contains(id));
+        manifest.epoch += 1;
+        storage
+            .put_if_version_matches(
+                &self.manifest_path(stripe),
+                Box::new(serde_utils::to_json_bytes(&manifest)?),
+                &version,
+            )
+            .await
+            .map_err(|error| map_storage_error(&self.index_id, error))?;
+        Ok(())
+    }
+
     /// Folds the WAL tail of one stripe into one segment per time bucket, then commits once.
     pub(crate) async fn fold(&self, storage: &dyn Storage, stripe: usize) -> MetastoreResult<bool> {
         let (mut manifest, version) = self.read_manifest(storage, stripe).await?;
@@ -1096,6 +1258,14 @@ impl ManifestLayout {
                 .map_err(|error| map_storage_error(&self.index_id, error))?;
             let wal: WalBatch = serde_utils::from_json_bytes(&bytes)?;
             for op in wal.ops {
+                // A copy of another stripe's marking is only there to make that marking visible
+                // together with the split the mutation published. Folding it into this stripe would
+                // keep it in a segment after the split it marks was deleted, where it would bring
+                // the split back into every later read. The stripe that owns the split records the
+                // real state, so the copy is dropped once a fold takes over the batch.
+                if self.stripe_of(op.split_id.as_str()) != stripe {
+                    continue;
+                }
                 let bucket = match &op.split {
                     Some(split) => self.bucket_of(split),
                     // A removal goes to the bucket holding the split it removes. That split is
@@ -1355,7 +1525,7 @@ impl ManifestLayout {
             // An empty window: `to - 1` below would underflow, and there is nothing to return.
             return Ok(Vec::new());
         }
-        let mut splits = BTreeMap::new();
+        let mut splits: BTreeMap<SplitId, Split> = BTreeMap::new();
         // One round trip per stripe is the floor of this layout, so they are fetched together:
         // eight manifests in sequence turn a windowed read into eight times the bucket's
         // round trip.
@@ -1401,9 +1571,22 @@ impl ManifestLayout {
                 Ok::<_, MetastoreError>(wal)
             }))
             .await?;
+        let mut removed: BTreeSet<SplitId> = BTreeSet::new();
         for wal in wal_batches {
             for op in wal.ops {
-                apply_op(&mut splits, op);
+                apply_op(&mut splits, &mut removed, op);
+            }
+        }
+        // The marks a merge wrote with the split it published: they only change the state of a
+        // split the reader found, so they cannot resurrect a deleted one, and they are read from
+        // the manifests, which are read in full whatever the window.
+        for (manifest, _) in &manifests {
+            for split_id in &manifest.pending_marks {
+                if let Some(split) = splits.get_mut(split_id)
+                    && split.split_state == SplitState::Published
+                {
+                    split.split_state = SplitState::MarkedForDeletion;
+                }
             }
         }
         Ok(splits
@@ -1459,6 +1642,10 @@ impl ManifestLayout {
     }
 }
 
+/// Applies the operations of one stripe to the splits of one segment of that stripe.
+///
+/// The operations are the stripe's own tail, in the order its manifest names it, so the last one
+/// wins and no timestamp comparison is needed here.
 fn apply_ops(splits: &mut Vec<Split>, ops: Vec<SplitOp>) {
     let mut current: BTreeMap<SplitId, Split> = splits
         .drain(..)
@@ -1477,12 +1664,48 @@ fn apply_ops(splits: &mut Vec<Split>, ops: Vec<SplitOp>) {
     splits.extend(current.into_values());
 }
 
-fn apply_op(splits: &mut BTreeMap<SplitId, Split>, op: SplitOp) {
+/// Rank of a state in the one-way lifecycle of a split: `Staged` → `Published` →
+/// `MarkedForDeletion`, and then gone.
+///
+/// It is what resolves the two records a split can have at once: a merge publishes the split it
+/// creates together with the marking of the splits it replaces (see `publish_ops`), so a copy of a
+/// marked split lives in the stripe of that product as well as in its own. The update timestamp
+/// would be the natural thing to compare, but Quickwit records it in seconds and the two records
+/// are written within the same second, so ties are the common case and the stripe order — which
+/// says nothing about which record is newer — would decide. The state is monotone, so it decides
+/// instead.
+fn state_rank(split: &Split) -> u8 {
+    match split.split_state {
+        SplitState::Staged => 0,
+        SplitState::Published => 1,
+        SplitState::MarkedForDeletion => 2,
+    }
+}
+
+/// Applies one operation to a split map assembled from every stripe.
+///
+/// Hidden contracts: the same split can appear in more than one stripe, in which case the record
+/// furthest along its lifecycle wins (see `state_rank`), and a deletion is final for the read — a
+/// split id is never reused, so a marking copy must not bring back a split that was deleted.
+fn apply_op(splits: &mut BTreeMap<SplitId, Split>, removed: &mut BTreeSet<SplitId>, op: SplitOp) {
     match op.split {
         Some(split) => {
-            splits.insert(op.split_id, split);
+            // A deletion is final: a copy of the split may sit in the stripe of the product that
+            // replaced it, and that stripe can be read after the one the deletion was written to.
+            // A split id is never reused, so a removed id cannot come back in this read.
+            if removed.contains(&op.split_id) {
+                return;
+            }
+            let wins = splits
+                .get(&op.split_id)
+                .map(|current| state_rank(&split) >= state_rank(current))
+                .unwrap_or(true);
+            if wins {
+                splits.insert(op.split_id, split);
+            }
         }
         None => {
+            removed.insert(op.split_id.clone());
             splits.remove(&op.split_id);
         }
     }
@@ -2349,6 +2572,403 @@ mod tests {
         assert!(
             error.to_string().contains("neither the tail nor a segment"),
             "unexpected error: {error}"
+        );
+    }
+
+    fn split_id_in_stripe(layout: &ManifestLayout, stripe: usize, prefix: &str) -> SplitId {
+        (0..)
+            .map(|candidate| SplitId::from(format!("{prefix}-{candidate}")))
+            .find(|split_id| layout.stripe_of(split_id.as_str()) == stripe)
+            .unwrap()
+    }
+
+    fn split_at(
+        split_id: &SplitId,
+        time_range: Option<std::ops::RangeInclusive<i64>>,
+        timestamp: i64,
+    ) -> Split {
+        Split {
+            split_state: SplitState::Published,
+            update_timestamp: timestamp,
+            publish_timestamp: None,
+            split_metadata: SplitMetadata {
+                time_range,
+                ..SplitMetadata::for_test(split_id.clone())
+            },
+        }
+    }
+
+    fn op_for(split: Split) -> SplitOp {
+        SplitOp {
+            split_id: split.split_id().clone(),
+            split: Some(split),
+        }
+    }
+
+    fn marking_op(split: Split) -> SplitOp {
+        SplitOp {
+            split_id: split.split_id().clone(),
+            split: Some(Split {
+                split_state: SplitState::MarkedForDeletion,
+                ..split
+            }),
+        }
+    }
+
+    /// A record further along the lifecycle wins, whatever the timestamps say: Quickwit records
+    /// them in seconds, so the two records of one split are usually written in the same second.
+    #[test]
+    fn test_apply_op_lets_the_furthest_state_win() {
+        let split_id = SplitId::from("split");
+        let mut splits: BTreeMap<SplitId, Split> =
+            BTreeMap::from([(split_id.clone(), split_at(&split_id, None, 900))]);
+        let mut removed = BTreeSet::new();
+        apply_op(
+            &mut splits,
+            &mut removed,
+            marking_op(split_at(&split_id, None, 10)),
+        );
+        assert_eq!(splits[&split_id].split_state, SplitState::MarkedForDeletion);
+    }
+
+    /// A deletion is final for the read: no later record of that id brings it back.
+    #[test]
+    fn test_apply_op_never_restores_a_removed_split() {
+        let split_id = SplitId::from("split");
+        let mut splits: BTreeMap<SplitId, Split> =
+            BTreeMap::from([(split_id.clone(), split_at(&split_id, None, 10))]);
+        let mut removed = BTreeSet::new();
+        apply_op(
+            &mut splits,
+            &mut removed,
+            SplitOp {
+                split_id: split_id.clone(),
+                split: None,
+            },
+        );
+        apply_op(
+            &mut splits,
+            &mut removed,
+            op_for(split_at(&split_id, None, 99)),
+        );
+        assert!(!splits.contains_key(&split_id));
+    }
+
+    /// The marking of the splits a merge replaces is written as a mark in the same compare-and-swap
+    /// that publishes the split, so a reader sees both or neither — whatever the stripes.
+    #[tokio::test]
+    async fn test_a_half_committed_merge_is_visible_consistently() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        // The window-covered source lives in the stripe whose commit fails, the product in the
+        // other one: the state a reader sees cannot come from the source's own commit.
+        let source_a_id = split_id_in_stripe(&layout, 1, "source-a");
+        let source_b_id = split_id_in_stripe(&layout, 0, "source-b");
+        let product_id = split_id_in_stripe(&layout, 0, "product");
+        let time_range = Some(1_700_000_000..=1_700_000_060);
+        let source_a = split_at(&source_a_id, time_range.clone(), 10);
+        let source_b = split_at(&source_b_id, time_range.clone(), 10);
+        publish_and_fold(&layout, &storage, vec![source_a.clone(), source_b.clone()]).await;
+
+        test_hooks::fail_next_commit_for_stripe(layout.stripe_of(source_a_id.as_str()));
+        let result = layout
+            .publish_ops(
+                &storage,
+                vec![
+                    op_for(split_at(&product_id, time_range.clone(), 20)),
+                    marking_op(split_at(&source_a_id, time_range.clone(), 21)),
+                    marking_op(split_at(&source_b_id, time_range.clone(), 21)),
+                ],
+            )
+            .await;
+        assert!(result.is_err(), "the mutation was supposed to stop halfway");
+
+        let listed = layout
+            .list_splits(&storage, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+        let published: Vec<String> = listed
+            .iter()
+            .filter(|split| split.split_state == SplitState::Published)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        let marked: Vec<String> = listed
+            .iter()
+            .filter(|split| split.split_state == SplitState::MarkedForDeletion)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert_eq!(
+            published,
+            vec![product_id.to_string()],
+            "half a merge must show the product and nothing else as published"
+        );
+        assert_eq!(
+            marked.len(),
+            2,
+            "both replaced splits must be marked: {marked:?}"
+        );
+    }
+
+    /// The same state read through a window that only covers one bucket: the mark is read from the
+    /// manifest, which no window prunes, so the answer is still one copy of each document.
+    #[tokio::test]
+    async fn test_a_windowed_read_of_a_half_committed_merge_sees_one_copy() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let source_a_id = split_id_in_stripe(&layout, 1, "source-a");
+        let source_b_id = split_id_in_stripe(&layout, 0, "source-b");
+        let product_id = split_id_in_stripe(&layout, 0, "product");
+        let early = 1_000_000..=1_000_060;
+        let late = 1_700_000_000..=1_700_000_060;
+        let source_a = split_at(&source_a_id, Some(early.clone()), 10);
+        let source_b = split_at(&source_b_id, Some(late.clone()), 10);
+        publish_and_fold(&layout, &storage, vec![source_a.clone(), source_b.clone()]).await;
+
+        // The commit of the stripe that owns the window-covered source fails.
+        test_hooks::fail_next_commit_for_stripe(layout.stripe_of(source_a_id.as_str()));
+        let _ = layout
+            .publish_ops(
+                &storage,
+                vec![
+                    op_for(split_at(
+                        &product_id,
+                        Some(early.start().to_owned()..=late.end().to_owned()),
+                        20,
+                    )),
+                    marking_op(split_at(&source_a_id, Some(early), 21)),
+                    marking_op(split_at(&source_b_id, Some(late.clone()), 21)),
+                ],
+            )
+            .await;
+
+        let windowed = layout
+            .list_splits(&storage, 999_000, 1_001_000)
+            .await
+            .unwrap();
+        let visible: Vec<String> = windowed
+            .iter()
+            .filter(|split| split.split_state == SplitState::Published)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert_eq!(
+            visible,
+            vec![product_id.to_string()],
+            "a windowed read of a half-committed merge must not return the product and its source"
+        );
+        let marked: Vec<String> = windowed
+            .iter()
+            .filter(|split| split.split_state == SplitState::MarkedForDeletion)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![source_a_id.to_string()],
+            "the replaced split of this window has to be marked, even though its own stripe did \
+             not commit: {marked:?}"
+        );
+    }
+
+    /// The stripes that own the marked splits record it themselves, which is what a point read
+    /// sees, and the marks are cleared once they have.
+    #[tokio::test]
+    async fn test_the_owner_stripe_records_the_marking_and_the_marks_are_cleared() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let source_id = split_id_in_stripe(&layout, 1, "source");
+        let product_id = split_id_in_stripe(&layout, 0, "product");
+        let time_range = Some(1_700_000_000..=1_700_000_060);
+        publish_and_fold(
+            &layout,
+            &storage,
+            vec![split_at(&source_id, time_range.clone(), 10)],
+        )
+        .await;
+        layout
+            .publish_ops(
+                &storage,
+                vec![
+                    op_for(split_at(&product_id, time_range.clone(), 20)),
+                    marking_op(split_at(&source_id, time_range.clone(), 21)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let found = layout
+            .get_splits_by_id(&storage, std::slice::from_ref(&source_id))
+            .await
+            .unwrap();
+        let source = found.get(&source_id).expect("the split is still there");
+        assert_eq!(source.split_state, SplitState::MarkedForDeletion);
+        let (manifest, _) = layout
+            .read_manifest(&storage, layout.stripe_of(product_id.as_str()))
+            .await
+            .unwrap();
+        assert!(
+            manifest.pending_marks.is_empty(),
+            "the marks are redundant once the owner recorded them: {:?}",
+            manifest.pending_marks
+        );
+    }
+
+    /// A split deleted after the marking landed must not come back, and folding only the stripe
+    /// that owns it (the stripe of the product may stay unfolded) must not change that.
+    #[tokio::test]
+    async fn test_a_deleted_split_does_not_come_back_when_only_the_owner_stripe_folds() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let source_id = split_id_in_stripe(&layout, 1, "source");
+        let product_id = split_id_in_stripe(&layout, 0, "product");
+        let time_range = Some(1_700_000_000..=1_700_000_060);
+        publish_and_fold(
+            &layout,
+            &storage,
+            vec![split_at(&source_id, time_range.clone(), 10)],
+        )
+        .await;
+        // The merge publishes the product and marks the source.
+        layout
+            .publish_ops(
+                &storage,
+                vec![
+                    op_for(split_at(&product_id, time_range.clone(), 20)),
+                    marking_op(split_at(&source_id, time_range.clone(), 21)),
+                ],
+            )
+            .await
+            .unwrap();
+        // The janitor deletes it.
+        layout
+            .publish_ops(
+                &storage,
+                vec![SplitOp {
+                    split_id: source_id.clone(),
+                    split: None,
+                }],
+            )
+            .await
+            .unwrap();
+        // Only the stripe that owns the split is folded: the stripe of the product keeps its
+        // (already cleared, but even an uncleared one would be inert) state.
+        for round in 0..40 {
+            layout
+                .publish_ops(
+                    &storage,
+                    vec![op_for(split_at(
+                        &split_id_in_stripe(&layout, 1, &format!("filler-{round}")),
+                        time_range.clone(),
+                        100 + round,
+                    ))],
+                )
+                .await
+                .unwrap();
+        }
+        layout
+            .fold(&storage, layout.stripe_of(source_id.as_str()))
+            .await
+            .unwrap();
+
+        let listed = layout
+            .list_splits(&storage, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+        let listed_ids: Vec<String> = listed
+            .iter()
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert!(
+            !listed_ids.contains(&source_id.to_string()),
+            "a deleted split must not come back when only its own stripe folds: {listed_ids:?}"
+        );
+    }
+
+    /// Several products cannot all be atomic with the marking of the splits they replace, so the
+    /// marking commits after the last one. What a reader catches in between is the products with
+    /// their sources still published — duplicated hits, never a missing document.
+    #[tokio::test]
+    async fn test_a_multi_product_merge_never_hides_documents() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let source_id = split_id_in_stripe(&layout, 0, "source");
+        let first_product_id = split_id_in_stripe(&layout, 1, "product-a");
+        let last_product_id = split_id_in_stripe(&layout, 1, "product-b");
+        let time_range = Some(1_700_000_000..=1_700_000_060);
+        publish_and_fold(
+            &layout,
+            &storage,
+            vec![split_at(&source_id, time_range.clone(), 10)],
+        )
+        .await;
+
+        test_hooks::fail_next_commit_for_stripe(layout.stripe_of(last_product_id.as_str()));
+        let result = layout
+            .publish_ops(
+                &storage,
+                vec![
+                    op_for(split_at(&first_product_id, time_range.clone(), 20)),
+                    op_for(split_at(&last_product_id, time_range.clone(), 20)),
+                    marking_op(split_at(&source_id, time_range.clone(), 21)),
+                ],
+            )
+            .await;
+        assert!(result.is_err(), "the mutation was supposed to stop halfway");
+
+        let listed = layout
+            .list_splits(&storage, i64::MIN, i64::MAX)
+            .await
+            .unwrap();
+        let published: Vec<String> = listed
+            .iter()
+            .filter(|split| split.split_state == SplitState::Published)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert!(
+            published.contains(&source_id.to_string()),
+            "the split the merge replaces has to stay visible until the marking lands: \
+             {published:?}"
+        );
+    }
+
+    /// The cleanup of a mutation's marks is scoped to the ids that mutation wrote: marks another
+    /// mutation put on the same stripe in the meantime keep doing their job.
+    #[tokio::test]
+    async fn test_clearing_marks_only_removes_the_ids_this_mutation_wrote() {
+        let layout = layout();
+        let storage = RamStorage::default();
+        layout.create(&storage).await.unwrap();
+        let stripe = 0;
+        let (mut manifest, version) = layout.read_manifest(&storage, stripe).await.unwrap();
+        let mine = SplitId::from("mine");
+        let theirs = SplitId::from("theirs");
+        manifest.pending_marks.insert(mine.clone());
+        manifest.pending_marks.insert(theirs.clone());
+        storage
+            .put_if_version_matches(
+                &layout.manifest_path(stripe),
+                Box::new(serde_utils::to_json_bytes(&manifest).unwrap()),
+                &version,
+            )
+            .await
+            .unwrap();
+
+        layout
+            .clear_pending_marks(&storage, stripe, &BTreeSet::from([mine.clone()]))
+            .await
+            .unwrap();
+
+        let (manifest, _) = layout.read_manifest(&storage, stripe).await.unwrap();
+        assert!(
+            !manifest.pending_marks.contains(&mine),
+            "the mutation clears its own mark"
+        );
+        assert!(
+            manifest.pending_marks.contains(&theirs),
+            "another mutation's mark is not this mutation's to clear"
         );
     }
 }
