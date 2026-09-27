@@ -199,8 +199,9 @@ acknowledgement, so sustained ingest throughput is essentially unchanged in this
 acknowledged documents per second on one node, 122 with two nodes) while publication latency grows by
 about one round trip. Two nodes publishing concurrently do not slow each other down; when they rewrite
 the same manifest at the same moment the loser replays its mutation, which costs another round trip:
-15 contended creates had a median of 3.0 s against 1.8–2.1 s uncontended, with 9 replays counted by
-`quickwit_metastore_file_backed_cas_conflicts_total`.
+15 contended creates had a median of 3.0 s against 1.8–2.1 s uncontended, with 9 conflicts counted by
+`quickwit_metastore_file_backed_cas_conflicts_total`, all of them replayed and none exhausting the
+replay budget.
 
 Object storage bills per request, so sharing a metastore means one extra GET per metadata write on
 top of the requests a single-writer node already makes.
