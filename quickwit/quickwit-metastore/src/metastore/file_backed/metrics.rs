@@ -20,12 +20,14 @@
 
 use quickwit_metrics::{LazyCounter, lazy_counter};
 
-/// Number of metadata writes that lost a compare-and-swap race and were replayed.
+/// Number of metadata writes that lost a compare-and-swap race, whether they were replayed after it
+/// or gave up (those are counted again by [`CAS_CONFLICTS_EXHAUSTED_TOTAL`]).
 pub(super) static CAS_CONFLICTS_TOTAL: LazyCounter = lazy_counter!(
     name: "file_backed_cas_conflicts_total",
     description: "Number of file-backed metastore writes that lost a compare-and-swap race (HTTP \
-                  412) and were replayed. Sustained growth means several nodes are writing the \
-                  same metastore prefix.",
+                  412). Most of them were replayed and succeeded; the ones that gave up instead \
+                  are counted again by file_backed_cas_conflicts_exhausted_total. Sustained growth \
+                  means several nodes are writing the same metastore prefix.",
     subsystem: "metastore",
 );
 
