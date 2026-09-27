@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutations that ran out of budget are visible from Prometheus. A third counter, `..._replay_tolerated_splits_total`, counts the
   split state changes a replayed publish found already applied, so the tolerance granted by `is_replay` is
   visible instead of silent. (walgit: `qw-metastore-cas-observability`, `qw-metastore-replay-visibility`)
-- Monitoring: the metastore Grafana dashboard now panels those counters — compare-and-swap conflicts, writes
-  dropped after the replay budget, replayed publishes, manifest and shard folds with their failures, shard
+- Monitoring: the metastore Grafana dashboard now panels those counters — compare-and-swap conflicts, the
+  mutations that failed after the replay budget, replayed publishes, manifest and shard folds with their failures, shard
   objects a reader skipped, and the manifest reads a listing pays for adoption — so a shared object-storage
   metastore's contention, and the mutations that ran out of the replay budget, are visible where an
   operator looks, not only in Prometheus.

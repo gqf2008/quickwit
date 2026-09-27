@@ -33,15 +33,17 @@ pub(super) static CAS_CONFLICTS_TOTAL: LazyCounter = lazy_counter!(
 );
 
 /// Number of mutations that failed after exhausting their replay budget: the caller got an error,
-/// and what it lost depends on the layout (the whole-index layouts lose the write, the manifest
-/// layout has already committed the splits and loses only the index metadata).
+/// and what the mutation left behind depends on the layout and on which commit ran out (the
+/// single-object layout loses the whole write, the sharded one can have written the index root,
+/// and the manifest one has already committed the splits).
 pub(super) static CAS_CONFLICTS_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
     name: "file_backed_cas_conflicts_exhausted_total",
     description: "Number of file-backed metastore mutations that failed after exhausting their \
                   compare-and-swap replay budget, so the caller got an error. Any increase should \
-                  be paged on. What such a mutation lost depends on the layout: the ones that keep \
-                  the split map in one object lost the whole write, while the manifest layout \
-                  commits a mutation's splits before the index metadata, so what it lost there is \
+                  be paged on. What such a mutation left behind depends on the layout and on which \
+                  commit ran out: the single-object layout lost the whole write, the sharded\
+                  layout writes the index root before its slots, and the manifest layout commits \
+                  a mutation's splits before the index metadata, so what a publish lost there is \
                   the metadata update and not the splits.",
     subsystem: "metastore",
 );
