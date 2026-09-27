@@ -2901,9 +2901,9 @@ mod tests {
     /// The products sit in two different stripes on purpose, so that the mutation really takes the
     /// two-pass path and the failure lands on the pass that carries the markings. With both
     /// products in one stripe the marking rides in the product's own compare-and-swap and has
-    /// already landed by the time the injection fires, and with the injection on the first stripe
-    /// the first pass commits, no product has landed yet: either way the test would go red for a
-    /// reason that is not the window it pins.
+    /// already landed by the time the injection fires; with the injection on the first stripe of
+    /// the first pass, that pass commits nothing and no product has landed. Either way the test
+    /// would go red for a reason that is not the window it pins.
     #[tokio::test]
     async fn test_a_multi_product_merge_never_hides_documents() {
         let layout = multi_product_layout();
