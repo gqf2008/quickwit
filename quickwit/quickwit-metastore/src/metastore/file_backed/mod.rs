@@ -1188,9 +1188,21 @@ impl FileBackedMetastore {
     /// layout's splits; the other layouts compute them from the index the cache holds.
     async fn index_stats_of(&self, index_id: &str) -> MetastoreResult<IndexStats> {
         let Some(layout) = self.manifest_layout_of(index_id).await? else {
-            return self
+            let stats_result = self
                 .read_any(index_id, None, |index| index.get_stats())
                 .await;
+            // An index another node is halfway through creating or deleting has no stats. The stats
+            // listing is the only caller, and it skips an index it cannot read, so answer that
+            // state the same way: the operator gets the stats of the indexes that can
+            // be read instead of an error about one they never asked for.
+            return match stats_result {
+                Err(error) if is_transitioning_state_error(&error) => {
+                    Err(MetastoreError::NotFound(EntityKind::Index {
+                        index_id: index_id.to_string(),
+                    }))
+                }
+                other => other,
+            };
         };
         let (root_info, _, _) = layout.load_root_metadata_only(&*self.storage).await?;
         let index_uid = root_info.index.index_uid().clone();
@@ -2829,19 +2841,24 @@ async fn get_index_metadata(
     match index_metadata_result {
         Ok(index_metadata) => Ok(Some(index_metadata)),
         Err(MetastoreError::NotFound { .. }) => Ok(None),
-        Err(MetastoreError::Internal { message, cause }) => {
-            // An index another node is halfway through creating or deleting sits in a transitioning
-            // state, and a listing is better off skipping it than failing on it. That state reaches
-            // us as an error from `get_index_mutex`, which names it in `cause` — not in `message`,
-            // which only says the index cannot be retrieved.
-            if cause.contains("transitioning state") {
-                Ok(None)
-            } else {
-                Err(MetastoreError::Internal { message, cause })
-            }
-        }
+        // An index another node is halfway through creating or deleting has no metadata to report,
+        // and a listing is better off skipping it than failing on it.
+        Err(error) if is_transitioning_state_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Whether an error says the index is in a transitioning state (`creating` or `deleting`).
+///
+/// [`get_index_mutex`] is the only place that produces one, and it names the state in `cause` —
+/// not in `message`, which only says the index cannot be retrieved. A read that runs into it is
+/// looking at an index another node has not finished creating or deleting: a listing skips it, the
+/// same way it never had it in its snapshot of `Active` indexes.
+fn is_transitioning_state_error(error: &MetastoreError) -> bool {
+    matches!(
+        error,
+        MetastoreError::Internal { cause, .. } if cause.contains("transitioning state")
+    )
 }
 
 #[cfg(test)]
@@ -6452,6 +6469,75 @@ mod tests {
         assert!(
             get_index_metadata(metastore, index_id).await?.is_none(),
             "an index in a transitioning state has no metadata to report"
+        );
+        Ok(())
+    }
+
+    /// An index in a transitioning state has no stats, and the stats of one have to come back the
+    /// way the listing already skips an index it cannot read — not as the internal error the state
+    /// is represented by. The listing itself is only reachable through a race (its snapshot keeps
+    /// the `Active` indexes), which is why this asserts the call the listing makes.
+    #[tokio::test]
+    async fn test_the_stats_of_a_transitioning_index_are_not_found() -> anyhow::Result<()> {
+        let storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let metastore = FileBackedMetastore::for_test(storage);
+        let index_id = "test-transitioning-stats";
+        metastore
+            .state
+            .write()
+            .await
+            .indexes
+            .insert(index_id.to_string(), LazyIndexStatus::Deleting);
+        let error = metastore
+            .index_stats_of(index_id)
+            .await
+            .expect_err("an index in a transitioning state has no stats");
+        assert!(
+            matches!(error, MetastoreError::NotFound(_)),
+            "the listing skips what it cannot read, so this has to look like an index that is not \
+             there rather than fail the call: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// The stats listing answers with the indexes it can read while another node is creating or
+    /// deleting one of the others. The snapshot it takes keeps the `Active` indexes, so this is the
+    /// operator-visible behaviour that has to hold, whether or not a state ever lands mid-listing.
+    #[tokio::test]
+    async fn test_listing_index_stats_answers_while_an_index_is_in_a_transitioning_state()
+    -> anyhow::Result<()> {
+        let storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let metastore = FileBackedMetastore::for_test(storage);
+        let readable_index_id = "test-transitioning-listing-readable";
+        let index_config = IndexConfig::for_test(
+            readable_index_id,
+            &format!("ram:///indexes/{readable_index_id}"),
+        );
+        metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+            .await?;
+        // Another node is halfway through creating (or deleting) this one, so this node holds it in
+        // a transitioning state. The listing snapshots the `Active` indexes only — the state it has
+        // to survive is the one that lands between that snapshot and the read.
+        metastore.state.write().await.indexes.insert(
+            "test-transitioning-listing-deleting".to_string(),
+            LazyIndexStatus::Deleting,
+        );
+
+        let stats = metastore
+            .list_index_stats(ListIndexStatsRequest {
+                index_id_patterns: vec!["test-transitioning-listing*".to_string()],
+            })
+            .await?;
+        assert_eq!(
+            stats
+                .index_stats
+                .iter()
+                .filter_map(|stats| stats.index_uid.as_ref())
+                .map(|index_uid| index_uid.index_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![readable_index_id],
+            "the listing answers with what it can read and skips the index in transition"
         );
         Ok(())
     }
