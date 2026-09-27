@@ -78,12 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a competing writer whose delta lands on the same position, and a writer that took the shard over and
   replays an overlapping delta all keep getting the precondition failure.
   (walgit: `qw-replay-tolerates-applied-delta`)
-  Known gap, not fixed by this entry: the sharded layout writes the index root — the checkpoint among it —
-  before the slots it touches, so a slot commit that fails after the root leaves the checkpoint moved and the
-  split unpublished, and neither the metastore's retry nor a caller replay can finish it (the request has no
-  proof that the delta is its own, because its split is not published). Fixing it means committing the slots
-  first, or recording a writer identity the checkpoint format cannot carry today; the decision is parked in
-  `qw-replay-tolerates-applied-delta` with the measurements both ways.
+- Metastore: the sharded layout now commits the slots it touches **before** `root.json`, the object that
+  carries the checkpoint. A slot commit that fails therefore leaves nothing published and the checkpoint
+  where it was, and the metastore's own retry finishes the mutation; the other order used to leave the
+  checkpoint ahead of a split that was never published, so a single transient slot failure stranded that
+  split's documents — nothing re-read the window, because the checkpoint said it had been read. A failure
+  after the slots now leaves the splits published and the checkpoint behind them, which a replay finishes
+  and which costs duplicated documents rather than missing ones.
+  (walgit: `qw-sharded-partial-commit`)
 - Metastore: a publish that the indexing pipeline replays — because an attempt's response was lost
   after it committed, or because the manifest layout's own replay stopped partway — can now finish.
   `PublishSplitsRequest` carries `is_replay`, set by the pipeline from its second attempt, and the

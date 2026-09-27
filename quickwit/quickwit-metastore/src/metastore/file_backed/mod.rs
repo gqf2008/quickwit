@@ -3870,49 +3870,6 @@ mod tests {
         );
     }
 
-    /// Known gap, not a fix: the sharded layout writes the index root (the checkpoint among it)
-    /// before the slots it touches, so a slot commit that fails leaves the checkpoint moved and the
-    /// split unpublished. The metastore's own retry cannot finish it, because the delta it carries
-    /// is applied already and this request has no proof the publish is its own: its split is *not*
-    /// published, which is exactly what the failure left behind.
-    ///
-    /// Fixing it needs a decision the ledger holds
-    /// (`qw-replay-tolerates-applied-delta`, parked as needs-human): either commit the slots first,
-    /// so the failure leaves the checkpoint untouched, or record a writer identity the checkpoint
-    /// format cannot carry today. This test pins the state so that a change to it is deliberate.
-    #[tokio::test]
-    async fn test_a_slot_commit_failure_after_the_root_is_a_known_gap() {
-        use crate::metastore::file_backed::manifest_layout::test_hooks;
-
-        let index_id = "test-slot-commit-after-root";
-        let (metastore, index_uid, request) =
-            staged_publish_fixture(index_id, IndexLayout::Sharded { num_slots: 8 }).await;
-
-        test_hooks::fail_next_slot_commits(index_id, 1);
-        let error = metastore
-            .publish_splits(request(false))
-            .await
-            .expect_err("the slot commit fails after the root, and the retry cannot finish it");
-        assert!(
-            error.to_string().contains("incompatible checkpoint delta"),
-            "the failure to pin is the checkpoint delta the retry cannot apply: {error}"
-        );
-
-        let splits = list_splits_of(&metastore, &index_uid).await;
-        assert_eq!(splits.len(), 1);
-        assert_eq!(
-            splits[0].split_state,
-            SplitState::Staged,
-            "the split the failed slot commit left behind stays staged until the gap is fixed"
-        );
-
-        let replay = metastore.publish_splits(request(true)).await;
-        assert!(
-            replay.is_err(),
-            "a caller replay does not finish it either: {replay:?}"
-        );
-    }
-
     /// The shard API path (ingest-v2) tolerates the delta of a replay too, and it proves the
     /// publish is its own with the shard's publish token: a replay may skip the delta, but a
     /// request that carries a different token — another writer's publish — may not.
@@ -4282,6 +4239,67 @@ mod tests {
             vec!["split-a".to_string()],
             "only the writer that owns the delta publishes"
         );
+    }
+
+    /// The sharded layout commits the slots before the index metadata, so a slot commit that fails
+    /// leaves the checkpoint untouched and the metastore's own retry finishes the mutation. The
+    /// other order used to strand the split: the checkpoint advanced, the split was never
+    /// published, and neither the retry nor a caller replay could complete it.
+    #[tokio::test]
+    async fn test_a_slot_commit_failure_is_replayed_by_the_metastore() {
+        use crate::metastore::file_backed::manifest_layout::test_hooks;
+
+        let index_id = "test-slot-commit-order";
+        let (metastore, index_uid, request) =
+            staged_publish_fixture(index_id, IndexLayout::Sharded { num_slots: 8 }).await;
+
+        test_hooks::fail_next_slot_commits(index_id, 1);
+        metastore
+            .publish_splits(request(false))
+            .await
+            .expect("a slot commit that fails before the root has to be replayed, not reported");
+
+        let splits = list_splits_of(&metastore, &index_uid).await;
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].split_state, SplitState::Published);
+    }
+
+    /// The mirror image, and the property the order buys: when the index metadata is what fails,
+    /// the splits are published already and the checkpoint is behind them. A caller replay then
+    /// finishes the mutation — the splits are tolerated as published, the delta is applied — which
+    /// is the same shape the manifest layout has. A caller that never replays costs duplicated
+    /// documents, never a split that no slot describes.
+    #[tokio::test]
+    async fn test_a_root_commit_failure_leaves_the_splits_published() {
+        use crate::metastore::file_backed::manifest_layout::test_hooks;
+
+        let index_id = "test-root-commit-order";
+        let (metastore, index_uid, request) =
+            staged_publish_fixture(index_id, IndexLayout::Sharded { num_slots: 8 }).await;
+
+        test_hooks::fail_next_sharded_root_commits(index_id, DISTRIBUTED_MAX_ATTEMPTS as u32);
+        let error = metastore
+            .publish_splits(request(false))
+            .await
+            .expect_err("every commit of the index metadata fails");
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "an index metadata that never commits has to report the conflict: {error:?}"
+        );
+
+        let splits = list_splits_of(&metastore, &index_uid).await;
+        assert_eq!(splits.len(), 1);
+        assert_eq!(
+            splits[0].split_state,
+            SplitState::Published,
+            "the slot committed before the root, so the split is visible even though the mutation \
+             failed"
+        );
+
+        metastore
+            .publish_splits(request(true))
+            .await
+            .expect("a replay has to finish a mutation whose splits are published");
     }
 
     fn index_id_suffix(layout: &IndexLayout) -> &'static str {

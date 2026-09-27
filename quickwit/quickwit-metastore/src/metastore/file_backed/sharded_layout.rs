@@ -558,27 +558,12 @@ pub(super) async fn store_sharded_index(
         index.put_splits(splits);
         root_bytes?
     };
-    if root_bytes.as_slice() != context.root_bytes.as_slice() {
-        let write_result = storage
-            .put_if_version_matches(
-                &root_filepath(&index_id),
-                Box::new(root_bytes),
-                &context.root_version,
-            )
-            .await
-            .map_err(|error| convert_error(&index_id, error));
-        if let Err(error) = write_result {
-            index.put_touched_split_ids(touched_split_ids);
-            return Err(error);
-        }
-    }
-
     let mut touched_slots: BTreeMap<u32, BTreeSet<SplitId>> = BTreeMap::new();
-    for split_id in touched_split_ids {
+    for split_id in &touched_split_ids {
         touched_slots
             .entry(slot_of(split_id.as_str(), num_slots))
             .or_default()
-            .insert(split_id);
+            .insert(split_id.clone());
     }
 
     #[cfg(test)]
@@ -645,6 +630,36 @@ pub(super) async fn store_sharded_index(
                 %error,
                 "failed to fold a split slot, the next write to it will retry"
             );
+        }
+    }
+    // The index metadata — the checkpoint among it — commits *after* the slots it describes. A
+    // failure between the two then leaves the splits published and the checkpoint behind them:
+    // a replay finishes that (the splits are tolerated as already published, the delta is applied
+    // then, and the root commits), and a caller that never replays costs duplicated documents when
+    // the source is read again, never a split that no slot describes. The other order leaves the
+    // checkpoint ahead of a split that was never published, which costs the documents themselves.
+    if root_bytes.as_slice() != context.root_bytes.as_slice() {
+        #[cfg(test)]
+        if super::manifest_layout::test_hooks::take_sharded_root_commit_failure(&index_id) {
+            index.put_touched_split_ids(touched_split_ids);
+            return Err(MetastoreError::FailedPrecondition {
+                entity: quickwit_proto::metastore::EntityKind::Index {
+                    index_id: index_id.clone(),
+                },
+                message: "injected index metadata conflict".to_string(),
+            });
+        }
+        let write_result = storage
+            .put_if_version_matches(
+                &root_filepath(&index_id),
+                Box::new(root_bytes),
+                &context.root_version,
+            )
+            .await
+            .map_err(|error| convert_error(&index_id, error));
+        if let Err(error) = write_result {
+            index.put_touched_split_ids(touched_split_ids);
+            return Err(error);
         }
     }
     Ok(())
