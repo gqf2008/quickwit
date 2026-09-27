@@ -2802,15 +2802,17 @@ async fn get_index_mutex(
         LazyIndexStatus::Active(lazy_index) => lazy_index.get().await,
         LazyIndexStatus::Creating => Err(MetastoreError::Internal {
             message: format!("index `{index_id}` cannot be retrieved"),
-            cause: "index `{index_id}` is in transitioning state `creating` and this should not \
-                    happened. either recreate or delete it"
-                .to_string(),
+            cause: format!(
+                "index `{index_id}` is in transitioning state `creating` and this should not \
+                 happened. either recreate or delete it"
+            ),
         }),
         LazyIndexStatus::Deleting => Err(MetastoreError::Internal {
             message: format!("index `{index_id}` cannot be retrieved"),
-            cause: "index `{index_id}` is in transitioning state `deleting` and this should not \
-                    happened. try to delete it again"
-                .to_string(),
+            cause: format!(
+                "index `{index_id}` is in transitioning state `deleting` and this should not \
+                 happened. try to delete it again"
+            ),
         }),
     }
 }
@@ -2828,9 +2830,11 @@ async fn get_index_metadata(
         Ok(index_metadata) => Ok(Some(index_metadata)),
         Err(MetastoreError::NotFound { .. }) => Ok(None),
         Err(MetastoreError::Internal { message, cause }) => {
-            // Indexes can be in transient states `Creating` or `Deleting`.
-            // It is fine to ignore those errors.
-            if message.contains("transient state") {
+            // An index another node is halfway through creating or deleting sits in a transitioning
+            // state, and a listing is better off skipping it than failing on it. That state reaches
+            // us as an error from `get_index_mutex`, which names it in `cause` — not in `message`,
+            // which only says the index cannot be retrieved.
+            if cause.contains("transitioning state") {
                 Ok(None)
             } else {
                 Err(MetastoreError::Internal { message, cause })
@@ -6403,6 +6407,51 @@ mod tests {
         assert!(
             message.contains("conditional writes"),
             "the error must name the capability gap, got: {message}"
+        );
+        Ok(())
+    }
+
+    /// A read that lands on an index another node is creating or deleting has to name the index it
+    /// could not retrieve, the way an operator can find it again.
+    #[tokio::test]
+    async fn test_a_transitioning_state_error_names_the_index() {
+        for state in [LazyIndexStatus::Creating, LazyIndexStatus::Deleting] {
+            let error = match get_index_mutex("test-transitioning-index", &state).await {
+                Ok(_) => panic!("an index in a transitioning state cannot be retrieved"),
+                Err(error) => error,
+            };
+            let MetastoreError::Internal { message, cause } = error else {
+                panic!("a transitioning state has to be an internal error, got {error:?}");
+            };
+            assert!(
+                message.contains("test-transitioning-index")
+                    && cause.contains("test-transitioning-index"),
+                "the error has to name the index: {message} / {cause}"
+            );
+            assert!(
+                !cause.contains("{index_id}"),
+                "the cause kept the placeholder its format string was written with: {cause}"
+            );
+        }
+    }
+
+    /// An index that is in a transitioning state has no metadata to report, and a listing skips it
+    /// rather than failing on it. `get_index_metadata` has to recognise the error it gets for one.
+    #[tokio::test]
+    async fn test_get_index_metadata_skips_an_index_in_a_transitioning_state() -> anyhow::Result<()>
+    {
+        let storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let metastore = FileBackedMetastore::for_test(storage);
+        let index_id = "test-transitioning-index".to_string();
+        metastore
+            .state
+            .write()
+            .await
+            .indexes
+            .insert(index_id.clone(), LazyIndexStatus::Deleting);
+        assert!(
+            get_index_metadata(metastore, index_id).await?.is_none(),
+            "an index in a transitioning state has no metadata to report"
         );
         Ok(())
     }
