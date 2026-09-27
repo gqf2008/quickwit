@@ -343,6 +343,11 @@ impl SourceCheckpoint {
     /// metastore's own retry after a step that comes after the checkpoint write failed. Applying
     /// such a delta is refused as incompatible, which would fail a mutation that is already done,
     /// so a replay asks this first and skips the application instead.
+    ///
+    /// Hidden contract: the positions say *a* delta moved the checkpoint here, not *whose* delta it
+    /// was. A caller therefore only asks this once it has a proof that the publish is its own — see
+    /// `publish_splits_with_retry_tolerance`, which requires the splits of the request to be
+    /// published already, and the shard API path, which requires the shard's publish token.
     pub fn contains_delta(&self, delta: &SourceCheckpointDelta) -> bool {
         delta
             .per_partition

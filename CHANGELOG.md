@@ -69,11 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Metastore: a publish that the pipeline replays because its **first attempt committed and the response was
   lost** now finishes. The replay carries the checkpoint delta the first attempt applied; that delta is not
-  incompatible, it is done, so a replay skips it instead of failing on it (a fresh request that re-sends an
-  applied delta is still refused, so a caller bug stays visible). The metastore's own retry carries the same
-  tolerance on every layout, which is what lets a sharded publish whose slot commit failed after the index
-  root — the checkpoint among it — was written finish instead of stranding a split that no slot describes.
-  (walgit: `qw-replay-tolerates-applied-delta`)
+  incompatible, it is done, so the replay skips it instead of failing on it. Skipping it is only sound for
+  the publish that is the replay's own, and the checkpoint cannot say whose delta moved it, so a replay
+  proves it first: the splits it publishes are published already (only the caller's earlier attempt can have
+  published them), and on the ingest-v2 shard API the request carries the shard's publish token. A fresh
+  request that re-sends an applied delta, and a competing writer whose delta lands on the same position, both
+  keep getting the precondition failure. (walgit: `qw-replay-tolerates-applied-delta`)
+  Known gap, not fixed by this entry: the sharded layout writes the index root — the checkpoint among it —
+  before the slots it touches, so a slot commit that fails after the root leaves the checkpoint moved and the
+  split unpublished, and neither the metastore's retry nor a caller replay can finish it (the request has no
+  proof that the delta is its own, because its split is not published). Fixing it means committing the slots
+  first, or recording a writer identity the checkpoint format cannot carry today; the decision is parked in
+  `qw-replay-tolerates-applied-delta` with the measurements both ways.
 - Metastore: a publish that the indexing pipeline replays — because an attempt's response was lost
   after it committed, or because the manifest layout's own replay stopped partway — can now finish.
   `PublishSplitsRequest` carries `is_replay`, set by the pipeline from its second attempt, and the

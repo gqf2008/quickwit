@@ -3870,12 +3870,18 @@ mod tests {
         );
     }
 
-    /// The sharded layout writes the index root (the checkpoint among it) before the slots it
-    /// touches, so a slot commit that fails leaves the checkpoint moved and the split unpublished.
-    /// The metastore's own retry replays that mutation, and it has to finish it: the delta is
-    /// applied already, the split is not published yet.
+    /// Known gap, not a fix: the sharded layout writes the index root (the checkpoint among it)
+    /// before the slots it touches, so a slot commit that fails leaves the checkpoint moved and the
+    /// split unpublished. The metastore's own retry cannot finish it, because the delta it carries
+    /// is applied already and this request has no proof the publish is its own: its split is *not*
+    /// published, which is exactly what the failure left behind.
+    ///
+    /// Fixing it needs a decision the ledger holds
+    /// (`qw-replay-tolerates-applied-delta`, parked as needs-human): either commit the slots first,
+    /// so the failure leaves the checkpoint untouched, or record a writer identity the checkpoint
+    /// format cannot carry today. This test pins the state so that a change to it is deliberate.
     #[tokio::test]
-    async fn test_a_slot_commit_failure_after_the_root_is_replayed() {
+    async fn test_a_slot_commit_failure_after_the_root_is_a_known_gap() {
         use crate::metastore::file_backed::manifest_layout::test_hooks;
 
         let index_id = "test-slot-commit-after-root";
@@ -3883,14 +3889,215 @@ mod tests {
             staged_publish_fixture(index_id, IndexLayout::Sharded { num_slots: 8 }).await;
 
         test_hooks::fail_next_slot_commits(index_id, 1);
-        metastore
+        let error = metastore
             .publish_splits(request(false))
             .await
-            .expect("a slot commit that fails after the root has to be replayed, not reported");
+            .expect_err("the slot commit fails after the root, and the retry cannot finish it");
+        assert!(
+            error.to_string().contains("incompatible checkpoint delta"),
+            "the failure to pin is the checkpoint delta the retry cannot apply: {error}"
+        );
 
         let splits = list_splits_of(&metastore, &index_uid).await;
         assert_eq!(splits.len(), 1);
-        assert_eq!(splits[0].split_state, SplitState::Published);
+        assert_eq!(
+            splits[0].split_state,
+            SplitState::Staged,
+            "the split the failed slot commit left behind stays staged until the gap is fixed"
+        );
+
+        let replay = metastore.publish_splits(request(true)).await;
+        assert!(
+            replay.is_err(),
+            "a caller replay does not finish it either: {replay:?}"
+        );
+    }
+
+    /// The shard API path (ingest-v2) tolerates the delta of a replay too, and it proves the
+    /// publish is its own with the shard's publish token: a replay may skip the delta, but a
+    /// request that carries a different token — another writer's publish — may not.
+    #[tokio::test]
+    async fn test_the_shard_api_replay_tolerates_its_own_delta_only() {
+        use crate::checkpoint::{PartitionId, SourceCheckpointDelta};
+
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        let index_id = "test-shard-api-delta-replay";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        let source_id = SourceId::from(INGEST_V2_SOURCE_ID);
+        metastore
+            .add_source(AddSourceRequest {
+                index_uid: Some(index_uid.clone()),
+                source_config_json: serde_json::to_string(&SourceConfig::ingest_v2()).unwrap(),
+            })
+            .await
+            .unwrap();
+        let shard_id = "01J0TOKEN";
+        metastore
+            .open_shards(OpenShardsRequest {
+                subrequests: vec![OpenShardSubrequest {
+                    index_uid: Some(index_uid.clone()),
+                    source_id: source_id.clone(),
+                    shard_id: Some(ShardId::from(shard_id)),
+                    ingester_id: "test-ingester".to_string(),
+                    publish_token: Some("test-publish-token".to_string()),
+                    ..Default::default()
+                }],
+            })
+            .await
+            .unwrap();
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-0"));
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delta = IndexCheckpointDelta {
+            source_id: source_id.clone(),
+            source_delta: SourceCheckpointDelta::from_partition_delta(
+                PartitionId::from(shard_id),
+                Position::Beginning,
+                Position::offset(1u64),
+            )
+            .unwrap(),
+        };
+        let delta_json = serde_json::to_string(&delta).unwrap();
+        let request = |is_replay: bool, token: &str| PublishSplitsRequest {
+            index_uid: Some(index_uid.clone()),
+            staged_split_ids: vec![split_metadata.split_id.to_string()],
+            index_checkpoint_delta_json_opt: Some(delta_json.clone()),
+            publish_token_opt: Some(token.to_string()),
+            is_replay,
+            ..Default::default()
+        };
+
+        // The first attempt commits; its response is lost, and the caller replays it.
+        metastore
+            .publish_splits(request(false, "test-publish-token"))
+            .await
+            .unwrap();
+        metastore
+            .publish_splits(request(true, "test-publish-token"))
+            .await
+            .expect("a replay of this writer's own publish has to finish");
+
+        // Another writer (a different token) whose delta ends on the same position: the token is
+        // what says the delta is not its own, so it keeps getting refused even as a "replay".
+        let error = metastore
+            .publish_splits(request(true, "another-publish-token"))
+            .await
+            .expect_err("another writer's delta has to be refused");
+        assert!(
+            matches!(error, MetastoreError::InvalidPublishToken { .. }),
+            "the refusal has to name the publish token: {error:?}"
+        );
+    }
+
+    /// The tolerance is for the replay of a publish that is provably its own. A competing writer
+    /// whose delta lands on the same position carries a different delta, and must keep getting the
+    /// precondition failure: its split is not published, so answering it with a success would index
+    /// the same documents twice.
+    #[tokio::test]
+    async fn test_a_competing_writers_overlapping_delta_is_still_refused() {
+        use quickwit_config::{SourceConfig, SourceParams};
+
+        use crate::checkpoint::{PartitionId, SourceCheckpointDelta};
+
+        let index_id = "test-competing-writer-delta";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let source_id = "test-source";
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 4,
+        });
+        let split_a = SplitMetadata::for_test(SplitId::from("split-a"));
+        let split_b = SplitMetadata::for_test(SplitId::from("split-b"));
+        let index_uid = metastore
+            .create_index(
+                CreateIndexRequest::try_from_index_and_source_configs(
+                    &index_config,
+                    &[SourceConfig::for_test(source_id, SourceParams::void())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        for split in [&split_a, &split_b] {
+            metastore
+                .stage_splits(
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), split).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Writer A publishes (Beginning .. 9] with its own split.
+        let delta_a = IndexCheckpointDelta::for_test(source_id, 0..10);
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![split_a.split_id.to_string()],
+                index_checkpoint_delta_json_opt: Some(serde_json::to_string(&delta_a).unwrap()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Writer B's delta ends on the same position but starts later: the checkpoint is already
+        // there, and yet the publish is not B's — its split is still staged.
+        let delta_b = IndexCheckpointDelta {
+            source_id: source_id.to_string(),
+            source_delta: SourceCheckpointDelta::from_partition_delta(
+                PartitionId::from(""),
+                Position::offset(5u64),
+                Position::offset(9u64),
+            )
+            .unwrap(),
+        };
+        let error = metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![split_b.split_id.to_string()],
+                index_checkpoint_delta_json_opt: Some(serde_json::to_string(&delta_b).unwrap()),
+                is_replay: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a competing writer's delta has to be refused, replay or not");
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "the refusal has to be a precondition failure: {error:?}"
+        );
+
+        let splits = list_splits_of(&metastore, &index_uid).await;
+        let published: Vec<String> = splits
+            .into_iter()
+            .filter(|split| split.split_state == SplitState::Published)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert_eq!(
+            published,
+            vec!["split-a".to_string()],
+            "only the writer that owns the delta publishes"
+        );
     }
 
     fn index_id_suffix(layout: &IndexLayout) -> &'static str {

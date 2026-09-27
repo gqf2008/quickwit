@@ -323,10 +323,24 @@ impl Shards {
         if checkpoint_delta.is_empty() {
             return Ok(MutationOccurred::No(()));
         }
+        // Every partition this delta moves has to belong to a shard this publish opened: the
+        // publish token is the writer's identity, and it is what separates a replay of *this*
+        // writer's own publish from another writer that happens to land on the same positions.
+        let mut shard_ids = Vec::with_capacity(checkpoint_delta.num_partitions());
+        for (partition_id, _partition_delta) in checkpoint_delta.iter() {
+            let shard_id = ShardId::from(partition_id.as_str());
+            let shard = self.get_shard(&shard_id)?;
+            if shard.publish_token() != *publish_token {
+                return Err(MetastoreError::InvalidPublishToken {
+                    queue_id: shard.queue_id(),
+                });
+            }
+        }
         if let Err(error) = self.checkpoint.check_compatibility(&checkpoint_delta) {
-            // A replay carries the delta an earlier attempt applied, so the checkpoint is already
-            // where the delta would move it: that is done, not incompatible. A fresh request keeps
-            // getting the invalid-argument error below.
+            // A replay carries the delta an earlier attempt of this same writer applied, so the
+            // checkpoint is already where the delta would move it: that is done, not incompatible.
+            // The token check above is what makes that safe; a fresh request and a competing writer
+            // both keep getting the error below.
             if tolerate_already_applied && self.checkpoint.contains_delta(&checkpoint_delta) {
                 return Ok(MutationOccurred::No(()));
             }
@@ -335,17 +349,9 @@ impl Shards {
             });
         }
 
-        let mut shard_ids = Vec::with_capacity(checkpoint_delta.num_partitions());
-
         for (partition_id, partition_delta) in checkpoint_delta.iter() {
             let shard_id = ShardId::from(partition_id.as_str());
-            let shard = self.get_shard(&shard_id)?;
-
-            if shard.publish_token() != *publish_token {
-                return Err(MetastoreError::InvalidPublishToken {
-                    queue_id: shard.queue_id(),
-                });
-            }
+            self.get_shard(&shard_id)?;
             let publish_position_inclusive = partition_delta.to;
             shard_ids.push((shard_id, publish_position_inclusive))
         }

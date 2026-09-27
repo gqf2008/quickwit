@@ -627,6 +627,10 @@ impl FileBackedIndex {
         publish_token_opt: Option<PublishToken>,
         tolerate_already_published: bool,
     ) -> MetastoreResult<()> {
+        let staged_split_ids: Vec<String> = staged_split_ids
+            .into_iter()
+            .map(|split_id| split_id.as_ref().to_string())
+            .collect();
         if let Some(checkpoint_delta) = checkpoint_delta_opt {
             let source_id = checkpoint_delta.source_id.clone();
             let source = self.metadata.sources.get(&source_id).ok_or_else(|| {
@@ -649,11 +653,23 @@ impl FileBackedIndex {
                     tolerate_already_published,
                 )?;
             } else {
-                // A replay carries the delta an earlier attempt applied. That delta is not
-                // incompatible, it is done: applying it again would be refused, and refusing it
-                // here would fail a mutation whose checkpoint move already happened. Only the
-                // replay asks, so a fresh request keeps getting the precondition failure.
+                // A replay carries the delta an earlier attempt applied, and applying it again
+                // would be refused as incompatible. Skipping it is only sound for the replay of
+                // *this* request, and the checkpoint cannot say whose delta moved it: the positions
+                // are a shared watermark. So the publish proves it is its own first — the splits it
+                // publishes are published already, and only the caller's earlier attempt can have
+                // published them — and only then accepts the delta it finds applied. A competing
+                // writer whose delta happens to land on the same position fails that proof and
+                // keeps getting the precondition failure.
+                let own_publish_is_visible = staged_split_ids.iter().all(|split_id| {
+                    matches!(
+                        self.split_opt(&SplitId::from(split_id.as_str()))
+                            .map(|split| split.split_state),
+                        Some(SplitState::Published)
+                    )
+                });
                 let already_applied = tolerate_already_published
+                    && own_publish_is_visible
                     && self
                         .metadata
                         .checkpoint
