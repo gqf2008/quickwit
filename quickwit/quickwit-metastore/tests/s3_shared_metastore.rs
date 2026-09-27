@@ -418,9 +418,10 @@ async fn test_sharded_layout_on_s3_endpoint() -> anyhow::Result<()> {
     // green and this one red, naming `v2/splits/view.json`.
     assert_index_left_nothing_behind(&*storage, &index_id, "deleting a sharded index").await?;
     // And nothing the delete missed makes the index look alive to a node that starts afterwards,
-    // with no cache to answer from. A node that already holds the index keeps answering until its
-    // polling interval elapses — that is the read path's cache, not a leftover, so asserting on a
-    // running node would be asserting the interval.
+    // with no cache to answer from. A node that has already loaded the index is not the question:
+    // when a reload finds the object gone, the read path keeps its cached copy instead of dropping
+    // it (the polling task is allowed to run one more iteration before it exits), so what such a
+    // node answers says nothing about what is left on the storage.
     let mut metastore_d = FileBackedMetastore::try_new(storage.clone(), None).await?;
     assert!(
         !metastore_d.index_exists(&index_id).await?,
