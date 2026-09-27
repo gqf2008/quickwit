@@ -114,10 +114,10 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-        "expr": "sum by(rpc) (rate(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\", instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by(rpc) (rate(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\", instance=~\"$instance\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "{{operation}}",
+          "legendFormat": "{{rpc}}",
           "range": true,
           "refId": "A",
           "useBackend": false
@@ -213,7 +213,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-        "expr": "histogram_quantile(0.95, sum by(le, rpc) (rate(quickwit_grpc_request_duration_seconds_bucket{service=\"metastore\", kind=\"server\", instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by(le, rpc) (rate(quickwit_grpc_request_duration_seconds_bucket{service=\"metastore\", kind=\"server\", instance=~\"$instance\"}[$__rate_interval])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{rpc}}",
@@ -312,7 +312,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-        "expr": "sum by(rpc) (rate(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\", status=\"error\", instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by(rpc) (rate(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\", status=\"error\", instance=~\"$instance\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{rpc}}",
@@ -342,7 +342,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A metadata write lost the compare-and-swap on the object it was updating and was replayed. Sustained growth means several nodes write the same metastore prefix; contention is not a failure by itself, what matters is whether a write is dropped, in the panel next to this one.",
+      "description": "A metadata write lost the compare-and-swap on the object it was updating. Most are replayed and succeed; the ones that gave up instead are counted again by the panel next to this one, which is why a rise here is contention rather than loss. Sustained growth means several nodes write the same metastore prefix.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1104,13 +1104,13 @@
         "type": "datasource"
       },
       {
-      "allValue": ".*",
+        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
           "value": "$__all"
         },
-      "definition": "label_values(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\"},instance)",
+        "definition": "label_values(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\"},instance)",
         "hide": 0,
         "includeAll": true,
         "label": "Instance",
