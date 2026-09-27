@@ -473,10 +473,11 @@ impl S3StorageConfig {
             .or_else(|| self.endpoint.clone())
     }
 
-    /// How long a request waits for the first byte of its response, as configured.
+    /// How long a request may take, up to its response headers, as configured.
     ///
     /// `None` is the unset value: the storage reads that as its own default. `Some(0s)` is what
-    /// asks for no timeout at all, so the two are deliberately not folded together here.
+    /// asks for no timeout at all, so the two are deliberately not folded together here. The bound
+    /// covers sending the request body too, which is what the field's documentation is about.
     pub fn read_timeout(&self) -> Option<Duration> {
         self.read_timeout
             .as_ref()
