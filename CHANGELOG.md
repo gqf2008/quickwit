@@ -72,9 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incompatible, it is done, so the replay skips it instead of failing on it. Skipping it is only sound for
   the publish that is the replay's own, and the checkpoint cannot say whose delta moved it, so a replay
   proves it first: the splits it publishes are published already (only the caller's earlier attempt can have
-  published them), and on the ingest-v2 shard API the request carries the shard's publish token. A fresh
-  request that re-sends an applied delta, and a competing writer whose delta lands on the same position, both
-  keep getting the precondition failure. (walgit: `qw-replay-tolerates-applied-delta`)
+  published them — an empty set proves nothing). On the ingest-v2 shard API the request must also carry the
+  shard's publish token, which says the caller still holds the shard; it is not ownership of the delta by
+  itself, because a shard that changed hands has a new token. A fresh request that re-sends an applied delta,
+  a competing writer whose delta lands on the same position, and a writer that took the shard over and
+  replays an overlapping delta all keep getting the precondition failure.
+  (walgit: `qw-replay-tolerates-applied-delta`)
   Known gap, not fixed by this entry: the sharded layout writes the index root — the checkpoint among it —
   before the slots it touches, so a slot commit that fails after the root leaves the checkpoint moved and the
   split unpublished, and neither the metastore's retry nor a caller replay can finish it (the request has no

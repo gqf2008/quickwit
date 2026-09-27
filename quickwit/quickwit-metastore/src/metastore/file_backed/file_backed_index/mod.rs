@@ -631,6 +631,19 @@ impl FileBackedIndex {
             .into_iter()
             .map(|split_id| split_id.as_ref().to_string())
             .collect();
+        // The proof that a publish is the replay's own: the splits it publishes are published
+        // already, and only the caller's earlier attempt can have published them. An empty set is
+        // no proof at all, and neither is a set with a split still staged. Both delta paths need
+        // this: the shard API's publish token only says which writer holds the shard *now*, and a
+        // takeover replaces it, so a token match is not ownership of the delta either.
+        let own_publish_is_visible = !staged_split_ids.is_empty()
+            && staged_split_ids.iter().all(|split_id| {
+                matches!(
+                    self.split_opt(&SplitId::from(split_id.as_str()))
+                        .map(|split| split.split_state),
+                    Some(SplitState::Published)
+                )
+            });
         if let Some(checkpoint_delta) = checkpoint_delta_opt {
             let source_id = checkpoint_delta.source_id.clone();
             let source = self.metadata.sources.get(&source_id).ok_or_else(|| {
@@ -650,24 +663,15 @@ impl FileBackedIndex {
                 self.try_apply_delta_v2(
                     checkpoint_delta,
                     publish_token,
-                    tolerate_already_published,
+                    tolerate_already_published && own_publish_is_visible,
                 )?;
             } else {
                 // A replay carries the delta an earlier attempt applied, and applying it again
-                // would be refused as incompatible. Skipping it is only sound for the replay of
-                // *this* request, and the checkpoint cannot say whose delta moved it: the positions
-                // are a shared watermark. So the publish proves it is its own first — the splits it
-                // publishes are published already, and only the caller's earlier attempt can have
-                // published them — and only then accepts the delta it finds applied. A competing
-                // writer whose delta happens to land on the same position fails that proof and
-                // keeps getting the precondition failure.
-                let own_publish_is_visible = staged_split_ids.iter().all(|split_id| {
-                    matches!(
-                        self.split_opt(&SplitId::from(split_id.as_str()))
-                            .map(|split| split.split_state),
-                        Some(SplitState::Published)
-                    )
-                });
+                // would be refused as incompatible. The checkpoint cannot say whose delta moved it
+                // — the positions are a shared watermark — so only a publish with the proof above
+                // accepts the delta it finds applied. A competing writer whose delta happens to
+                // land on the same position has no such proof and keeps getting the precondition
+                // failure.
                 let already_applied = tolerate_already_published
                     && own_publish_is_visible
                     && self

@@ -347,7 +347,7 @@ impl SourceCheckpoint {
     /// Hidden contract: the positions say *a* delta moved the checkpoint here, not *whose* delta it
     /// was. A caller therefore only asks this once it has a proof that the publish is its own — see
     /// `publish_splits_with_retry_tolerance`, which requires the splits of the request to be
-    /// published already, and the shard API path, which requires the shard's publish token.
+    /// published already, on both delta paths.
     pub fn contains_delta(&self, delta: &SourceCheckpointDelta) -> bool {
         delta
             .per_partition

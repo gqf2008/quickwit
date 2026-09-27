@@ -4006,6 +4006,159 @@ mod tests {
         );
     }
 
+    /// A shard can change hands: `acquire_shards` replaces its publish token, so a token match
+    /// only says which writer holds the shard now, not whose delta moved the checkpoint. A writer
+    /// that took the shard over therefore cannot replay an overlapping delta into a success — the
+    /// proof is the same on this path as on the classic one: the splits of the request are
+    /// published already.
+    #[tokio::test]
+    async fn test_a_shard_takeover_does_not_tolerate_an_overlapping_delta() {
+        use crate::checkpoint::{PartitionId, SourceCheckpointDelta};
+
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 60,
+            num_stripes: 2,
+        });
+        let index_id = "test-shard-takeover-delta";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let index_uid = metastore
+            .create_index(CreateIndexRequest::try_from_index_config(&index_config).unwrap())
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        let source_id = SourceId::from(INGEST_V2_SOURCE_ID);
+        metastore
+            .add_source(AddSourceRequest {
+                index_uid: Some(index_uid.clone()),
+                source_config_json: serde_json::to_string(&SourceConfig::ingest_v2()).unwrap(),
+            })
+            .await
+            .unwrap();
+        let shard_id = ShardId::from("01J0TAKEOVER");
+        metastore
+            .open_shards(OpenShardsRequest {
+                subrequests: vec![OpenShardSubrequest {
+                    index_uid: Some(index_uid.clone()),
+                    source_id: source_id.clone(),
+                    shard_id: Some(shard_id.clone()),
+                    ingester_id: "test-ingester".to_string(),
+                    publish_token: Some("aaa-token".to_string()),
+                    ..Default::default()
+                }],
+            })
+            .await
+            .unwrap();
+        let split_a = SplitMetadata::for_test(SplitId::from("split-a"));
+        let split_b = SplitMetadata::for_test(SplitId::from("split-b"));
+        for split in [&split_a, &split_b] {
+            metastore
+                .stage_splits(
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), split).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let delta = |from_offset: u64| IndexCheckpointDelta {
+            source_id: source_id.clone(),
+            source_delta: SourceCheckpointDelta::from_partition_delta(
+                PartitionId::from(shard_id.as_str()),
+                Position::offset(from_offset),
+                Position::offset(9u64),
+            )
+            .unwrap(),
+        };
+
+        // Writer 1 publishes up to position 9.
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![split_a.split_id.to_string()],
+                index_checkpoint_delta_json_opt: Some(
+                    serde_json::to_string(&IndexCheckpointDelta {
+                        source_id: source_id.clone(),
+                        source_delta: SourceCheckpointDelta::from_partition_delta(
+                            PartitionId::from(shard_id.as_str()),
+                            Position::Beginning,
+                            Position::offset(9u64),
+                        )
+                        .unwrap(),
+                    })
+                    .unwrap(),
+                ),
+                publish_token_opt: Some("aaa-token".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The shard changes hands, and the new holder replays an overlapping delta.
+        let acquired = metastore
+            .acquire_shards(AcquireShardsRequest {
+                index_uid: Some(index_uid.clone()),
+                source_id: source_id.clone(),
+                shard_ids: vec![shard_id.clone()],
+                publish_token: "zzz-token".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(acquired.acquired_shards.len(), 1);
+
+        let error = metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![split_b.split_id.to_string()],
+                index_checkpoint_delta_json_opt: Some(serde_json::to_string(&delta(4)).unwrap()),
+                publish_token_opt: Some("zzz-token".to_string()),
+                is_replay: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a takeover does not make the previous writer's delta its own");
+        assert!(
+            !error.to_string().is_empty(),
+            "the refusal has to say what happened: {error:?}"
+        );
+
+        let splits = list_splits_of(&metastore, &index_uid).await;
+        let published: Vec<String> = splits
+            .into_iter()
+            .filter(|split| split.split_state == SplitState::Published)
+            .map(|split| split.split_id().to_string())
+            .collect();
+        assert_eq!(published, vec!["split-a".to_string()]);
+    }
+
+    /// An empty set of staged splits is no proof that the publish is the replay's own, so it must
+    /// not open the delta tolerance on its own.
+    #[tokio::test]
+    async fn test_an_empty_staged_set_is_not_a_proof_of_its_own_publish() {
+        let index_id = "test-empty-staged-no-proof";
+        let (metastore, _index_uid, request) = staged_publish_fixture(
+            index_id,
+            IndexLayout::ManifestSegments {
+                bucket_secs: 3_600,
+                num_stripes: 4,
+            },
+        )
+        .await;
+        metastore.publish_splits(request(false)).await.unwrap();
+
+        let mut empty = request(true);
+        empty.staged_split_ids.clear();
+        let error = metastore
+            .publish_splits(empty)
+            .await
+            .expect_err("an empty staged set has to keep the delta strict");
+        assert!(
+            error.to_string().contains("checkpoint delta"),
+            "the refusal has to name the checkpoint delta: {error}"
+        );
+    }
+
     /// The tolerance is for the replay of a publish that is provably its own. A competing writer
     /// whose delta lands on the same position carries a different delta, and must keep getting the
     /// precondition failure: its split is not published, so answering it with a success would index
