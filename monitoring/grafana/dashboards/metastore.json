@@ -441,7 +441,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A mutation gave up after exhausting its whole replay budget, so the caller got an error. Any increase should be paged on: read the conflicts next to it for the cause. What such a mutation left behind depends on the layout and on which commit ran out — the single-object layout lost the whole write, the sharded layout writes the index root before its slots, and a manifest-layout publish has already committed its splits and lost the index metadata update (a replay finishes that one).",
+      "description": "A mutation gave up after exhausting its whole replay budget, so the caller got an error. Any increase should be paged on: read the conflicts next to it for the cause. What such a mutation left behind depends on the layout and on which commit ran out — the single-object layout lost the whole write; the sharded layout writes the index root before the slots it touches, so an exhausted slot commit can leave that earlier write in place (for a publish, its checkpoint); and a manifest-layout mutation may have committed its splits (when the index metadata is what ran out, and a replay of that publish finishes it) or none of them (when a stripe's own commit is what ran out).",
       "fieldConfig": {
         "defaults": {
           "color": {

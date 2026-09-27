@@ -35,16 +35,19 @@ pub(super) static CAS_CONFLICTS_TOTAL: LazyCounter = lazy_counter!(
 /// Number of mutations that failed after exhausting their replay budget: the caller got an error,
 /// and what the mutation left behind depends on the layout and on which commit ran out (the
 /// single-object layout loses the whole write, the sharded one can have written the index root,
-/// and the manifest one has already committed the splits).
+/// and the manifest one has committed its splits when the index metadata is what ran out, and
+/// none of them when a stripe's own commit did).
 pub(super) static CAS_CONFLICTS_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
     name: "file_backed_cas_conflicts_exhausted_total",
     description: "Number of file-backed metastore mutations that failed after exhausting their \
                   compare-and-swap replay budget, so the caller got an error. Any increase should \
                   be paged on. What such a mutation left behind depends on the layout and on which \
-                  commit ran out: the single-object layout lost the whole write, the sharded\
-                  layout writes the index root before its slots, and the manifest layout commits \
-                  a mutation's splits before the index metadata, so what a publish lost there is \
-                  the metadata update and not the splits.",
+                  commit ran out: the single-object layout lost the whole write; the sharded \
+                  layout writes the index root before the slots it touches, so an exhausted slot \
+                  commit can leave that earlier write in place; and a manifest-layout mutation \
+                  may have committed its splits (when the index metadata is what ran out, a \
+                  replay of the same publish finishes it) or none of them (when a stripe's own \
+                  commit is what ran out).",
     subsystem: "metastore",
 );
 
