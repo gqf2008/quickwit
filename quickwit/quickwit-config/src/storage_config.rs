@@ -405,18 +405,18 @@ pub struct S3StorageConfig {
     pub disable_stalled_stream_protection_upload: bool,
     #[serde(default)]
     pub disable_stalled_stream_protection_download: bool,
-    /// How long an S3 request waits for the first byte of its response before giving up.
+    /// How long an S3 request may take before giving up.
     ///
     /// A connection that goes away without a reset — a NAT or a proxy that forgets the flow —
     /// leaves a request waiting forever when the client has no read timeout, which is what the
     /// SDK defaults to. A metastore call that never returns hangs the publisher or the GC with
-    /// it, instead of failing and letting the retry and the replay handle it. The timeout
-    /// covers the wait for the first byte, not the transfer, so a large split that streams
-    /// steadily is not affected.
+    /// it, instead of failing and letting the retry and the replay handle it.
     ///
-    /// Unset means the storage's own default (30s, see `DEFAULT_S3_READ_TIMEOUT` in
-    /// `quickwit-storage`); `0s` is how a deployment that wants the old behaviour asks for no
-    /// timeout at all.
+    /// The bound covers the request up to its response headers, **sending the body included**: a
+    /// large object on a slow link needs a larger value than the default, or none at all.
+    ///
+    /// Unset means the storage's own default (5 min, see `DEFAULT_S3_READ_TIMEOUT` in
+    /// `quickwit-storage`); `0s` is how a deployment on a slow link asks for no timeout at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_timeout: Option<HumanDuration>,
 }

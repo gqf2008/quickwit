@@ -149,12 +149,14 @@ fn get_region(s3_storage_config: &S3StorageConfig) -> Option<Region> {
     })
 }
 
-/// How long an S3 request waits for the first byte of its response when the storage configuration
-/// does not say otherwise.
+/// How long an S3 request may take, when the storage configuration does not say otherwise.
 ///
 /// The AWS SDK's default is to wait forever, which turns a silently dropped connection into a
-/// metastore call that never returns.
-pub const DEFAULT_S3_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// metastore call that never returns. The bound covers the whole request **including sending its
+/// body**, and stops at the response headers — a healthy 32 MiB upload that takes 22 s failed with
+/// a 2 s bound in a measurement against the SDK this crate pins. Five minutes is therefore what
+/// keeps a 256 MiB split (the default split size) inside the bound down to roughly 7 Mbps.
+pub const DEFAULT_S3_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     let aws_config = get_aws_config().await;
@@ -181,8 +183,9 @@ pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     // Without a read timeout a request waits forever on a connection that went away without a
     // reset — a NAT or a proxy that forgets the flow — and the caller waits with it: a metastore
     // call that never returns hangs the publisher or the GC instead of failing so that the retry
-    // and the replay can do their job. The timeout is on the wait for the first byte of the
-    // response, not on the transfer, so an object that streams steadily is unaffected.
+    // and the replay can do their job. The bound covers the whole request up to the response
+    // headers, sending the body included, which is why its default has to be generous rather than
+    // tight: see `DEFAULT_S3_READ_TIMEOUT`.
     let read_timeout = match s3_storage_config.read_timeout() {
         // `0s` in the configuration is how a deployment asks for the old behaviour back.
         Some(read_timeout) if read_timeout.is_zero() => None,
@@ -1402,6 +1405,12 @@ mod tests {
     /// able to move that bound and to ask for no bound at all.
     #[tokio::test]
     async fn test_s3_client_read_timeout() {
+        assert_eq!(
+            DEFAULT_S3_READ_TIMEOUT,
+            Duration::from_secs(300),
+            "the default is part of the configuration's contract: it covers a 256 MiB split down \
+             to roughly 7 Mbps, and moving it is a deliberate change"
+        );
         let read_timeout = |client: &S3Client| {
             client
                 .config()
