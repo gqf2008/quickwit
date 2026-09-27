@@ -5381,6 +5381,135 @@ mod tests {
         ));
     }
 
+    /// Deleting an index leaves nothing behind it, in every layout.
+    ///
+    /// Each layout keeps its metadata in objects under the index's own prefix — the single file,
+    /// the slots/view/segments, or the manifests/WAL/segments and one object per shard. A delete
+    /// that misses one of them leaves storage to pay for forever, and an index later created with
+    /// the same id would find the leftovers. Nothing pinned that before: the tests around this one
+    /// cover the failure paths of a delete, not what it leaves on the storage.
+    #[tokio::test]
+    async fn test_deleting_an_index_leaves_no_object_under_its_prefix() {
+        use quickwit_config::INGEST_V2_SOURCE_ID;
+
+        use crate::checkpoint::{PartitionId, SourceCheckpointDelta};
+
+        let layouts = [
+            ("single-object", IndexLayout::SingleObject),
+            ("sharded", IndexLayout::Sharded { num_slots: 8 }),
+            (
+                "manifest",
+                IndexLayout::ManifestSegments {
+                    bucket_secs: 3_600,
+                    num_stripes: 4,
+                },
+            ),
+        ];
+        for (label, layout) in layouts {
+            let index_id = format!("test-delete-leaves-nothing-{label}");
+            let index_config =
+                IndexConfig::for_test(&index_id, &format!("ram:///indexes/{index_id}"));
+            let storage = Arc::new(RamStorage::default());
+            let mut metastore = FileBackedMetastore::try_new(storage.clone(), None)
+                .await
+                .unwrap();
+            metastore.set_distributed(true);
+            metastore.set_index_layout(layout);
+            let index_uid = metastore
+                .create_index(
+                    CreateIndexRequest::try_from_index_and_source_configs(
+                        &index_config,
+                        &[SourceConfig::ingest_v2()],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .index_uid()
+                .clone();
+            // A shard, so the shard state has objects of its own in the layouts that keep them
+            // outside the root.
+            metastore
+                .open_shards(OpenShardsRequest {
+                    subrequests: vec![OpenShardSubrequest {
+                        index_uid: Some(index_uid.clone()),
+                        source_id: INGEST_V2_SOURCE_ID.to_string(),
+                        shard_id: Some(ShardId::from("01J0DELETEME")),
+                        ingester_id: "test-ingester".to_string(),
+                        publish_token: Some("test-publish-token".to_string()),
+                        ..Default::default()
+                    }],
+                })
+                .await
+                .unwrap();
+            // And a publish, so the layout has written its metadata objects (a checkpoint moves the
+            // root of every layout).
+            let split_metadata = SplitMetadata::for_test(SplitId::from("split-delete-me"));
+            metastore
+                .stage_splits(
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // The shard's own partition moves with the publish, and the shard API wants the token
+            // it was opened with.
+            let checkpoint_delta = IndexCheckpointDelta {
+                source_id: INGEST_V2_SOURCE_ID.to_string(),
+                source_delta: SourceCheckpointDelta::from_partition_delta(
+                    PartitionId::from("01J0DELETEME"),
+                    Position::Beginning,
+                    Position::offset(1u64),
+                )
+                .unwrap(),
+            };
+            metastore
+                .publish_splits(PublishSplitsRequest {
+                    index_uid: Some(index_uid.clone()),
+                    staged_split_ids: vec![split_metadata.split_id.to_string()],
+                    index_checkpoint_delta_json_opt: Some(
+                        serde_json::to_string(&checkpoint_delta).unwrap(),
+                    ),
+                    publish_token_opt: Some("test-publish-token".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let before = objects_under(&*storage, &index_id).await;
+            assert!(
+                !before.is_empty(),
+                "[{label}] the index has to have objects to delete in the first place"
+            );
+
+            metastore
+                .delete_index(DeleteIndexRequest {
+                    index_uid: Some(index_uid),
+                })
+                .await
+                .unwrap();
+
+            let after = objects_under(&*storage, &index_id).await;
+            assert!(
+                after.is_empty(),
+                "[{label}] a deleted index must leave nothing under its prefix, found: {after:?}"
+            );
+        }
+    }
+
+    /// Every object under one index's prefix, in the order the storage lists them.
+    async fn objects_under(storage: &dyn Storage, index_id: &str) -> Vec<std::path::PathBuf> {
+        let mut pages = storage.list(Path::new(index_id));
+        let mut paths = Vec::new();
+        while let Some(page) = futures::StreamExt::next(&mut pages).await {
+            for metadata in page.unwrap() {
+                paths.push(metadata.path);
+            }
+        }
+        paths.sort();
+        paths
+    }
+
     #[tokio::test]
     async fn test_file_backed_metastore_delete_index_when_storage_failing_before_metadata_delete() {
         let mut mock_storage = MockStorage::default();
