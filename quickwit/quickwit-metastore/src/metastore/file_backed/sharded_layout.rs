@@ -566,16 +566,16 @@ pub(super) async fn store_sharded_index(
             .insert(split_id.clone());
     }
 
-    #[cfg(test)]
-    if super::manifest_layout::test_hooks::take_slot_commit_failure(&index_id) {
-        return Err(MetastoreError::FailedPrecondition {
-            entity: quickwit_proto::metastore::EntityKind::Index {
-                index_id: index_id.clone(),
-            },
-            message: "injected slot commit conflict".to_string(),
-        });
-    }
     for (slot, split_ids) in touched_slots {
+        #[cfg(test)]
+        if super::manifest_layout::test_hooks::take_slot_commit_failure(&index_id) {
+            return Err(MetastoreError::FailedPrecondition {
+                entity: quickwit_proto::metastore::EntityKind::Index {
+                    index_id: index_id.clone(),
+                },
+                message: "injected slot commit conflict".to_string(),
+            });
+        }
         let bookmark = context.view.bookmark(slot);
         // The file as the read that produced this context saw it, not as it is now: the
         // compare-and-swap below is what tells us whether it moved in the meantime.

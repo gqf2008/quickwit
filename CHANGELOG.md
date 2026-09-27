@@ -79,8 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replays an overlapping delta all keep getting the precondition failure.
   (walgit: `qw-replay-tolerates-applied-delta`)
 - Metastore: the sharded layout now commits the slots it touches **before** `root.json`, the object that
-  carries the checkpoint. A slot commit that fails therefore leaves nothing published and the checkpoint
-  where it was, and the metastore's own retry finishes the mutation; the other order used to leave the
+  carries the checkpoint. A slot commit that fails therefore leaves the checkpoint where it was — the
+  slots that committed before the failure stay published, a mutation touches several of them — and the
+  metastore's own retry finishes the mutation; the other order used to leave the
   checkpoint ahead of a split that was never published, so a single transient slot failure stranded that
   split's documents — nothing re-read the window, because the checkpoint said it had been read. A failure
   after the slots now leaves the splits published and the checkpoint behind them, which a replay finishes

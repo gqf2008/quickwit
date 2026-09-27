@@ -124,7 +124,7 @@ populated slots until a read can be served from a cache or from a coarser object
 | ------- | ------------------ |
 | Writer crashes after writing a slot file, before any fold | Entries are in the slot file; the next write or fold picks them up (`test_sharded_layout_round_trip`) |
 | Writer commits the slots, then fails before `root.json` | The splits are published and the checkpoint is behind them (`test_a_root_commit_failure_leaves_the_splits_published`): a replay finishes the mutation, and a caller that never replays costs duplicated documents, never missing ones (invariant 7) |
-| A slot commit fails before `root.json` is written | Nothing is published and the checkpoint has not moved; the metastore's own retry finishes the mutation (`test_a_slot_commit_failure_is_replayed_by_the_metastore`) |
+| A slot commit fails before `root.json` is written | The slots that committed before it stay published and the checkpoint has not moved; the metastore's own retry finishes the mutation (`test_a_slot_commit_failure_is_replayed_by_the_metastore`; a mutation touches several slots, so "nothing is published" only holds when the first one fails) |
 | Writer crashes mid-fold, after the segment, before the view CAS | The segment is unreferenced; the view still names the previous one, and the next write to that slot folds again (`fold_slot` deletes its segment when the view CAS loses) |
 | Two writers fold the same slot at once | The view CAS settles it; the loser deletes the segment it wrote |
 | Reader holds an old view while a fold (and its GC) runs | Two generations of segments are kept, and a slot file from a newer generation forces the reader to restart (`test_sharded_layout_conflicts_only_on_the_same_slot` covers the conflicting writers, the GC rule is asserted by construction) |
@@ -143,8 +143,8 @@ populated slots until a read can be served from a cache or from a coarser object
   to prevent. A shard's publish token does not separate the writers either: a shard that changes
   hands carries the new holder's token. What a replay may skip is therefore gated on proof that the
   publish is its own (the splits it publishes are published already) or on the request changing no
-  split state at all; see `qw-replay-tolerates-applied-delta` in the ledger and
-  `tests/s3_shared_metastore.rs` for the measurements.
+  split state at all; the measurements and the two counterexamples are in the ledger thread
+  `qw-replay-tolerates-applied-delta`.
 
 - **PostgreSQL metastore**: row-level updates, no whole-file rewrite, 26 ms writes and zero conflicts in
   the same benchmark where R2 needed 2.14 s. It is the pragmatic answer when a database may be

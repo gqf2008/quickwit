@@ -4264,6 +4264,96 @@ mod tests {
         assert_eq!(splits[0].split_state, SplitState::Published);
     }
 
+    /// A mutation touches several slots, so a slot commit that fails on a *later* one leaves the
+    /// earlier slots published — the index keeps the splits it committed, and the checkpoint stays
+    /// behind all of them. A replay then finishes the mutation; nothing is stranded and nothing is
+    /// lost.
+    #[tokio::test]
+    async fn test_a_slot_commit_failure_on_a_later_slot_leaves_the_earlier_splits_published() {
+        use quickwit_config::SourceParams;
+
+        use crate::metastore::file_backed::manifest_layout::test_hooks;
+
+        let index_id = "test-slot-commit-order-multi";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let source_id = "test-source";
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
+        let splits: Vec<SplitMetadata> = (0..8)
+            .map(|i| SplitMetadata::for_test(SplitId::from(format!("split-{i}"))))
+            .collect();
+        let index_uid = metastore
+            .create_index(
+                CreateIndexRequest::try_from_index_and_source_configs(
+                    &index_config,
+                    &[SourceConfig::for_test(source_id, SourceParams::void())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        for split in &splits {
+            metastore
+                .stage_splits(
+                    StageSplitsRequest::try_from_split_metadata(index_uid.clone(), split).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let checkpoint_delta = IndexCheckpointDelta::for_test(source_id, 0..10);
+        let request = |is_replay: bool| PublishSplitsRequest {
+            index_uid: Some(index_uid.clone()),
+            staged_split_ids: splits
+                .iter()
+                .map(|split| split.split_id.to_string())
+                .collect(),
+            index_checkpoint_delta_json_opt: Some(
+                serde_json::to_string(&checkpoint_delta).unwrap(),
+            ),
+            is_replay,
+            ..Default::default()
+        };
+
+        // One slot commits, the next one exhausts the budget: the mutation fails with the earlier
+        // slots in place and the checkpoint untouched.
+        test_hooks::fail_slot_commits(index_id, 1, DISTRIBUTED_MAX_ATTEMPTS as u32);
+        metastore
+            .publish_splits(request(false))
+            .await
+            .expect_err("a later slot commit that keeps failing has to surface");
+
+        let listed = list_splits_of(&metastore, &index_uid).await;
+        assert_eq!(listed.len(), splits.len());
+        let published = listed
+            .iter()
+            .filter(|split| split.split_state == SplitState::Published)
+            .count();
+        assert!(
+            published > 0 && published < splits.len(),
+            "the slots that committed before the failure stay published, the rest do not: \
+             {published} of {}",
+            splits.len()
+        );
+
+        // The delta was never applied, so a replay applies it, tolerates the splits that are
+        // published already, and finishes the publish.
+        metastore
+            .publish_splits(request(true))
+            .await
+            .expect("a replay finishes a mutation whose earlier slots are published");
+        let listed = list_splits_of(&metastore, &index_uid).await;
+        assert!(
+            listed
+                .iter()
+                .all(|split| split.split_state == SplitState::Published),
+            "every split has to be published after the replay"
+        );
+    }
+
     /// The mirror image, and the property the order buys: when the index metadata is what fails,
     /// the splits are published already and the checkpoint is behind them. A caller replay then
     /// finishes the mutation — the splits are tolerated as published, the delta is applied — which

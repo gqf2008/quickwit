@@ -111,7 +111,7 @@ pub(crate) mod test_hooks {
     static FAIL_NEXT_COMMIT_FOR_STRIPE: Mutex<Option<usize>> = Mutex::new(None);
     static FAIL_NEXT_ROOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
     static FAIL_NEXT_SHARD_OBJECT_WRITES: Mutex<Option<(String, u32)>> = Mutex::new(None);
-    static FAIL_NEXT_SLOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
+    static FAIL_NEXT_SLOT_COMMITS: Mutex<Option<(String, (u32, u32))>> = Mutex::new(None);
     static FAIL_NEXT_SHARDED_ROOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
     static SHARD_OBJECT_WRITE_INJECTIONS: Mutex<u32> = Mutex::new(0);
 
@@ -153,11 +153,19 @@ pub(crate) mod test_hooks {
 
     /// Fails the next `commits` slot commits of `index_id` in the sharded layout.
     ///
-    /// That layout writes the index root (the checkpoint among it) before the slots it touches, so
-    /// this is the hook for a failure *after* the checkpoint moved: whatever the caller does next
-    /// has to be able to finish a mutation whose split is not published yet.
+    /// That layout writes the slots it touches before the index root, so this is the hook for a
+    /// failure *before* the checkpoint moved: whatever the caller does next has to be able to
+    /// finish a mutation whose slots are not published yet, without a checkpoint that says they
+    /// were.
     pub(crate) fn fail_next_slot_commits(index_id: &str, commits: u32) {
-        *FAIL_NEXT_SLOT_COMMITS.lock().unwrap() = Some((index_id.to_string(), commits));
+        fail_slot_commits(index_id, 0, commits);
+    }
+
+    /// Fails `commits` slot commits of `index_id` in the sharded layout, after `skip` of them have
+    /// gone through: the shape of a mutation that touches several slots and dies on a later one,
+    /// with the earlier slots already committed.
+    pub(crate) fn fail_slot_commits(index_id: &str, skip: u32, commits: u32) {
+        *FAIL_NEXT_SLOT_COMMITS.lock().unwrap() = Some((index_id.to_string(), (skip, commits)));
     }
 
     /// Fails the next `commits` index-metadata commits of a sharded index, after the slots it
@@ -181,10 +189,17 @@ pub(crate) mod test_hooks {
 
     pub(crate) fn take_slot_commit_failure(index_id: &str) -> bool {
         let mut guard = FAIL_NEXT_SLOT_COMMITS.lock().unwrap();
-        let Some((armed_index_id, commits)) = guard.as_mut() else {
+        let Some((armed_index_id, (skip, commits))) = guard.as_mut() else {
             return false;
         };
-        if armed_index_id != index_id || *commits == 0 {
+        if armed_index_id != index_id {
+            return false;
+        }
+        if *skip > 0 {
+            *skip -= 1;
+            return false;
+        }
+        if *commits == 0 {
             return false;
         }
         *commits -= 1;
