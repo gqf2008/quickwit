@@ -138,6 +138,8 @@ deployment sizes from, is `docs/operating/shared-metastore.md`.
    under the existing bounded replay. A merge is the one mutation with more than one pass: the stripes
    that own the splits it replaces record the marking after the stripe carrying the product commits,
    and a single-product merge then clears the marks it wrote with one more compare-and-swap.
+   A mutation that also changes what the index itself holds — its metadata, sources, checkpoints or
+   delete tasks — pays the root's own compare-and-swap on top, and only when it changed.
    `FileBackedIndex` stays as the single-node, in-memory model.
 3. **Read path** — **landed**: `list_splits(query)` reads the manifests (in parallel, so all stripes
    share one round trip), prunes the buckets the query's time range cannot touch, and fetches the
