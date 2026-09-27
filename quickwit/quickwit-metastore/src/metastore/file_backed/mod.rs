@@ -6437,6 +6437,13 @@ mod tests {
                 Ok(_) => panic!("an index in a transitioning state cannot be retrieved"),
                 Err(error) => error,
             };
+            // The callers that skip a transitioning index recognise it by the phrase this error
+            // carries. Binding the predicate to the error it was written for is what keeps a
+            // rewording of the cause from quietly turning both of those skips off.
+            assert!(
+                is_transitioning_state_error(&error),
+                "the listings have to recognise the state this error names: {error:?}"
+            );
             let MetastoreError::Internal { message, cause } = error else {
                 panic!("a transitioning state has to be an internal error, got {error:?}");
             };
