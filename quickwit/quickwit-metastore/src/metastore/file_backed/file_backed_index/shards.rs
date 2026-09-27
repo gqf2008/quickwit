@@ -323,9 +323,10 @@ impl Shards {
         if checkpoint_delta.is_empty() {
             return Ok(MutationOccurred::No(()));
         }
-        // Every partition this delta moves has to belong to a shard this publish opened: the
-        // publish token is the writer's identity, and it is what separates a replay of *this*
-        // writer's own publish from another writer that happens to land on the same positions.
+        // Every partition this delta moves has to belong to a shard this caller still holds: the
+        // publish token is a necessary condition, not ownership of the delta (a shard that changed
+        // hands carries the new holder's token). What makes the tolerance below safe is the proof
+        // its caller asked for before passing `tolerate_already_applied`.
         let mut shard_ids = Vec::with_capacity(checkpoint_delta.num_partitions());
         for (partition_id, _partition_delta) in checkpoint_delta.iter() {
             let shard_id = ShardId::from(partition_id.as_str());

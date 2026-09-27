@@ -631,19 +631,30 @@ impl FileBackedIndex {
             .into_iter()
             .map(|split_id| split_id.as_ref().to_string())
             .collect();
+        let replaced_split_ids: Vec<String> = replaced_split_ids
+            .into_iter()
+            .map(|split_id| split_id.as_ref().to_string())
+            .collect();
         // The proof that a publish is the replay's own: the splits it publishes are published
-        // already, and only the caller's earlier attempt can have published them. An empty set is
-        // no proof at all, and neither is a set with a split still staged. Both delta paths need
-        // this: the shard API's publish token only says which writer holds the shard *now*, and a
-        // takeover replaces it, so a token match is not ownership of the delta either.
-        let own_publish_is_visible = !staged_split_ids.is_empty()
-            && staged_split_ids.iter().all(|split_id| {
-                matches!(
-                    self.split_opt(&SplitId::from(split_id.as_str()))
-                        .map(|split| split.split_state),
-                    Some(SplitState::Published)
-                )
-            });
+        // already, and only the caller's earlier attempt can have published them. A set with a
+        // split still staged is no proof, and neither is an empty set — except that a request with
+        // nothing to publish and nothing to replace changes no split state at all, so its only step
+        // is the delta and skipping a delta that is applied already is a no-op there. The pipeline
+        // sends those when a batch holds no split (`Publisher`).
+        //
+        // Both delta paths need this proof: the shard API's publish token only says which writer
+        // holds the shard *now*, and a takeover replaces it, so a token match is not ownership of
+        // the delta either.
+        let own_publish_is_visible = staged_split_ids.iter().all(|split_id| {
+            matches!(
+                self.split_opt(&SplitId::from(split_id.as_str()))
+                    .map(|split| split.split_state),
+                Some(SplitState::Published)
+            )
+        });
+        let changes_no_split_state = staged_split_ids.is_empty() && replaced_split_ids.is_empty();
+        let may_skip_an_applied_delta =
+            !staged_split_ids.is_empty() && own_publish_is_visible || changes_no_split_state;
         if let Some(checkpoint_delta) = checkpoint_delta_opt {
             let source_id = checkpoint_delta.source_id.clone();
             let source = self.metadata.sources.get(&source_id).ok_or_else(|| {
@@ -663,7 +674,7 @@ impl FileBackedIndex {
                 self.try_apply_delta_v2(
                     checkpoint_delta,
                     publish_token,
-                    tolerate_already_published && own_publish_is_visible,
+                    tolerate_already_published && may_skip_an_applied_delta,
                 )?;
             } else {
                 // A replay carries the delta an earlier attempt applied, and applying it again
@@ -673,7 +684,7 @@ impl FileBackedIndex {
                 // land on the same position has no such proof and keeps getting the precondition
                 // failure.
                 let already_applied = tolerate_already_published
-                    && own_publish_is_visible
+                    && may_skip_an_applied_delta
                     && self
                         .metadata
                         .checkpoint

@@ -4132,12 +4132,17 @@ mod tests {
         assert_eq!(published, vec!["split-a".to_string()]);
     }
 
-    /// An empty set of staged splits is no proof that the publish is the replay's own, so it must
-    /// not open the delta tolerance on its own.
+    /// A publish with nothing to publish and nothing to replace changes no split state: its only
+    /// step is the checkpoint delta, so a replay of one is accepted when the delta is applied
+    /// already — that is the request the `Publisher` sends for a batch that holds no split.
+    ///
+    /// A publish that only replaces splits is not that: it changes state, and an empty set of
+    /// staged splits proves nothing about who sent it, so it keeps getting the precondition
+    /// failure.
     #[tokio::test]
-    async fn test_an_empty_staged_set_is_not_a_proof_of_its_own_publish() {
+    async fn test_an_empty_staged_set_is_no_proof_unless_the_publish_is_a_no_op() {
         let index_id = "test-empty-staged-no-proof";
-        let (metastore, _index_uid, request) = staged_publish_fixture(
+        let (metastore, index_uid, request) = staged_publish_fixture(
             index_id,
             IndexLayout::ManifestSegments {
                 bucket_secs: 3_600,
@@ -4147,12 +4152,38 @@ mod tests {
         .await;
         metastore.publish_splits(request(false)).await.unwrap();
 
-        let mut empty = request(true);
-        empty.staged_split_ids.clear();
-        let error = metastore
-            .publish_splits(empty)
+        // Nothing to publish, nothing to replace: accepted as a replay.
+        let mut no_op = request(true);
+        no_op.staged_split_ids.clear();
+        metastore
+            .publish_splits(no_op)
             .await
-            .expect_err("an empty staged set has to keep the delta strict");
+            .expect("a publish that changes no split state has to be replayed");
+
+        // A split to replace, and nothing staged: no proof that the publish is its own.
+        let replaced_split = SplitMetadata::for_test(SplitId::from("split-replaced"));
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &replaced_split)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        metastore
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid.clone()),
+                staged_split_ids: vec![replaced_split.split_id.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut replace_only = request(true);
+        replace_only.staged_split_ids.clear();
+        replace_only.replaced_split_ids = vec![replaced_split.split_id.to_string()];
+        let error = metastore
+            .publish_splits(replace_only)
+            .await
+            .expect_err("a state-changing publish with nothing staged keeps the delta strict");
         assert!(
             error.to_string().contains("checkpoint delta"),
             "the refusal has to name the checkpoint delta: {error}"
