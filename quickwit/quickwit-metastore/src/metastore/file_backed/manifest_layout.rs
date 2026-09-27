@@ -111,6 +111,7 @@ pub(crate) mod test_hooks {
     static FAIL_NEXT_COMMIT_FOR_STRIPE: Mutex<Option<usize>> = Mutex::new(None);
     static FAIL_NEXT_ROOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
     static FAIL_NEXT_SHARD_OBJECT_WRITES: Mutex<Option<(String, u32)>> = Mutex::new(None);
+    static FAIL_NEXT_SLOT_COMMITS: Mutex<Option<(String, u32)>> = Mutex::new(None);
     static SHARD_OBJECT_WRITE_INJECTIONS: Mutex<u32> = Mutex::new(0);
 
     /// Fails the next manifest commit of `stripe`, once.
@@ -147,6 +148,27 @@ pub(crate) mod test_hooks {
     /// the mutation rather than leave a split that no shard state describes.
     pub(crate) fn fail_next_shard_object_writes(index_id: &str, writes: u32) {
         *FAIL_NEXT_SHARD_OBJECT_WRITES.lock().unwrap() = Some((index_id.to_string(), writes));
+    }
+
+    /// Fails the next `commits` slot commits of `index_id` in the sharded layout.
+    ///
+    /// That layout writes the index root (the checkpoint among it) before the slots it touches, so
+    /// this is the hook for a failure *after* the checkpoint moved: whatever the caller does next
+    /// has to be able to finish a mutation whose split is not published yet.
+    pub(crate) fn fail_next_slot_commits(index_id: &str, commits: u32) {
+        *FAIL_NEXT_SLOT_COMMITS.lock().unwrap() = Some((index_id.to_string(), commits));
+    }
+
+    pub(crate) fn take_slot_commit_failure(index_id: &str) -> bool {
+        let mut guard = FAIL_NEXT_SLOT_COMMITS.lock().unwrap();
+        let Some((armed_index_id, commits)) = guard.as_mut() else {
+            return false;
+        };
+        if armed_index_id != index_id || *commits == 0 {
+            return false;
+        }
+        *commits -= 1;
+        true
     }
 
     /// How many shard-object writes the hook has failed, so a test can assert the injection

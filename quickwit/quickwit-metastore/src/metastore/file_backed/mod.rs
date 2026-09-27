@@ -625,8 +625,27 @@ impl FileBackedMetastore {
         index_uid: &IndexUid,
         mutate_fn: impl Fn(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
     ) -> MetastoreResult<T> {
+        self.mutate_replaying(index_uid, false, |index, _is_replay| mutate_fn(index))
+            .await
+    }
+
+    /// Same as [`Self::mutate`], for a mutation whose steps a replay has to tolerate.
+    ///
+    /// `caller_replay` says the caller is replaying a request of its own (the pipeline's second
+    /// attempt after a lost response); an attempt after the first one is a replay too, because the
+    /// previous attempt may have applied part of the mutation before it failed. The closure is told
+    /// which of the two it is, so a publish can accept the splits and the checkpoint delta an
+    /// earlier attempt already applied instead of failing on them.
+    async fn mutate_replaying<T>(
+        &self,
+        index_uid: &IndexUid,
+        caller_replay: bool,
+        mutate_fn: impl Fn(&mut FileBackedIndex, bool) -> MetastoreResult<MutationOccurred<T>>,
+    ) -> MetastoreResult<T> {
         if self.distributed {
-            return self.mutate_distributed(index_uid, mutate_fn).await;
+            return self
+                .mutate_distributed_replaying(index_uid, caller_replay, mutate_fn)
+                .await;
         }
         let index_id = &index_uid.index_id;
         let mut locked_index = self.get_locked_index(index_id).await?;
@@ -637,7 +656,7 @@ impl FileBackedMetastore {
         }
         let mut index = locked_index.clone();
 
-        let value = match mutate_fn(&mut index)? {
+        let value = match mutate_fn(&mut index, caller_replay)? {
             MutationOccurred::Yes(value) => value,
             MutationOccurred::No(value) => {
                 return Ok(value);
@@ -681,10 +700,11 @@ impl FileBackedMetastore {
     /// resurrect splits it deleted. Every attempt therefore re-reads the index together with its
     /// version and writes back with `If-Match`; losing that race means somebody else wrote first,
     /// so we reload and replay instead of overwriting them.
-    async fn mutate_distributed<T>(
+    async fn mutate_distributed_replaying<T>(
         &self,
         index_uid: &IndexUid,
-        mutate_fn: impl Fn(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+        caller_replay: bool,
+        mutate_fn: impl Fn(&mut FileBackedIndex, bool) -> MetastoreResult<MutationOccurred<T>>,
     ) -> MetastoreResult<T> {
         let index_id = &index_uid.index_id;
         let mut attempt = 0;
@@ -707,7 +727,10 @@ impl FileBackedMetastore {
                     ),
                 });
             };
-            let value = match mutate_fn(&mut index)? {
+            // Attempt 2 onwards replays an attempt that may have committed part of the mutation
+            // before it failed, so the mutation is told to tolerate what is already applied.
+            let is_replay = attempt > 1 || caller_replay;
+            let value = match mutate_fn(&mut index, is_replay)? {
                 MutationOccurred::Yes(value) => value,
                 MutationOccurred::No(value) => {
                     // Nothing to write, but the read still refreshed our cached view.
@@ -1287,7 +1310,9 @@ impl FileBackedMetastore {
             // observes a partial commit of *itself*. A caller that says it is replaying still gets
             // the same tolerance: its commit may have landed while the response was lost.
             return self
-                .mutate(index_uid, |index| mutate_fn(index, caller_replay))
+                .mutate_replaying(index_uid, caller_replay, |index, is_replay| {
+                    mutate_fn(index, is_replay)
+                })
                 .await;
         };
         let mut attempt = 0;
@@ -3781,6 +3806,165 @@ mod tests {
             CAS_CONFLICTS_EXHAUSTED_TOTAL.get() - exhausted_before >= 1,
             "giving up on the index metadata has to be visible to operators"
         );
+    }
+
+    /// A publish whose first attempt committed, replayed because its response was lost.
+    ///
+    /// The replay carries the checkpoint delta the first attempt applied. Applying it again is
+    /// refused as incompatible, so a replay that does not tolerate it fails a mutation that is
+    /// already done — on both layouts, since the delta is written in the index metadata either way.
+    #[tokio::test]
+    async fn test_a_replay_of_a_committed_publish_finishes() {
+        for layout in [
+            IndexLayout::Sharded { num_slots: 8 },
+            IndexLayout::ManifestSegments {
+                bucket_secs: 3_600,
+                num_stripes: 4,
+            },
+        ] {
+            let index_id = format!("test-replay-committed-{}", index_id_suffix(&layout));
+            let (metastore, index_uid, request) = staged_publish_fixture(&index_id, layout).await;
+
+            // The first attempt commits; its response is lost before the caller sees it.
+            metastore.publish_splits(request(false)).await.unwrap();
+
+            // The pipeline replays the same request, which the metastore has to finish rather than
+            // refuse on the checkpoint delta it already applied.
+            metastore
+                .publish_splits(request(true))
+                .await
+                .expect("a replay of a committed publish has to finish");
+
+            let splits = list_splits_of(&metastore, &index_uid).await;
+            assert_eq!(splits.len(), 1);
+            assert_eq!(splits[0].split_state, SplitState::Published);
+        }
+    }
+
+    /// The tolerance is for replays only: a fresh request that re-sends an applied delta is still
+    /// refused, so a caller bug stays visible instead of being answered with a success.
+    #[tokio::test]
+    async fn test_a_fresh_request_with_an_applied_delta_is_still_refused() {
+        let index_id = "test-fresh-applied-delta";
+        let (metastore, _index_uid, request) = staged_publish_fixture(
+            index_id,
+            IndexLayout::ManifestSegments {
+                bucket_secs: 3_600,
+                num_stripes: 4,
+            },
+        )
+        .await;
+        metastore.publish_splits(request(false)).await.unwrap();
+
+        let error = metastore
+            .publish_splits(request(false))
+            .await
+            .expect_err("a fresh request with an applied delta has to be refused");
+        assert!(
+            matches!(error, MetastoreError::FailedPrecondition { .. }),
+            "the refusal has to be a precondition failure: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("checkpoint delta"),
+            "the refusal has to name the checkpoint delta: {error}"
+        );
+    }
+
+    /// The sharded layout writes the index root (the checkpoint among it) before the slots it
+    /// touches, so a slot commit that fails leaves the checkpoint moved and the split unpublished.
+    /// The metastore's own retry replays that mutation, and it has to finish it: the delta is
+    /// applied already, the split is not published yet.
+    #[tokio::test]
+    async fn test_a_slot_commit_failure_after_the_root_is_replayed() {
+        use crate::metastore::file_backed::manifest_layout::test_hooks;
+
+        let index_id = "test-slot-commit-after-root";
+        let (metastore, index_uid, request) =
+            staged_publish_fixture(index_id, IndexLayout::Sharded { num_slots: 8 }).await;
+
+        test_hooks::fail_next_slot_commits(index_id, 1);
+        metastore
+            .publish_splits(request(false))
+            .await
+            .expect("a slot commit that fails after the root has to be replayed, not reported");
+
+        let splits = list_splits_of(&metastore, &index_uid).await;
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].split_state, SplitState::Published);
+    }
+
+    fn index_id_suffix(layout: &IndexLayout) -> &'static str {
+        match layout {
+            IndexLayout::ManifestSegments { .. } => "manifest",
+            _ => "sharded",
+        }
+    }
+
+    /// One index, one staged split, and a publish request that can be sent as a first attempt or as
+    /// a replay (the same request, the way the pipeline retries it).
+    async fn staged_publish_fixture(
+        index_id: &str,
+        layout: IndexLayout,
+    ) -> (
+        FileBackedMetastore,
+        IndexUid,
+        impl Fn(bool) -> PublishSplitsRequest + use<>,
+    ) {
+        use quickwit_config::{SourceConfig, SourceParams};
+
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let source_id = "test-source";
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(layout);
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-0"));
+        let index_uid = metastore
+            .create_index(
+                CreateIndexRequest::try_from_index_and_source_configs(
+                    &index_config,
+                    &[SourceConfig::for_test(source_id, SourceParams::void())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let checkpoint_delta = IndexCheckpointDelta::for_test(source_id, 0..10);
+        let request_uid = index_uid.clone();
+        let request = move |is_replay: bool| PublishSplitsRequest {
+            index_uid: Some(request_uid.clone()),
+            staged_split_ids: vec![split_metadata.split_id.to_string()],
+            index_checkpoint_delta_json_opt: Some(
+                serde_json::to_string(&checkpoint_delta).unwrap(),
+            ),
+            is_replay,
+            ..Default::default()
+        };
+        (metastore, index_uid, request)
+    }
+
+    async fn list_splits_of(metastore: &FileBackedMetastore, index_uid: &IndexUid) -> Vec<Split> {
+        metastore
+            .list_splits(
+                ListSplitsRequest::try_from_list_splits_query(&ListSplitsQuery::for_index(
+                    index_uid.clone(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collect_splits()
+            .await
+            .unwrap()
     }
 
     /// The counterpart of the test above: a caller that does replay finishes the mutation its

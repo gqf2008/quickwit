@@ -67,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the round-trip arithmetic and the measured numbers behind it. (walgit: `qw-metastore-backend-guidance`)
 
 ### Fixed
+- Metastore: a publish that the pipeline replays because its **first attempt committed and the response was
+  lost** now finishes. The replay carries the checkpoint delta the first attempt applied; that delta is not
+  incompatible, it is done, so a replay skips it instead of failing on it (a fresh request that re-sends an
+  applied delta is still refused, so a caller bug stays visible). The metastore's own retry carries the same
+  tolerance on every layout, which is what lets a sharded publish whose slot commit failed after the index
+  root — the checkpoint among it — was written finish instead of stranding a split that no slot describes.
+  (walgit: `qw-replay-tolerates-applied-delta`)
 - Metastore: a publish that the indexing pipeline replays — because an attempt's response was lost
   after it committed, or because the manifest layout's own replay stopped partway — can now finish.
   `PublishSplitsRequest` carries `is_replay`, set by the pipeline from its second attempt, and the

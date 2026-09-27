@@ -335,6 +335,22 @@ impl SourceCheckpoint {
         }
         Ok(())
     }
+
+    /// Whether this checkpoint already holds the positions `delta` moves its partitions to.
+    ///
+    /// A publish that is being replayed carries the delta an earlier attempt applied: either the
+    /// caller's second attempt, whose first one committed before its response was lost, or the
+    /// metastore's own retry after a step that comes after the checkpoint write failed. Applying
+    /// such a delta is refused as incompatible, which would fail a mutation that is already done,
+    /// so a replay asks this first and skips the application instead.
+    pub fn contains_delta(&self, delta: &SourceCheckpointDelta) -> bool {
+        delta
+            .per_partition
+            .iter()
+            .all(|(partition_id, partition_delta)| {
+                self.per_partition.get(partition_id) == Some(&partition_delta.to)
+            })
+    }
 }
 
 impl fmt::Debug for SourceCheckpoint {
@@ -539,6 +555,39 @@ impl SourceCheckpointDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_contains_delta_distinguishes_applied_from_pending() {
+        let mut checkpoint = SourceCheckpoint::default();
+        let delta = SourceCheckpointDelta::from_partition_delta(
+            PartitionId::from("a"),
+            Position::Beginning,
+            Position::offset(9u64),
+        )
+        .unwrap();
+        assert!(
+            !checkpoint.contains_delta(&delta),
+            "a delta the checkpoint has not applied yet is not contained"
+        );
+        checkpoint.try_apply_delta(delta.clone()).unwrap();
+        assert!(
+            checkpoint.contains_delta(&delta),
+            "the delta the checkpoint now holds is contained"
+        );
+
+        // A delta that reaches further is not contained, even though applying it is refused as
+        // incompatible anyway: a replay that carries it is not a replay of what happened here.
+        let longer = SourceCheckpointDelta::from_partition_delta(
+            PartitionId::from("a"),
+            Position::Beginning,
+            Position::offset(19u64),
+        )
+        .unwrap();
+        assert!(!checkpoint.contains_delta(&longer));
+
+        // An empty delta moves nothing, so every checkpoint contains it.
+        assert!(checkpoint.contains_delta(&SourceCheckpointDelta::default()));
+    }
 
     #[test]
     fn test_delta_from_range() {

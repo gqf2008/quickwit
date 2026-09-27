@@ -318,15 +318,22 @@ impl Shards {
         &mut self,
         checkpoint_delta: SourceCheckpointDelta,
         publish_token: PublishToken,
+        tolerate_already_applied: bool,
     ) -> MetastoreResult<MutationOccurred<()>> {
         if checkpoint_delta.is_empty() {
             return Ok(MutationOccurred::No(()));
         }
-        self.checkpoint
-            .check_compatibility(&checkpoint_delta)
-            .map_err(|error| MetastoreError::InvalidArgument {
+        if let Err(error) = self.checkpoint.check_compatibility(&checkpoint_delta) {
+            // A replay carries the delta an earlier attempt applied, so the checkpoint is already
+            // where the delta would move it: that is done, not incompatible. A fresh request keeps
+            // getting the invalid-argument error below.
+            if tolerate_already_applied && self.checkpoint.contains_delta(&checkpoint_delta) {
+                return Ok(MutationOccurred::No(()));
+            }
+            return Err(MetastoreError::InvalidArgument {
                 message: error.to_string(),
-            })?;
+            });
+        }
 
         let mut shard_ids = Vec::with_capacity(checkpoint_delta.num_partitions());
 

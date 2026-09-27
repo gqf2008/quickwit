@@ -615,10 +615,10 @@ impl FileBackedIndex {
     /// Publishes splits.
     /// Publishes splits.
     ///
-    /// `tolerate_already_published` is passed by the manifest layout, which commits one stripe at a
-    /// time and therefore can replay a mutation whose publication already partly happened; the
-    /// other layouts pass `false`, because their mutation sees the whole index in one
-    /// compare-and-swap.
+    /// `tolerate_already_published` says this call replays an earlier attempt: a split it is about
+    /// to publish may be published already, and the checkpoint delta it carries may be applied
+    /// already. The metastore sets it for its own retry and for a caller that says it is replaying
+    /// (`is_replay`); a fresh request still gets the precondition failure for both.
     pub(crate) fn publish_splits_with_retry_tolerance(
         &mut self,
         staged_split_ids: impl IntoIterator<Item = impl AsRef<str>>,
@@ -643,24 +643,41 @@ impl FileBackedIndex {
                     );
                     MetastoreError::InvalidArgument { message }
                 })?;
-                self.try_apply_delta_v2(checkpoint_delta, publish_token)?;
+                self.try_apply_delta_v2(
+                    checkpoint_delta,
+                    publish_token,
+                    tolerate_already_published,
+                )?;
             } else {
-                self.metadata
-                    .checkpoint
-                    .try_apply_delta(checkpoint_delta)
-                    .map_err(|error| {
-                        quickwit_common::rate_limited_error!(
-                            limit_per_min = 6,
-                            index = self.index_id(),
-                            "failed to apply checkpoint delta"
-                        );
-                        let entity = EntityKind::CheckpointDelta {
-                            index_id: self.index_id().to_string(),
-                            source_id,
-                        };
-                        let message = error.to_string();
-                        MetastoreError::FailedPrecondition { entity, message }
-                    })?;
+                // A replay carries the delta an earlier attempt applied. That delta is not
+                // incompatible, it is done: applying it again would be refused, and refusing it
+                // here would fail a mutation whose checkpoint move already happened. Only the
+                // replay asks, so a fresh request keeps getting the precondition failure.
+                let already_applied = tolerate_already_published
+                    && self
+                        .metadata
+                        .checkpoint
+                        .source_checkpoint(&source_id)
+                        .map(|checkpoint| checkpoint.contains_delta(&checkpoint_delta.source_delta))
+                        .unwrap_or(false);
+                if !already_applied {
+                    self.metadata
+                        .checkpoint
+                        .try_apply_delta(checkpoint_delta)
+                        .map_err(|error| {
+                            quickwit_common::rate_limited_error!(
+                                limit_per_min = 6,
+                                index = self.index_id(),
+                                "failed to apply checkpoint delta"
+                            );
+                            let entity = EntityKind::CheckpointDelta {
+                                index_id: self.index_id().to_string(),
+                                source_id,
+                            };
+                            let message = error.to_string();
+                            MetastoreError::FailedPrecondition { entity, message }
+                        })?;
+                }
             }
         }
         self.mark_splits_as_published_helper(staged_split_ids, tolerate_already_published)?;
@@ -933,9 +950,14 @@ impl FileBackedIndex {
         &mut self,
         checkpoint_delta: IndexCheckpointDelta,
         publish_token: PublishToken,
+        tolerate_already_applied: bool,
     ) -> MetastoreResult<MutationOccurred<()>> {
         self.get_shards_for_source_mut(&checkpoint_delta.source_id)?
-            .try_apply_delta(checkpoint_delta.source_delta, publish_token)
+            .try_apply_delta(
+                checkpoint_delta.source_delta,
+                publish_token,
+                tolerate_already_applied,
+            )
     }
 
     // Parquet Splits API
@@ -1052,7 +1074,8 @@ impl FileBackedIndex {
                     );
                     MetastoreError::InvalidArgument { message }
                 })?;
-                self.try_apply_delta_v2(checkpoint_delta, publish_token)?;
+                // The parquet split publishes carry no replay flag, so no tolerance here.
+                self.try_apply_delta_v2(checkpoint_delta, publish_token, false)?;
             } else {
                 self.metadata
                     .checkpoint

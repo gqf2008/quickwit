@@ -59,13 +59,18 @@ pub(super) static CAS_CONFLICTS_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
 /// publishes an already-published split is still refused. Without the counter the tolerance would
 /// be invisible, and a client that keeps re-sending publishes it already got an acknowledgement for
 /// would look like normal traffic.
+///
+/// The checkpoint delta such a replay carries is accepted the same way — applied already is done,
+/// not incompatible — and is not counted here: only the split state changes are.
 pub(super) static REPLAY_TOLERATED_SPLITS_TOTAL: LazyCounter = lazy_counter!(
     name: "file_backed_replay_tolerated_splits_total",
     description: "Number of split state changes that a replayed publish found already applied and \
                   accepted. The replay is either a caller's second attempt, whose first one \
                   committed before its response was lost, or the manifest layout finishing its own \
                   multi-step commit. Growth with no matching retry in the pipeline means callers are \
-                  re-sending publishes that already succeeded.",
+                  re-sending publishes that already succeeded. The checkpoint delta a replay carries \
+                  is accepted the same way and is not counted here; a fresh request that re-sends an \
+                  applied delta is still refused.",
     subsystem: "metastore",
 );
 
