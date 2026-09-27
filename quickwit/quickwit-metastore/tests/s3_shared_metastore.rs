@@ -41,7 +41,8 @@ use quickwit_config::{
 };
 use quickwit_metastore::{
     CreateIndexRequestExt, FileBackedMetastore, IndexLayout, ListSplitsQuery, ListSplitsRequestExt,
-    MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState, StageSplitsRequestExt,
+    MetastoreServiceExt, MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState,
+    StageSplitsRequestExt,
 };
 use quickwit_proto::metastore::{
     CreateIndexRequest, DeleteIndexRequest, IndexMetadataRequest, LastDeleteOpstampRequest,
@@ -410,6 +411,21 @@ async fn test_sharded_layout_on_s3_endpoint() -> anyhow::Result<()> {
         !storage.exists(&root_path).await?,
         "deleting the index should remove its sharded objects"
     );
+    // The root alone is not the question: the layout also writes a view, one slot file per touched
+    // slot and the segments they name. `exists(root)` passes while any of those stays behind, so
+    // this walks the whole listing the way an operator auditing the bucket would.
+    // Measured: dropping the view's delete from `delete_sharded_index` leaves the root check
+    // green and this one red, naming `v2/splits/view.json`.
+    assert_index_left_nothing_behind(&*storage, &index_id, "deleting a sharded index").await?;
+    // And nothing the delete missed makes the index look alive to a node that starts afterwards,
+    // with no cache to answer from. A node that already holds the index keeps answering until its
+    // polling interval elapses — that is the read path's cache, not a leftover, so asserting on a
+    // running node would be asserting the interval.
+    let mut metastore_d = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    assert!(
+        !metastore_d.index_exists(&index_id).await?,
+        "a node that starts after the delete still sees the index: something was left behind"
+    );
     Ok(())
 }
 
@@ -553,6 +569,14 @@ async fn test_manifest_layout_on_s3_endpoint() -> anyhow::Result<()> {
         !storage.exists(&root_path).await?,
         "deleting the index should remove its objects"
     );
+    // Same question as the sharded test, with more objects to miss: the stripes, their WAL files,
+    // the segments a fold wrote and the per-shard objects.
+    assert_index_left_nothing_behind(&*storage, &index_id, "deleting a manifest index").await?;
+    let mut metastore_d = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    assert!(
+        !metastore_d.index_exists(&index_id).await?,
+        "a node that starts after the delete still sees the index: something was left behind"
+    );
     Ok(())
 }
 
@@ -679,6 +703,10 @@ async fn test_manifest_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
         .delete_index(DeleteIndexRequest {
             index_uid: Some(index_uid),
         })
+        .await?;
+    // A fold leaves segments and collected WAL behind as well, so this is the delete to walk the
+    // listing on: whatever the folds wrote has to go with the index.
+    assert_index_left_nothing_behind(&*storage, &index_id, "deleting a folded manifest index")
         .await?;
     Ok(())
 }
@@ -839,6 +867,8 @@ async fn test_sharded_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
         .delete_index(DeleteIndexRequest {
             index_uid: Some(index_uid),
         })
+        .await?;
+    assert_index_left_nothing_behind(&*storage, &index_id, "deleting a folded sharded index")
         .await?;
     Ok(())
 }
@@ -1134,4 +1164,37 @@ async fn object_snapshot(
         }
     }
     Ok(snapshot)
+}
+
+/// Every object under `prefix`, following the listing's pages. A real endpoint paginates, so an
+/// assertion about what an index left behind has to walk the pages rather than look at one key.
+async fn objects_under(storage: &dyn Storage, prefix: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let mut pages = storage.list(prefix);
+    while let Some(page) = futures::StreamExt::next(&mut pages).await {
+        for metadata in page? {
+            paths.push(metadata.path);
+        }
+    }
+    Ok(paths)
+}
+
+/// Asserts that deleting the index left nothing at all under `<index_id>/`.
+///
+/// [`Storage::exists`] answers for one key, so a delete that misses the view, a slot file, a
+/// segment, a shard object or a WAL still passes an `exists(root)` check while the bucket keeps
+/// paying for it. This walks the whole listing instead, the way an operator auditing the prefix
+/// would, and names every object that is still there.
+async fn assert_index_left_nothing_behind(
+    storage: &dyn Storage,
+    index_id: &str,
+    what: &str,
+) -> anyhow::Result<()> {
+    let leftovers = objects_under(storage, Path::new(index_id)).await?;
+    assert!(
+        leftovers.is_empty(),
+        "{what} left {} object(s) under `{index_id}/`: {leftovers:?}",
+        leftovers.len()
+    );
+    Ok(())
 }
