@@ -45,7 +45,7 @@ walk the index set adopt what it has (see *Seeing what another node created* bel
 ## Operating it
 
 - **Alerts**: page on any increase of `..._cas_conflicts_exhausted_total` (a mutation failed under
-  contention; on a manifest-layout index its splits are still published, see
+  contention; on a manifest-layout index part or all of its splits may be published, see
   [the counters](../configuration/metastore-config.md#monitoring-a-shared-metastore));
   warn when conflicts exceed ~10% of the metastore write rate over five minutes.
 - **Cost**: sharing costs one extra read per metadata write (create: 3 PUT vs 3 PUT + 1 GET; delete:
