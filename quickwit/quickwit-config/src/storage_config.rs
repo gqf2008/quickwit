@@ -14,6 +14,7 @@
 
 use std::ops::Deref;
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::{env, fmt};
 
 use anyhow::ensure;
@@ -21,6 +22,8 @@ use itertools::Itertools;
 use quickwit_common::{get_bool_from_env, get_from_env_opt};
 use serde::{Deserialize, Serialize};
 use serde_with::{EnumMap, serde_as};
+
+use crate::serde_utils::HumanDuration;
 
 /// Lists the storage backends supported by Quickwit.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -402,6 +405,20 @@ pub struct S3StorageConfig {
     pub disable_stalled_stream_protection_upload: bool,
     #[serde(default)]
     pub disable_stalled_stream_protection_download: bool,
+    /// How long an S3 request waits for the first byte of its response before giving up.
+    ///
+    /// A connection that goes away without a reset — a NAT or a proxy that forgets the flow —
+    /// leaves a request waiting forever when the client has no read timeout, which is what the
+    /// SDK defaults to. A metastore call that never returns hangs the publisher or the GC with
+    /// it, instead of failing and letting the retry and the replay handle it. The timeout
+    /// covers the wait for the first byte, not the transfer, so a large split that streams
+    /// steadily is not affected.
+    ///
+    /// Unset means the storage's own default (30s, see `DEFAULT_S3_READ_TIMEOUT` in
+    /// `quickwit-storage`); `0s` is how a deployment that wants the old behaviour asks for no
+    /// timeout at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_timeout: Option<HumanDuration>,
 }
 
 impl S3StorageConfig {
@@ -456,6 +473,16 @@ impl S3StorageConfig {
             .or_else(|| self.endpoint.clone())
     }
 
+    /// How long a request waits for the first byte of its response, as configured.
+    ///
+    /// `None` is the unset value: the storage reads that as its own default. `Some(0s)` is what
+    /// asks for no timeout at all, so the two are deliberately not folded together here.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
+            .as_ref()
+            .map(|read_timeout| **read_timeout)
+    }
+
     pub fn force_path_style_access(&self) -> Option<bool> {
         static FORCE_PATH_STYLE: OnceLock<Option<bool>> = OnceLock::new();
         *FORCE_PATH_STYLE.get_or_init(|| {
@@ -493,6 +520,7 @@ impl fmt::Debug for S3StorageConfig {
                 "disable_stalled_stream_protection_download",
                 &self.disable_stalled_stream_protection_download,
             )
+            .field("read_timeout", &self.read_timeout)
             .finish()
     }
 }
@@ -529,6 +557,53 @@ impl GoogleCloudStorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The S3 read timeout is written the way every other duration in the configuration is, and the
+    /// two meaningful values — a bound and "no bound" — come out distinct.
+    #[test]
+    fn test_s3_read_timeout_parses() {
+        let storage_configs: StorageConfigs =
+            serde_yaml::from_str("s3:\n  read_timeout: 5s").unwrap();
+        let s3_config = storage_configs
+            .iter()
+            .find_map(|storage_config| storage_config.as_s3())
+            .unwrap();
+        assert_eq!(s3_config.read_timeout(), Some(Duration::from_secs(5)));
+        let round_tripped: StorageConfigs =
+            serde_yaml::from_str(&serde_yaml::to_string(&storage_configs).unwrap()).unwrap();
+        assert_eq!(
+            round_tripped
+                .iter()
+                .find_map(|storage_config| storage_config.as_s3())
+                .unwrap()
+                .read_timeout(),
+            Some(Duration::from_secs(5)),
+            "the timeout has to survive being written back out"
+        );
+
+        let storage_configs: StorageConfigs = serde_yaml::from_str("s3: {}").unwrap();
+        assert_eq!(
+            storage_configs
+                .iter()
+                .find_map(|storage_config| storage_config.as_s3())
+                .unwrap()
+                .read_timeout(),
+            None,
+            "an unset timeout is not the same as a disabled one"
+        );
+
+        let storage_configs: StorageConfigs =
+            serde_yaml::from_str("s3:\n  read_timeout: 0s").unwrap();
+        assert_eq!(
+            storage_configs
+                .iter()
+                .find_map(|storage_config| storage_config.as_s3())
+                .unwrap()
+                .read_timeout(),
+            Some(Duration::ZERO),
+            "`0s` is how a deployment asks for no read timeout"
+        );
+    }
 
     #[test]
     fn test_storage_configs_serde() {

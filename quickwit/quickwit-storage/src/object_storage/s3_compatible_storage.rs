@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{fmt, io};
 
 use anyhow::{Context as AnyhhowContext, anyhow};
@@ -149,6 +149,13 @@ fn get_region(s3_storage_config: &S3StorageConfig) -> Option<Region> {
     })
 }
 
+/// How long an S3 request waits for the first byte of its response when the storage configuration
+/// does not say otherwise.
+///
+/// The AWS SDK's default is to wait forever, which turns a silently dropped connection into a
+/// metastore call that never returns.
+pub const DEFAULT_S3_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     let aws_config = get_aws_config().await;
     let credentials_provider =
@@ -171,7 +178,23 @@ pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
         .download_enabled(!s3_storage_config.disable_stalled_stream_protection_download)
         .build();
     s3_config.set_stalled_stream_protection(Some(stalled_stream_protection));
-    s3_config.set_timeout_config(aws_config.timeout_config().cloned());
+    // Without a read timeout a request waits forever on a connection that went away without a
+    // reset — a NAT or a proxy that forgets the flow — and the caller waits with it: a metastore
+    // call that never returns hangs the publisher or the GC instead of failing so that the retry
+    // and the replay can do their job. The timeout is on the wait for the first byte of the
+    // response, not on the transfer, so an object that streams steadily is unaffected.
+    let read_timeout = match s3_storage_config.read_timeout() {
+        // `0s` in the configuration is how a deployment asks for the old behaviour back.
+        Some(read_timeout) if read_timeout.is_zero() => None,
+        Some(read_timeout) => Some(read_timeout),
+        None => Some(DEFAULT_S3_READ_TIMEOUT),
+    };
+    let mut timeout_config_builder = aws_config
+        .timeout_config()
+        .map(|timeout_config| timeout_config.to_builder())
+        .unwrap_or_default();
+    timeout_config_builder.set_read_timeout(read_timeout);
+    s3_config.set_timeout_config(Some(timeout_config_builder.build()));
 
     // We always disable response checksum. We mostly do range request anyway.
     // Somehow, localstack keeps returning the full checksum on range request, which
@@ -1374,6 +1397,47 @@ mod tests {
 
     use super::*;
     use crate::{DebouncedStorage, MultiPartPolicy, S3CompatibleObjectStorage};
+
+    /// A request has to give up waiting for a response, and the storage configuration has to be
+    /// able to move that bound and to ask for no bound at all.
+    #[tokio::test]
+    async fn test_s3_client_read_timeout() {
+        let read_timeout = |client: &S3Client| {
+            client
+                .config()
+                .timeout_config()
+                .and_then(|timeout_config| timeout_config.read_timeout())
+        };
+
+        let client = create_s3_client(&S3StorageConfig::default()).await;
+        assert_eq!(
+            read_timeout(&client),
+            Some(DEFAULT_S3_READ_TIMEOUT),
+            "an unset read timeout has to become the storage default, not the SDK's wait-forever"
+        );
+
+        let configured = S3StorageConfig {
+            read_timeout: Some(Duration::from_secs(5).into()),
+            ..Default::default()
+        };
+        let client = create_s3_client(&configured).await;
+        assert_eq!(
+            read_timeout(&client),
+            Some(Duration::from_secs(5)),
+            "the storage configuration has to override the default"
+        );
+
+        let disabled = S3StorageConfig {
+            read_timeout: Some(Duration::ZERO.into()),
+            ..Default::default()
+        };
+        let client = create_s3_client(&disabled).await;
+        assert_eq!(
+            read_timeout(&client),
+            None,
+            "`0s` is the documented way to ask for no read timeout"
+        );
+    }
 
     #[tokio::test]
     async fn test_md5_calc() -> std::io::Result<()> {

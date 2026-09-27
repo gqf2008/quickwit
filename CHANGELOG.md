@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Azure Blob Storage: support custom endpoints via `endpoint` and `endpoint_suffix` configuration options for sovereign clouds (#6624)
+- Storage: an S3 request now gives up waiting for the first byte of its response after **30 s**
+  (`storage.s3.read_timeout` moves that bound, `0s` waits forever as before). The AWS SDK sets no read timeout,
+  so a connection that went away without a reset — a NAT or a proxy that forgets the flow — held the request
+  forever: a metastore call that never returns hangs the publisher or the GC instead of failing so that the
+  retry and the replay can run. The bound is on the wait for the first byte, not on the transfer, so an object
+  that streams steadily is unaffected. Measured: a request with no timeout sat in `mio::poll` for ten minutes
+  with its connection `ESTABLISHED` and no bytes moving, while the endpoint answered a fresh connection in
+  0.22 s. (walgit: `qw-s3-request-timeout`)
 - Storage: conditional writes (`put_if_absent`, `put_if_version_matches`, `get_all_with_version`) with a
   `PreconditionFailed` error kind, and a Cloudflare R2 storage flavor (`storage.s3.flavor: r2`, alias
   `cloudflare`) that sets `region: auto`, path-style access and `Content-MD5` checksums. Verified against the

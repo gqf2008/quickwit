@@ -76,6 +76,15 @@ impl From<HumanDuration> for Duration {
     }
 }
 
+impl From<Duration> for HumanDuration {
+    fn from(duration: Duration) -> Self {
+        HumanDuration {
+            duration_str: humantime::format_duration(duration).to_string(),
+            duration,
+        }
+    }
+}
+
 impl fmt::Debug for HumanDuration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_tuple("HumanDuration")
