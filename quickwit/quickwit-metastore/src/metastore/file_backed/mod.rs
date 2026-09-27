@@ -1220,6 +1220,14 @@ impl FileBackedMetastore {
     ) -> MetastoreResult<Vec<Split>> {
         let mut splits_per_index = Vec::with_capacity(index_id_with_incarnation_id_opts.len());
         for (index_id, incarnation_id_opt) in index_id_with_incarnation_id_opts {
+            // A read that names no incarnation is the listing that names no index either — the
+            // compaction planner reads that way, and `list_splits_inner` takes its index set from
+            // the `Active` snapshot. An index that entered a transitioning state after that
+            // snapshot is not part of the listing, so the listing skips it, the way it already
+            // skips an index that is not there. A read that does name an index keeps reporting the
+            // state: whoever asked for that index has to learn it is not readable, rather than read
+            // an empty split list as "no data".
+            let read_is_a_listing = incarnation_id_opt.is_none();
             // An index stored in the manifest layout is read from its segments, pruned by the
             // query's window, instead of being materialised: that is the whole point of the layout.
             match self
@@ -1232,6 +1240,7 @@ impl FileBackedMetastore {
                 }
                 Ok(None) => {}
                 Err(MetastoreError::NotFound(_)) => continue,
+                Err(error) if read_is_a_listing && is_transitioning_state_error(&error) => continue,
                 Err(error) => return Err(error),
             }
             match self
@@ -1247,6 +1256,7 @@ impl FileBackedMetastore {
                     // If the index does not exist, we just skip it.
                     continue;
                 }
+                Err(error) if read_is_a_listing && is_transitioning_state_error(&error) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -6545,6 +6555,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![readable_index_id],
             "the listing answers with what it can read and skips the index in transition"
+        );
+        Ok(())
+    }
+
+    /// A listing that names no index — the shape the compaction planner reads in — skips an index
+    /// that is in a transitioning state instead of failing the whole pass on it.
+    #[tokio::test]
+    async fn test_a_listing_of_splits_skips_an_index_in_a_transitioning_state() -> anyhow::Result<()>
+    {
+        let storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let metastore = FileBackedMetastore::for_test(storage);
+        let index_id = "test-transitioning-splits-listing".to_string();
+        metastore
+            .state
+            .write()
+            .await
+            .indexes
+            .insert(index_id.clone(), LazyIndexStatus::Deleting);
+
+        let splits = metastore
+            .list_splits_aux(
+                &[(index_id, None)],
+                ListSplitsQuery::for_all_indexes().with_split_state(SplitState::Published),
+            )
+            .await?;
+        assert!(
+            splits.is_empty(),
+            "a listing has to skip the index in a transitioning state, not fail on it: {splits:?}"
+        );
+        Ok(())
+    }
+
+    /// The same read, naming the index: the caller has to learn that the index is not readable
+    /// rather than read an empty split list as "no data".
+    #[tokio::test]
+    async fn test_a_read_of_a_named_transitioning_index_reports_the_state() -> anyhow::Result<()> {
+        let storage: Arc<dyn Storage> = Arc::new(RamStorage::default());
+        let metastore = FileBackedMetastore::for_test(storage);
+        let index_id = "test-transitioning-splits-named".to_string();
+        metastore
+            .state
+            .write()
+            .await
+            .indexes
+            .insert(index_id.clone(), LazyIndexStatus::Deleting);
+
+        let error = metastore
+            .list_splits_aux(
+                &[(index_id, Some(Ulid::new()))],
+                ListSplitsQuery::for_all_indexes().with_split_state(SplitState::Published),
+            )
+            .await
+            .expect_err("a read that names the index has to report the state");
+        assert!(
+            matches!(error, MetastoreError::Internal { .. }),
+            "the state is a failure for the caller that asked for this index: {error:?}"
         );
         Ok(())
     }
