@@ -1360,8 +1360,10 @@ impl FileBackedMetastore {
                 }
                 // Giving up on the index metadata is the case an operator has to be able to see:
                 // the splits of this mutation are committed by now (they commit
-                // before the root), so the caller's retry can no longer finish it —
-                // publishing an already published split is refused by contract.
+                // before the root), so the caller gets an error for a mutation whose split work
+                // already landed, and a caller that does not replay cannot tell that state from a
+                // mutation nothing happened to. A replay of the same publish does finish it — the
+                // already-published splits are tolerated, which is what `is_replay` is for.
                 // Leaving this uncounted is what let a real 5-node run exhaust
                 // the budget with `cas_conflicts_exhausted_total` still at zero.
                 if is_manifest_conflict(&error) {
@@ -3710,9 +3712,10 @@ mod tests {
     /// A root that never commits has to be counted as an exhausted budget.
     ///
     /// The manifest layout commits the splits of a mutation before it commits the index metadata,
-    /// so when the metadata is what keeps losing, the caller's retry cannot finish the
-    /// mutation: publishing a split that is already published is refused by contract. This is
-    /// the failure a real five-node run against a bucket 0.81 s away hit, and the counter
+    /// so when the metadata is what keeps losing the caller gets an error after its split work
+    /// already landed: the splits are published, the index metadata update is not, and only a
+    /// replay of the same publish finishes it (the already-published splits are tolerated). This
+    /// is the failure a real five-node run against a bucket 0.81 s away hit, and the counter
     /// stayed at zero because only the split path recorded its exhaustion.
     #[tokio::test]
     async fn test_a_root_that_never_commits_is_counted_as_exhausted() {
@@ -3778,6 +3781,95 @@ mod tests {
             CAS_CONFLICTS_EXHAUSTED_TOTAL.get() - exhausted_before >= 1,
             "giving up on the index metadata has to be visible to operators"
         );
+    }
+
+    /// The counterpart of the test above: a caller that does replay finishes the mutation its
+    /// root commit gave up on.
+    ///
+    /// The splits are committed before the index metadata, so a mutation that exhausts the budget
+    /// on the metadata has published its splits already. The pipeline's second attempt carries
+    /// `is_replay`, and that is what lets it finish: the splits it is about to publish are already
+    /// published, which a fresh request would be refused for but a replay tolerates.
+    #[tokio::test]
+    async fn test_a_replay_finishes_a_mutation_whose_root_commit_exhausted_the_budget() {
+        use quickwit_config::{SourceConfig, SourceParams};
+
+        use crate::metastore::file_backed::manifest_layout::test_hooks;
+
+        let index_id = "test-root-exhaustion-replay";
+        let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
+        let source_id = "test-source";
+        let storage = Arc::new(RamStorage::default());
+        let mut metastore = FileBackedMetastore::try_new(storage, None).await.unwrap();
+        metastore.set_distributed(true);
+        metastore.set_index_layout(IndexLayout::ManifestSegments {
+            bucket_secs: 3_600,
+            num_stripes: 4,
+        });
+        let split_metadata = SplitMetadata::for_test(SplitId::from("split-0"));
+        let index_uid = metastore
+            .create_index(
+                CreateIndexRequest::try_from_index_and_source_configs(
+                    &index_config,
+                    &[SourceConfig::for_test(source_id, SourceParams::void())],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .index_uid()
+            .clone();
+        metastore
+            .stage_splits(
+                StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let checkpoint_delta = IndexCheckpointDelta::for_test(source_id, 0..10);
+        let publish_request = |is_replay: bool| PublishSplitsRequest {
+            index_uid: Some(index_uid.clone()),
+            staged_split_ids: vec![split_metadata.split_id.to_string()],
+            index_checkpoint_delta_json_opt: Some(
+                serde_json::to_string(&checkpoint_delta).unwrap(),
+            ),
+            is_replay,
+            ..Default::default()
+        };
+
+        // Every commit of the index metadata fails: the splits commit, the metadata does not, and
+        // the first attempt gives up after its budget.
+        test_hooks::fail_next_root_commits(index_id, DISTRIBUTED_MAX_ATTEMPTS as u32);
+        let first_attempt = metastore.publish_splits(publish_request(false)).await;
+        assert!(
+            matches!(
+                first_attempt,
+                Err(MetastoreError::FailedPrecondition { .. })
+            ),
+            "the first attempt has to report the metadata conflict: {first_attempt:?}"
+        );
+
+        // The pipeline's second attempt replays the same request, and it has to finish the
+        // mutation rather than fail on the split it published before.
+        metastore
+            .publish_splits(publish_request(true))
+            .await
+            .expect("a replay has to finish a mutation whose splits are already published");
+
+        let listed = metastore
+            .list_splits(
+                ListSplitsRequest::try_from_list_splits_query(&ListSplitsQuery::for_index(
+                    index_uid,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .collect_splits()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].split_state, SplitState::Published);
     }
 
     /// A merge marks the splits it replaced and publishes the split that replaces them. When the

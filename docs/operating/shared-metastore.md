@@ -13,7 +13,7 @@ procedure lives in [Version upgrade](upgrades.md).
 Every metadata write reloads the file together with its version and writes it back with `If-Match`.
 Losing the race is normal — another node wrote first — so the operation replays within a bounded
 budget (16 attempts, the delay doubling from 10 ms to a 2 s cap) instead of overwriting the winner.
-Contention and dropped writes are exported as
+Contention, and the mutations that ran out of the replay budget, are exported as
 `quickwit_metastore_file_backed_cas_conflicts_total` and `..._exhausted_total`.
 
 ## Requirements
@@ -44,7 +44,9 @@ walk the index set adopt what it has (see *Seeing what another node created* bel
 
 ## Operating it
 
-- **Alerts**: page on any increase of `..._cas_conflicts_exhausted_total` (a write was dropped);
+- **Alerts**: page on any increase of `..._cas_conflicts_exhausted_total` (a mutation failed under
+  contention; on a manifest-layout index its splits are still published, see
+  [the counters](../configuration/metastore-config.md#monitoring-a-shared-metastore));
   warn when conflicts exceed ~10% of the metastore write rate over five minutes.
 - **Cost**: sharing costs one extra read per metadata write (create: 3 PUT vs 3 PUT + 1 GET; delete:
   2 PUT + 1 DELETE plus the read of the file being deleted). With the default commit settings a

@@ -441,7 +441,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A mutation gave up after exhausting its whole replay budget, so its write was dropped. Any increase is a lost write under contention: page on this one, and read the conflicts next to it for the cause.",
+      "description": "A mutation gave up after exhausting its whole replay budget, so the caller got an error. Any increase should be paged on: read the conflicts next to it for the cause. What such a mutation lost depends on the layout — the single-object and sharded layouts lost the whole write, while a manifest-layout mutation has already committed its splits and lost only the index metadata update.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -532,7 +532,7 @@
           "useBackend": false
         }
       ],
-      "title": "Metadata writes dropped after the replay budget",
+      "title": "Mutations that failed after the replay budget",
       "type": "timeseries"
     },
     {

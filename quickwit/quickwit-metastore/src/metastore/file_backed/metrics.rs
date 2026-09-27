@@ -15,7 +15,7 @@
 //! Metrics for the shared (compare-and-swap) write path of the file-backed metastore.
 //!
 //! These counters are the only way to see contention from the outside: every conflict means another
-//! node wrote the same object first, and an exhausted replay means a mutation was dropped after its
+//! node wrote the same object first, and an exhausted replay means a mutation failed after its
 //! retry budget ran out.
 
 use quickwit_metrics::{LazyCounter, lazy_counter};
@@ -32,12 +32,17 @@ pub(super) static CAS_CONFLICTS_TOTAL: LazyCounter = lazy_counter!(
     subsystem: "metastore",
 );
 
-/// Number of mutations that failed after exhausting their replay budget.
+/// Number of mutations that failed after exhausting their replay budget: the caller got an error,
+/// and what it lost depends on the layout (the whole-index layouts lose the write, the manifest
+/// layout has already committed the splits and loses only the index metadata).
 pub(super) static CAS_CONFLICTS_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
     name: "file_backed_cas_conflicts_exhausted_total",
     description: "Number of file-backed metastore mutations that failed after exhausting their \
-                  compare-and-swap replay budget. Any increase means a write was dropped under \
-                  contention and should be paged on.",
+                  compare-and-swap replay budget, so the caller got an error. Any increase should \
+                  be paged on. What such a mutation lost depends on the layout: the ones that keep \
+                  the split map in one object lost the whole write, while the manifest layout \
+                  commits a mutation's splits before the index metadata, so what it lost there is \
+                  the metadata update and not the splits.",
     subsystem: "metastore",
 );
 
