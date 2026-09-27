@@ -114,7 +114,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "sum by(rpc) (rate(quickwit_metastore_grpc_requests_total{kind=\"server\", instance=~\"$instance\"}[$__rate_interval]))",
+        "expr": "sum by(rpc) (rate(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\", instance=~\"$instance\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{operation}}",
@@ -213,7 +213,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "histogram_quantile(0.95, sum by(le, rpc) (rate(quickwit_metastore_grpc_request_duration_seconds_bucket{kind=\"server\", instance=~\"$instance\"}[$__rate_interval])))",
+        "expr": "histogram_quantile(0.95, sum by(le, rpc) (rate(quickwit_grpc_request_duration_seconds_bucket{service=\"metastore\", kind=\"server\", instance=~\"$instance\"}[$__rate_interval])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{rpc}}",
@@ -312,7 +312,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "sum by(rpc) (rate(quickwit_metastore_grpc_requests_total{kind=\"server\", status=\"error\", instance=~\"$instance\"}[$__rate_interval]))",
+        "expr": "sum by(rpc) (rate(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\", status=\"error\", instance=~\"$instance\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "{{rpc}}",
@@ -540,7 +540,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A publish being replayed found the split state it was about to write already applied, and accepted it. Both a caller's second attempt (whose first one committed before the response was lost) and the manifest layout finishing its own multi-step commit reach the mutation this way. Growth that no retry in the pipeline explains means callers re-send publishes that already succeeded.",
+      "description": "A publish being replayed found split state changes it was about to write already applied, and accepted them. Both a caller's second attempt (whose first one committed before the response was lost) and the manifest layout finishing its own multi-step commit reach the mutation this way. Growth that no retry in the pipeline explains means callers re-send publishes that already succeeded.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -631,7 +631,7 @@
           "useBackend": false
         }
       ],
-      "title": "Replayed publishes that found their work already applied",
+      "title": "Split state changes a replayed publish found already applied",
       "type": "timeseries"
     },
     {
@@ -1104,13 +1104,13 @@
         "type": "datasource"
       },
       {
-        "allValue": "",
+      "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
           "value": "$__all"
         },
-        "definition": "label_values(quickwit_metastore_grpc_requests_total{kind=\"server\"},instance)",
+      "definition": "label_values(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\"},instance)",
         "hide": 0,
         "includeAll": true,
         "label": "Instance",
@@ -1119,7 +1119,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(quickwit_metastore_grpc_requests_total{kind=\"server\"},instance)",
+          "query": "label_values(quickwit_grpc_requests_total{service=\"metastore\", kind=\"server\"},instance)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,

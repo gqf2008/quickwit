@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped after the replay budget, replayed publishes, manifest and shard folds with their failures, shard
   objects a reader skipped, and the manifest reads a listing pays for adoption — so a shared object-storage
   metastore's contention and dropped writes are visible where an operator looks, not only in Prometheus.
+  The same dashboard's three request panels and its instance variable had kept the pre-0.9 gRPC metric names,
+  which no longer exist, so they showed nothing: they now query `quickwit_grpc_requests_total` and
+  `quickwit_grpc_request_duration_seconds` with `service="metastore"`, the names the upgrade notes give.
   (walgit: `qw-metastore-dashboard-counters`)
 - **Metastore: a third layout for very large indexes, where the manifest holds references instead of the
   split map.** `QW_METASTORE_MANIFEST_LAYOUT=true` makes a node create indexes with one manifest per stripe
