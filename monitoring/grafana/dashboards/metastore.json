@@ -342,7 +342,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A metadata write lost the compare-and-swap on the object it was updating. Most are replayed and succeed; the ones that gave up instead are counted again by the panel next to this one, which is why a rise here is contention rather than loss. Sustained growth means several nodes write the same metastore prefix.",
+      "description": "A metadata write lost the compare-and-swap on the object it was updating. A conflict that does not exhaust the replay budget is replayed against the fresh object; the ones that run out of budget are counted again by the panel next to this one, which is why a rise here is contention rather than loss. Sustained growth means several nodes write the same metastore prefix.",
       "fieldConfig": {
         "defaults": {
           "color": {

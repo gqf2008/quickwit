@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation keeps compiling, but `ObjectMetadata` gains a public field and `StorageErrorKind` two
   variants, which breaks exhaustive `match`es and struct literals outside this repository.
 - Metastore: a shared (S3-compatible) file-backed metastore now reports
-  `quickwit_metastore_file_backed_cas_conflicts_total` (writes that lost a compare-and-swap race and were
-  replayed) and `..._exhausted_total` (mutations dropped after the replay budget ran out), so contention and
+  `quickwit_metastore_file_backed_cas_conflicts_total` (writes that lost a compare-and-swap race; the ones
+  that ran out of the replay budget are counted again by the next counter) and `..._exhausted_total`
+  (mutations dropped after the replay budget ran out), so contention and
   dropped writes are visible from Prometheus. A third counter, `..._replay_tolerated_splits_total`, counts the
   split state changes a replayed publish found already applied, so the tolerance granted by `is_replay` is
   visible instead of silent. (walgit: `qw-metastore-cas-observability`, `qw-metastore-replay-visibility`)

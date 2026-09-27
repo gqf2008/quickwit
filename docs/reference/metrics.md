@@ -75,7 +75,7 @@ stripe into a segment), and how often a reader had to skip a shard object it cou
 
 | Namespace | Metric Name | Description | Type |
 | --------- | ----------- | ----------- | ---- |
-| `quickwit_metastore` | `file_backed_cas_conflicts_total` | Number of metadata writes that lost a compare-and-swap race and were replayed | `counter` |
+| `quickwit_metastore` | `file_backed_cas_conflicts_total` | Number of metadata writes that lost a compare-and-swap race; a conflict that does not exhaust the replay budget is replayed, the ones that run out of budget are counted again as `file_backed_cas_conflicts_exhausted_total` | `counter` |
 | `quickwit_metastore` | `file_backed_cas_conflicts_exhausted_total` | Number of mutations that failed after exhausting their replay budget | `counter` |
 | `quickwit_metastore` | `file_backed_replay_tolerated_splits_total` | Number of split state changes a replayed publish found already applied and accepted | `counter` |
 | `quickwit_metastore` | `file_backed_shard_folds_total` | Number of split slots of the sharded layout folded into a segment | `counter` |

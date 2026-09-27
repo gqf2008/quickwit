@@ -138,7 +138,7 @@ A shared metastore exposes these counters on the `/metrics` endpoint:
 
 | Metric | Meaning |
 | ------ | ------- |
-| `quickwit_metastore_file_backed_cas_conflicts_total` | Metadata writes that lost a compare-and-swap race (`412 Precondition Failed`) and were replayed against the fresh file. A conflict is normal and harmless: it only says another node wrote first. |
+| `quickwit_metastore_file_backed_cas_conflicts_total` | Metadata writes that lost a compare-and-swap race (`412 Precondition Failed`) against the fresh file. A conflict that does not exhaust the replay budget is replayed against it; the ones that run out of budget are counted again by `..._cas_conflicts_exhausted_total`. A conflict is normal and harmless: it only says another node wrote first. |
 | `quickwit_metastore_file_backed_cas_conflicts_exhausted_total` | Writes that failed after exhausting the bounded replay budget (16 attempts, the delay doubling from 10 ms up to a 2 s cap, plus jitter — under 20 s in total). The mutation was **not** applied. |
 | `quickwit_metastore_file_backed_replay_tolerated_splits_total` | Split state changes that a publish being replayed found already applied and accepted. A replay is either a caller's second attempt, whose first one committed before its response was lost, or the manifest layout finishing its own multi-step commit. Growth without a matching retry in the pipeline means callers keep re-sending publishes that already succeeded. |
 | `quickwit_metastore_file_backed_shard_folds_total` | Split slots of the [sharded layout](#very-large-indexes-sharded-splits) folded into a segment. Folding is what keeps a slot file bounded, so this should grow slowly but steadily on an index being written to. |
