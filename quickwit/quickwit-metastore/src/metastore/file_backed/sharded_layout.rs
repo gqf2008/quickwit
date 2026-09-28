@@ -940,8 +940,13 @@ mod tests {
         // root and the view and reaches the listing this test is about.
         storage
             .expect_get_all_with_version()
+            // Root and view, and then nothing: the read has to stop at the listing whose versions
+            // are missing rather than go on to download a slot file.
+            .times(2)
             .returning(move |path| {
                 let storage = ram_storage_for_reads.clone();
+                // The mock's expectations are synchronous, and this is the same pattern the other
+                // tests in this crate use to forward to a real storage from one.
                 block_on(async { storage.get_all_with_version(path).await })
             });
         storage.expect_list().returning(|prefix| {

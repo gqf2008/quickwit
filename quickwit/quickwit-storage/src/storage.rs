@@ -45,10 +45,10 @@ pub struct ObjectMetadata {
     ///
     /// This is the same opaque token [`Storage::put_if_version_matches`] expects, so a caller can
     /// compare a listing against versions it recorded earlier to find out which objects changed,
-    /// without downloading any of them. Backends that do not report one when listing — the local
-    /// file backend, for instance — leave it `None`, and callers must then fall back to reading
-    /// the object. RAM reports its own write counter here, so a listing on it does say which
-    /// objects changed.
+    /// without downloading any of them. A backend that lists without a version — an S3-compatible
+    /// endpoint that returns no ETag, say — leaves it `None`, and callers must then fall back to
+    /// reading the object. RAM reports its own write counter here, so a listing on it does say
+    /// which objects changed; the local file backend does not list objects at all.
     pub object_version: Option<ObjectVersion>,
 }
 
