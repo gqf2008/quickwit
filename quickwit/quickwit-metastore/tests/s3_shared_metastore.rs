@@ -358,6 +358,79 @@ async fn test_shared_metastore_either_shares_safely_or_refuses_to_start() -> any
     Ok(())
 }
 
+/// Deleting an index also drops it from the shared root manifest.
+///
+/// The objects under the index prefix are only half of the delete: a shared metastore keeps one
+/// `manifest.json` at the storage root that lists every index, and the delete removes the entry
+/// *after* it removes the objects. No other test reads that object, so a delete that left the entry
+/// behind would pass all of them — and a node that adopts the manifest would keep an index that is
+/// no longer there, or hand a recreated index the dead one's status.
+#[tokio::test]
+async fn test_deleting_an_index_drops_it_from_the_shared_manifest() -> anyhow::Result<()> {
+    if !endpoint_is_configured() {
+        eprintln!(
+            "skipping test_deleting_an_index_drops_it_from_the_shared_manifest: QW_S3_ENDPOINT is \
+             not set"
+        );
+        return Ok(());
+    }
+    let bucket_uri = append_random_suffix(&format!("{}/shared-manifest-delete", test_bucket_uri()));
+    let storage = s3_storage(&bucket_uri).await?;
+    if skip_unless_the_endpoint_can_be_shared(
+        &*storage,
+        "test_deleting_an_index_drops_it_from_the_shared_manifest",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
+    assert!(
+        metastore.is_distributed(),
+        "an s3:// metastore on an endpoint that enforces conditional writes runs in shared mode"
+    );
+    let index_id = append_random_suffix("shared-manifest-delete-index");
+    let index_config = IndexConfig::for_test(&index_id, &format!("s3://bucket/{index_id}"));
+    let index_uid: IndexUid = metastore
+        .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)
+        .await?
+        .index_uid()
+        .clone();
+    assert!(
+        shared_manifest_indexes(&*storage)
+            .await?
+            .contains(&index_id),
+        "creating an index has to register it in the shared root manifest"
+    );
+
+    metastore
+        .delete_index(DeleteIndexRequest {
+            index_uid: Some(index_uid),
+        })
+        .await?;
+    assert!(
+        !shared_manifest_indexes(&*storage)
+            .await?
+            .contains(&index_id),
+        "deleting an index has to drop its entry from the shared root manifest"
+    );
+    Ok(())
+}
+
+/// The index ids the shared root manifest lists, read from the object itself rather than from any
+/// node's cache.
+async fn shared_manifest_indexes(storage: &dyn Storage) -> anyhow::Result<Vec<String>> {
+    let bytes = storage.get_all(Path::new("manifest.json")).await?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).context("the root manifest should be JSON")?;
+    Ok(manifest
+        .get("indexes")
+        .and_then(|indexes| indexes.as_object())
+        .map(|indexes| indexes.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 /// The sharded layout on a real endpoint: two nodes publish, both keep their splits, and the index
 /// lives in the objects the layout describes (and nowhere else).
 ///
