@@ -118,6 +118,29 @@ async fn storage_enforces_conditional_writes(storage: &dyn Storage) -> anyhow::R
     Ok(enforces)
 }
 
+/// Skips a test that needs the endpoint to back a shared metastore when it cannot.
+///
+/// The capability itself is asserted by
+/// [`test_shared_metastore_either_shares_safely_or_refuses_to_start`], which runs on an endpoint
+/// with the capability and on one without it. A test that *uses* the shared behaviour has nothing
+/// to say about an endpoint that has none of it, and the repository's own `make test-all` points
+/// these tests at localstack, which accepts a second write carrying `If-None-Match: *` (measured
+/// against 3.5.0: neither `If-None-Match` nor `If-Match` is enforced). Skipping out loud beats
+/// failing every run of the suite there, and beats passing without sharing anything.
+async fn skip_unless_the_endpoint_can_be_shared(
+    storage: &dyn Storage,
+    test_name: &str,
+) -> anyhow::Result<bool> {
+    if storage_enforces_conditional_writes(storage).await? {
+        return Ok(false);
+    }
+    eprintln!(
+        "skipping {test_name}: the endpoint accepts a second write carrying `If-None-Match: *`, \
+         so it cannot back a shared metastore (AWS S3, Cloudflare R2 and MinIO do enforce it)"
+    );
+    Ok(true)
+}
+
 /// The conditional-write primitives the shared metastore is built on, against a real endpoint.
 #[tokio::test]
 async fn test_conditional_writes_on_s3_endpoint() -> anyhow::Result<()> {
@@ -348,6 +371,11 @@ async fn test_sharded_layout_on_s3_endpoint() -> anyhow::Result<()> {
     }
     let bucket_uri = append_random_suffix(&format!("{}/sharded-layout", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
+    if skip_unless_the_endpoint_can_be_shared(&*storage, "test_sharded_layout_on_s3_endpoint")
+        .await?
+    {
+        return Ok(());
+    }
     let mut metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
     metastore_a.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
     let metastore_b = {
@@ -455,6 +483,14 @@ async fn test_deleting_an_index_with_more_objects_than_one_page() -> anyhow::Res
     }
     let bucket_uri = append_random_suffix(&format!("{}/delete-pages", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
+    if skip_unless_the_endpoint_can_be_shared(
+        &*storage,
+        "test_deleting_an_index_with_more_objects_than_one_page",
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
     metastore.set_index_layout(IndexLayout::Sharded { num_slots: 8 });
 
@@ -519,6 +555,11 @@ async fn test_manifest_layout_on_s3_endpoint() -> anyhow::Result<()> {
     }
     let bucket_uri = append_random_suffix(&format!("{}/manifest-layout", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
+    if skip_unless_the_endpoint_can_be_shared(&*storage, "test_manifest_layout_on_s3_endpoint")
+        .await?
+    {
+        return Ok(());
+    }
     let mut metastore_a = FileBackedMetastore::try_new(storage.clone(), None).await?;
     metastore_a.set_index_layout(IndexLayout::ManifestSegments {
         bucket_secs: 3_600,
@@ -672,6 +713,11 @@ async fn test_manifest_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
     }
     let bucket_uri = append_random_suffix(&format!("{}/manifest-fold", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
+    if skip_unless_the_endpoint_can_be_shared(&*storage, "test_manifest_layout_fold_on_s3_endpoint")
+        .await?
+    {
+        return Ok(());
+    }
     let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
     // One stripe: every split of the batch hashes into it, so the batch itself is what makes the
     // stripe fold.
@@ -802,6 +848,11 @@ async fn test_sharded_layout_fold_on_s3_endpoint() -> anyhow::Result<()> {
     }
     let bucket_uri = append_random_suffix(&format!("{}/sharded-fold", test_bucket_uri()));
     let storage = s3_storage(&bucket_uri).await?;
+    if skip_unless_the_endpoint_can_be_shared(&*storage, "test_sharded_layout_fold_on_s3_endpoint")
+        .await?
+    {
+        return Ok(());
+    }
     let mut metastore = FileBackedMetastore::try_new(storage.clone(), None).await?;
     // One slot: every split of a batch hashes into it, so the batch itself is what makes the slot
     // fold, the way one stripe does in the manifest layout's own fold test.
