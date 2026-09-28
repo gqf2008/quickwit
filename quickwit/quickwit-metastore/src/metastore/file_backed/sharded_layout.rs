@@ -845,6 +845,7 @@ pub(super) async fn sharded_index_exists(
 mod tests {
     use std::sync::Arc;
 
+    use futures::executor::block_on;
     use quickwit_proto::types::{IndexUid, SplitId};
     use quickwit_storage::{MockStorage, RamStorage};
 
@@ -924,11 +925,55 @@ mod tests {
         assert_eq!(list_split_ids(&*storage).await.len(), 10);
     }
 
-    /// The layout tells a stale slot file from a current one by the version the listing reports,
-    /// which is why the documentation says it needs a storage that versions its objects. A storage
-    /// that returns none is an error rather than a split map nobody can tell apart from an old one.
+    /// The other half of the same requirement, and the one the documentation promises: a slot file
+    /// is re-read only when the version the listing reports differs from the one an earlier read
+    /// recorded, so a listing without versions is an error rather than a split map nobody can tell
+    /// apart from an older one.
     #[tokio::test]
-    async fn test_a_sharded_index_needs_the_versions_its_storage_reports() {
+    async fn test_a_listing_without_versions_is_an_error() {
+        let ram_storage = Arc::new(RamStorage::default());
+        create_index(&*ram_storage, 8).await;
+
+        let mut storage = MockStorage::default();
+        let ram_storage_for_reads = ram_storage.clone();
+        // Everything but the listing comes from a real sharded index, so the read gets past the
+        // root and the view and reaches the listing this test is about.
+        storage
+            .expect_get_all_with_version()
+            .returning(move |path| {
+                let storage = ram_storage_for_reads.clone();
+                block_on(async { storage.get_all_with_version(path).await })
+            });
+        storage.expect_list().returning(|prefix| {
+            let slots_prefix = prefix.to_path_buf();
+            Box::pin(futures::stream::once(async move {
+                Ok(vec![ObjectMetadata {
+                    path: slots_prefix.join("00000.json"),
+                    size: bytesize::ByteSize(2),
+                    last_modified: std::time::SystemTime::UNIX_EPOCH,
+                    object_version: None,
+                }])
+            }))
+        });
+
+        let error = load_sharded_index_once(&storage, INDEX_ID)
+            .await
+            .expect_err("a listing without versions cannot say which slot files changed");
+        let message = error.to_string();
+        assert!(
+            message.contains("requires a storage that versions objects")
+                && message.contains("00000.json"),
+            "the error has to name the capability and the object it could not version, got: \
+             {message}"
+        );
+    }
+
+    /// The read needs the version of the root: that is the token the write path compares and swaps
+    /// against, so a storage that returns no version cannot back this layout. A storage that
+    /// returns none is an error rather than a root nobody can tell apart from the one it read
+    /// earlier.
+    #[tokio::test]
+    async fn test_a_sharded_index_needs_the_version_of_its_root() {
         let mut storage = MockStorage::default();
         storage
             .expect_get_all_with_version()
