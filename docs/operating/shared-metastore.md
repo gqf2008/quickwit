@@ -112,14 +112,14 @@ index's split map, which the whole-index layouts do and which this layout exists
 - The janitor's `DeleteTaskPlanner` used to trip the actor progress watchdog under load: its
   metastore and search calls are now awaited in the actor framework's protected zone, which is what
   those calls need (they are another actor's latency, not this one's), and the 5-node manifest-layout
-  run above has no such fault. A protected call is no longer covered by this actor's watchdog, so what
-  stops such a call is the client of the service being called: the storage client's
-  `storage.s3.read_timeout` on the metastore path (five minutes by default, see
-  [storage configuration](../configuration/storage-config.md#s3-storage-configuration)), and the leaf
-  search timeout on the search path (`leaf_request_timeout`, 30 s). Without a bound a request whose
-  connection stalls holds the call, and the actor with it, forever — measured on this machine: a
-  request with no read timeout sat for ten minutes with its connection `ESTABLISHED` and no bytes
-  moving, while the same endpoint answered a fresh connection in 0.22 s.
+  run above has no such fault. A protected call is no longer covered by this actor's watchdog, so it is
+  the party being called that has to stop such a call: on the metastore path the metastore's own storage
+  client bounds it with `storage.s3.read_timeout` (five minutes by default, see
+  [storage configuration](../configuration/storage-config.md#s3-storage-configuration)), and on the
+  search path the leaf bounds it with `searcher.leaf_request_timeout_secs` (30 s by default). Without a
+  bound a request whose connection stalls holds the call, and the actor with it, forever — measured on
+  this machine: a request with no read timeout sat for ten minutes with its connection `ESTABLISHED` and
+  no bytes moving, while the same endpoint answered a fresh connection in 0.22 s.
 
 ## Very large indexes: sharded splits
 
