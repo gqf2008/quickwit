@@ -112,9 +112,13 @@ index's split map, which the whole-index layouts do and which this layout exists
 - The janitor's `DeleteTaskPlanner` used to trip the actor progress watchdog under load: its
   metastore and search calls are now awaited in the actor framework's protected zone, which is what
   those calls need (they are another actor's latency, not this one's), and the 5-node manifest-layout
-  run above has no such fault. A protected call is no longer covered by this actor's watchdog, so a
-  call that never returns relies on the downstream service to fail; if that shows up, bound it in
-  the client rather than here.
+  run above has no such fault. A protected call is no longer covered by this actor's watchdog, so it
+  is the storage client that has to fail rather than wait: it does, through
+  `storage.s3.read_timeout` (five minutes by default, see
+  [storage configuration](../configuration/storage-config.md)). Without that bound a request whose
+  connection stalls holds the call, and the actor with it, forever — measured on this machine: a
+  request with no read timeout sat for ten minutes with its connection `ESTABLISHED` and no bytes
+  moving, while the same endpoint answered a fresh connection in 0.22 s.
 
 ## Very large indexes: sharded splits
 
