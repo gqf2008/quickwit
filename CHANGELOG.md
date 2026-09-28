@@ -43,18 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (walgit: `qw-metastore-dashboard-counters`)
 - **Metastore: a sharded layout for indexes too large to rewrite on every publish.**
   `QW_METASTORE_SHARDED_LAYOUT=true` makes a node create indexes whose split metadata lives in one slot file
-  per slot (`v2/splits/slots/<slot>.json`), with a view that names, per slot, the segment and the slot
-  version folded into it. A publish rewrites only the slots it touched instead of the whole split map, and a
-  reader fetches the view and the slot files whose version changed; segments are folded per slot against the
-  view's generation, and two generations are kept so a reader holding an older view still resolves. The
-  layout is recorded in the objects, so a node reads an index whichever layout created it, and the slot count
-  is fixed when the index is created. Measured with the same workload at 180 splits: a publish rewrites
-  1.6 KB → 5.6 KB against 6.5 KB → 123.9 KB for the single-object layout. A mutation commits the slots it
-  touched **before** its index metadata (the object that carries the checkpoint), so a failure between the
-  two leaves the splits published with the checkpoint behind them: a replay finishes the mutation, and a
-  caller that never replays pays duplicated documents rather than lost ones.
-  (walgit: `qw-metastore-sharded-layout`, `qw-metastore-sharded-split-store`, `qw-sharded-partial-commit`,
-  `qw-sharded-fold-on-s3`)
+  per slot (`v2/splits/slots/00042.json`), with a view that names, per slot, the segment and the slot version
+  folded into it. A publish rewrites only the slots it touched instead of the whole split map, and a reader
+  fetches the view and the slot files whose version changed; segments are folded per slot against the view's
+  generation, and two generations are kept so a reader holding an older view still resolves. The layout is
+  recorded in the objects, so a node reads an index whichever layout created it, and the slot count is fixed
+  when the index is created. Measured with the same workload at 180 splits — 64 slots and a fold threshold of
+  8, before a fold has to rewrite a large segment, not the 256/512 defaults — a publish rewrites 1.6 KB → 5.6 KB
+  against 6.5 KB → 123.9 KB for the single-object layout. A mutation commits the slots it touched **before**
+  its index metadata, which is why a failure between the two costs duplicated documents rather than lost ones
+  (see the commit-order entry under Fixed). (walgit: `qw-metastore-sharded-layout`,
+  `qw-metastore-sharded-split-store`, `qw-sharded-partial-commit`, `qw-sharded-fold-on-s3`)
 - **Metastore: a third layout for very large indexes, where the manifest holds references instead of the
   split map.** `QW_METASTORE_MANIFEST_LAYOUT=true` makes a node create indexes with one manifest per stripe
   (`v3/manifest-<stripe>.json`), an immutable WAL object per published batch and one segment per time bucket,
@@ -123,11 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (walgit: `qw-metastore-create-replay-fix`)
 - Metastore: a listing no longer fails because another node is in the middle of creating or deleting one of the
   indexes it is listing. An index in that state (which the listing's own snapshot already excludes) used to come
-  back as an internal error and take the whole call with it — the stats listing behind `/api/v1/indexes/stats`,
-  and the split listing the compaction planner and the janitor run over every index. A listing that names no
-  index now skips it, the way it already skips an index that is not there; a read that *does* name an index
-  still reports the state, so a caller cannot mistake an unreadable index for an empty one. The same state's
-  error also stopped printing `{index_id}` literally, and the metadata listing now recognises it at all.
+  back as an internal error and take the whole call with it — the metastore's `ListIndexStats` listing, and the
+  split listing the compaction planner and the janitor run over every index. A listing that names no index now
+  skips it, the way it already skips an index that is not there; a read that *does* name an index still reports
+  the state, so a caller cannot mistake an unreadable index for an empty one. The same state's error also stopped
+  printing `{index_id}` literally, and the metadata listing now recognises it at all.
   (walgit: `qw-transient-state-error-text`, `qw-listing-skips-transitioning`, `qw-splits-listing-skips-transitioning`)
 - Metastore: the compare-and-swap replay budget went from 8 attempts with a 500 ms cap to 16 attempts capped at
   2 s; two nodes publishing into one index exhausted the old budget 11 times in two minutes.
