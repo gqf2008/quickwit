@@ -846,7 +846,7 @@ mod tests {
     use std::sync::Arc;
 
     use quickwit_proto::types::{IndexUid, SplitId};
-    use quickwit_storage::RamStorage;
+    use quickwit_storage::{MockStorage, RamStorage};
 
     use super::*;
     use crate::{IndexMetadata, SplitMetadata, SplitState};
@@ -922,6 +922,26 @@ mod tests {
         let (_, context) = load_sharded_index(&*storage, INDEX_ID).await.unwrap();
         write(&*storage, 0..10, &context).await.unwrap();
         assert_eq!(list_split_ids(&*storage).await.len(), 10);
+    }
+
+    /// The layout tells a stale slot file from a current one by the version the listing reports,
+    /// which is why the documentation says it needs a storage that versions its objects. A storage
+    /// that returns none is an error rather than a split map nobody can tell apart from an old one.
+    #[tokio::test]
+    async fn test_a_sharded_index_needs_the_versions_its_storage_reports() {
+        let mut storage = MockStorage::default();
+        storage
+            .expect_get_all_with_version()
+            .returning(|_| Ok((OwnedBytes::new(br#"{"format_version":1}"#.to_vec()), None)));
+
+        let error = load_sharded_index_once(&storage, INDEX_ID)
+            .await
+            .expect_err("a storage that reports no object version cannot back the sharded layout");
+        let message = error.to_string();
+        assert!(
+            message.contains("requires a storage that versions objects"),
+            "the error has to name the capability the storage is missing, got: {message}"
+        );
     }
 
     // The fold is the part that keeps a slot file bounded: without it the file would grow with the
