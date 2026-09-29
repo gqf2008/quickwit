@@ -468,9 +468,10 @@ impl FileBackedMetastore {
     ///
     /// Probing only the first one accepts an endpoint that implements "create if absent" but not
     /// compare-and-swap, and then every commit of this node goes through unconditionally while the
-    /// node believes it is sharing safely. That is not hypothetical: localstack implemented
-    /// `If-None-Match` in 3.7.0 and `If-Match` in 4.0.3, so the versions in between answer the
-    /// first probe and ignore the second.
+    /// node believes it is sharing safely. That is not hypothetical: upstream implemented
+    /// `If-None-Match` in localstack PR 11402 (shipped in 3.7.0) and `If-Match` in PR 11941
+    /// (shipped in 4.0.3), so the versions in between answer the first probe and ignore the second
+    /// -- from the upstream history rather than from a bisection we ran ourselves.
     async fn probe_conditional_writes(
         storage: &dyn Storage,
         probe_path: &std::path::Path,
@@ -516,6 +517,9 @@ impl FileBackedMetastore {
             // A backend that cannot version an object cannot compare-and-swap at all, which is a
             // configuration gap rather than an endpoint that quietly ignores preconditions.
             Ok((_bytes, None)) => return ConditionalWriteSupport::NotImplemented,
+            Err(error) if error.kind() == StorageErrorKind::Unsupported => {
+                return ConditionalWriteSupport::NotImplemented;
+            }
             Err(error) => return probe_failed(error),
         };
         // The payload differs from the one above on purpose: an ETag is a hash of the content, so
