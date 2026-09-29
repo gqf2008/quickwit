@@ -20,8 +20,12 @@ Contention, and the mutations that ran out of the replay budget, are exported as
 
 - The endpoint must **enforce conditional writes** (`If-None-Match` / `If-Match`). Amazon S3 does
   (since November 2024), Cloudflare R2 and MinIO do. Localstack 3.5.0 does not.
-- At startup the node writes a throwaway object twice with `If-None-Match` and refuses to start in
-  shared mode if the second write is accepted, because such a prefix would silently lose updates.
+- At startup the node probes a throwaway object for both preconditions a commit uses: it writes it
+  twice with `If-None-Match` and requires the second write to be rejected, then reads its version,
+  overwrites it with different content, and requires a write carrying the version it read to be
+  rejected as well. An endpoint that enforces only one of the two would silently lose updates:
+  localstack enforces neither in 3.5.0, and `If-None-Match` without `If-Match` up to 4.0.2. The node
+  refuses to start in shared mode when either write is accepted.
   `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on those endpoints; never
   share a prefix in that mode. The variable only covers that proven case: a storage that does not
   implement conditional writes at all, or a probe that could not run, still stops the node.

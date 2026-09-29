@@ -81,10 +81,14 @@ operations and measured behaviour, and [upgrade and rollback](../operating/upgra
 upgrading or downgrading a cluster: a prefix must never be written by an older (pre-CAS) node and a
 CAS node at the same time, because the older node overwrites whatever the CAS node committed.
 
-Quickwit does not take that on faith: at startup it writes a throwaway object twice with
-`If-None-Match` and checks that the second write is rejected. If the endpoint accepts it anyway
-(localstack 3.5.0 does, which would make a shared prefix lose updates silently), the node refuses to
-start. To run such an endpoint in **single-writer** mode, set `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true`;
+Quickwit does not take that on faith: at startup it probes a throwaway object for **both**
+preconditions a commit uses. It writes it twice with `If-None-Match` and checks that the second write
+is rejected, then it reads the object's version, overwrites it with different content, and checks that
+a write carrying the version it read is rejected too. An endpoint has to refuse both: one that
+enforces only the first (localstack 3.5.0 enforces neither, and the versions up to 4.0.2 enforce
+`If-None-Match` without `If-Match`) would let every later compare-and-swap through unconditionally and
+lose updates silently. When the endpoint accepts either write the node refuses to start. To run such
+an endpoint in **single-writer** mode, set `QW_METASTORE_ALLOW_UNSAFE_STORAGE=true`;
 the node then logs a warning and behaves like a `file://` metastore. Do not share its prefix. That
 variable covers only this case — an endpoint that accepted a conditional write it should have
 rejected. A storage that does not implement conditional writes at all, or a probe that could not
