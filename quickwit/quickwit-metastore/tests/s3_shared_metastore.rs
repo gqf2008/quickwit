@@ -100,7 +100,13 @@ async fn s3_storage(bucket_uri: &str) -> anyhow::Result<Arc<dyn Storage>> {
     Ok(Arc::new(storage))
 }
 
-/// Whether the endpoint rejects a write whose `If-None-Match` precondition does not hold.
+/// Whether the endpoint rejects a write whose precondition does not hold, for both preconditions
+/// the shared metastore commits with.
+///
+/// `If-None-Match: *` alone is not enough: an endpoint can implement "create if absent" and still
+/// ignore `If-Match`, and then every commit a node makes lands unconditionally (localstack is such
+/// an endpoint between 3.7.0 and 4.0.2). The probe therefore also reads a version, moves the object
+/// past it, and requires the write carrying that stale version to lose.
 async fn storage_enforces_conditional_writes(storage: &dyn Storage) -> anyhow::Result<bool> {
     let probe_path = format!(".capability-probe-{}", append_random_suffix("entry"));
     let path = Path::new(&probe_path);
@@ -110,12 +116,32 @@ async fn storage_enforces_conditional_writes(storage: &dyn Storage) -> anyhow::R
     let second_write = storage
         .put_if_absent(path, Box::new(b"second".to_vec()))
         .await;
-    let enforces = matches!(
+    let enforces_if_none_match = matches!(
         &second_write,
         Err(error) if error.kind() == StorageErrorKind::PreconditionFailed
     );
+    let enforces_if_match = if enforces_if_none_match {
+        let (_, version) = storage.get_all_with_version(path).await?;
+        let Some(stale_version) = version else {
+            // No version to compare and swap against: the endpoint cannot back a shared metastore.
+            storage.delete(path).await?;
+            return Ok(false);
+        };
+        // Different bytes on purpose: an ETag is a content hash, so rewriting the same payload
+        // would keep the version and the stale write below would legitimately succeed.
+        storage.put(path, Box::new(b"moved on".to_vec())).await?;
+        let stale_write = storage
+            .put_if_version_matches(path, Box::new(b"stale".to_vec()), &stale_version)
+            .await;
+        matches!(
+            &stale_write,
+            Err(error) if error.kind() == StorageErrorKind::PreconditionFailed
+        )
+    } else {
+        false
+    };
     storage.delete(path).await?;
-    Ok(enforces)
+    Ok(enforces_if_none_match && enforces_if_match)
 }
 
 /// Skips a test that needs the endpoint to back a shared metastore when it cannot.
@@ -123,10 +149,10 @@ async fn storage_enforces_conditional_writes(storage: &dyn Storage) -> anyhow::R
 /// The capability itself is asserted by
 /// [`test_shared_metastore_either_shares_safely_or_refuses_to_start`], which runs on an endpoint
 /// with the capability and on one without it. A test that *uses* the shared behaviour has nothing
-/// to say about an endpoint that has none of it, and the repository's own `make test-all` points
-/// these tests at localstack, which accepts a second write carrying `If-None-Match: *` (measured
-/// against 3.5.0: neither `If-None-Match` nor `If-Match` is enforced). Skipping out loud beats
-/// failing every run of the suite there, and beats passing without sharing anything.
+/// to say about an endpoint that has none of it, and an endpoint can be missing either half of it:
+/// localstack 3.5.0 enforces neither `If-None-Match` nor `If-Match` (measured), and the versions
+/// from 3.7.0 to 4.0.2 enforce the first without the second. Skipping out loud beats failing every
+/// run of the suite there, and beats passing without sharing anything.
 async fn skip_unless_the_endpoint_can_be_shared(
     storage: &dyn Storage,
     test_name: &str,
@@ -135,8 +161,9 @@ async fn skip_unless_the_endpoint_can_be_shared(
         return Ok(false);
     }
     eprintln!(
-        "skipping {test_name}: the endpoint accepts a second write carrying `If-None-Match: *`, \
-         so it cannot back a shared metastore (AWS S3, Cloudflare R2 and MinIO do enforce it)"
+        "skipping {test_name}: the endpoint does not enforce both `If-None-Match: *` and \
+         `If-Match`, so it cannot back a shared metastore (AWS S3, Cloudflare R2 and MinIO do \
+         enforce both)"
     );
     Ok(true)
 }

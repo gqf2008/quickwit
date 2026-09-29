@@ -69,7 +69,7 @@ use quickwit_proto::metastore::{
     UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid, SplitId};
-use quickwit_storage::{ObjectVersion, Storage, StorageErrorKind};
+use quickwit_storage::{ObjectVersion, Storage, StorageError, StorageErrorKind};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tracing::{debug, info, instrument, warn};
@@ -444,42 +444,7 @@ impl FileBackedMetastore {
     ) -> ConditionalWriteSupport {
         let probe_path: std::path::PathBuf =
             format!(".quickwit-conditional-write-probe-{}", Ulid::new()).into();
-        let check_result = match storage
-            .put_if_absent(&probe_path, Box::new(b"probe".to_vec()))
-            .await
-        {
-            Ok(_) => {
-                match storage
-                    .put_if_absent(&probe_path, Box::new(b"probe again".to_vec()))
-                    .await
-                {
-                    Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => {
-                        ConditionalWriteSupport::Enforced
-                    }
-                    Err(error) => ConditionalWriteSupport::ProbeFailed(MetastoreError::Internal {
-                        message: format!(
-                            "failed to probe the metastore storage located at `{}`",
-                            storage.uri()
-                        ),
-                        cause: error.to_string(),
-                    }),
-                    Ok(_) => ConditionalWriteSupport::EndpointIgnoresPreconditions(
-                        "the endpoint accepted a second write carrying `If-None-Match: *`"
-                            .to_string(),
-                    ),
-                }
-            }
-            Err(error) if error.kind() == StorageErrorKind::Unsupported => {
-                ConditionalWriteSupport::NotImplemented
-            }
-            Err(error) => ConditionalWriteSupport::ProbeFailed(MetastoreError::Internal {
-                message: format!(
-                    "failed to probe the metastore storage located at `{}`",
-                    storage.uri()
-                ),
-                cause: error.to_string(),
-            }),
-        };
+        let check_result = Self::probe_conditional_writes(storage, &probe_path).await;
         // Best effort: never leave the probe object behind, and never fail startup over its
         // cleanup.
         if let Err(error) = storage.delete(&probe_path).await {
@@ -489,6 +454,100 @@ impl FileBackedMetastore {
             );
         }
         check_result
+    }
+
+    /// The probe itself, kept separate so the cleanup runs whatever the outcome.
+    ///
+    /// The shared write path commits through **two** preconditions, and an endpoint has to reject
+    /// a write when either of them does not hold:
+    ///
+    /// * `If-None-Match: *` claims an object that must not exist yet (an index's first manifest, a
+    ///   shard's first write);
+    /// * `If-Match: <version>` is what every later commit carries: a write that does not name the
+    ///   version its caller read has to lose, or two nodes overwrite each other's updates.
+    ///
+    /// Probing only the first one accepts an endpoint that implements "create if absent" but not
+    /// compare-and-swap, and then every commit of this node goes through unconditionally while the
+    /// node believes it is sharing safely. That is not hypothetical: localstack implemented
+    /// `If-None-Match` in 3.7.0 and `If-Match` in 4.0.3, so the versions in between answer the
+    /// first probe and ignore the second.
+    async fn probe_conditional_writes(
+        storage: &dyn Storage,
+        probe_path: &std::path::Path,
+    ) -> ConditionalWriteSupport {
+        let probe_failed = |error: StorageError| {
+            ConditionalWriteSupport::ProbeFailed(MetastoreError::Internal {
+                message: format!(
+                    "failed to probe the metastore storage located at `{}`",
+                    storage.uri()
+                ),
+                cause: error.to_string(),
+            })
+        };
+
+        // `If-None-Match: *`: the first write claims an absent object, the second one has to lose.
+        match storage
+            .put_if_absent(probe_path, Box::new(b"probe".to_vec()))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == StorageErrorKind::Unsupported => {
+                return ConditionalWriteSupport::NotImplemented;
+            }
+            Err(error) => return probe_failed(error),
+        }
+        match storage
+            .put_if_absent(probe_path, Box::new(b"probe again".to_vec()))
+            .await
+        {
+            Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => {}
+            Err(error) => return probe_failed(error),
+            Ok(_) => {
+                return ConditionalWriteSupport::EndpointIgnoresPreconditions(
+                    "the endpoint accepted a second write carrying `If-None-Match: *`".to_string(),
+                );
+            }
+        }
+
+        // `If-Match`: read the version, move the object past it, then try to commit against the
+        // version we read. That commit has to lose.
+        let stale_version = match storage.get_all_with_version(probe_path).await {
+            Ok((_bytes, Some(version))) => version,
+            // A backend that cannot version an object cannot compare-and-swap at all, which is a
+            // configuration gap rather than an endpoint that quietly ignores preconditions.
+            Ok((_bytes, None)) => return ConditionalWriteSupport::NotImplemented,
+            Err(error) => return probe_failed(error),
+        };
+        // The payload differs from the one above on purpose: an ETag is a hash of the content, so
+        // rewriting the same bytes would leave the version unchanged and the write below would be
+        // a legitimate compare-and-swap rather than a stale one.
+        if let Err(error) = storage
+            .put(probe_path, Box::new(b"probe moved on".to_vec()))
+            .await
+        {
+            return probe_failed(error);
+        }
+        match storage
+            .put_if_version_matches(
+                probe_path,
+                Box::new(b"probe with a stale version".to_vec()),
+                &stale_version,
+            )
+            .await
+        {
+            Err(error) if error.kind() == StorageErrorKind::PreconditionFailed => {
+                ConditionalWriteSupport::Enforced
+            }
+            Err(error) if error.kind() == StorageErrorKind::Unsupported => {
+                ConditionalWriteSupport::NotImplemented
+            }
+            Err(error) => probe_failed(error),
+            Ok(_) => ConditionalWriteSupport::EndpointIgnoresPreconditions(
+                "the endpoint accepted a write carrying an `If-Match` that no longer matches the \
+                 object's version"
+                    .to_string(),
+            ),
+        }
     }
 
     /// Return the underlying storage.
@@ -6086,6 +6145,89 @@ mod tests {
         Ok(())
     }
 
+    /// An endpoint that implements "create if absent" but not compare-and-swap must be refused
+    /// too.
+    ///
+    /// It answers the `If-None-Match: *` probe and ignores `If-Match`, so a node that only checked
+    /// the former would serve a shared prefix while every commit it made landed unconditionally:
+    /// two nodes publishing at the same time would overwrite each other's manifest and lose
+    /// splits, which is exactly what the shared mode must never do. localstack is such an endpoint
+    /// between 3.7.0 (which added `If-None-Match`) and 4.0.3 (which added `If-Match`).
+    #[tokio::test]
+    async fn test_distributed_metastore_refuses_storage_that_ignores_only_if_match()
+    -> anyhow::Result<()> {
+        fn mock_storage_ignoring_if_match() -> MockStorage {
+            let ram_storage = Arc::new(RamStorage::default());
+            let mut mock_storage = MockStorage::default();
+            mock_storage
+                .expect_uri()
+                .return_const(Uri::for_test("s3://test-bucket/indexes"));
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_put()
+                .returning(move |path, payload| block_on(ram_storage_clone.put(path, payload)));
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_exists()
+                .returning(move |path| block_on(ram_storage_clone.exists(path)));
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_get_all_with_version()
+                .returning(move |path| block_on(ram_storage_clone.get_all_with_version(path)));
+            // `If-None-Match: *` is enforced, so the first half of the probe passes.
+            let ram_storage_clone = ram_storage.clone();
+            mock_storage
+                .expect_put_if_absent()
+                .returning(move |path, payload| {
+                    block_on(ram_storage_clone.put_if_absent(path, payload))
+                });
+            // `If-Match` is not: the stale version is accepted and the write goes through.
+            mock_storage
+                .expect_put_if_version_matches()
+                .returning(|path, _payload, _version| {
+                    Ok(Some(ObjectVersion::new(format!(
+                        "unconditional-{}",
+                        path.display()
+                    ))))
+                });
+            mock_storage.expect_delete().returning(|_| Ok(()));
+            mock_storage
+        }
+
+        let error = FileBackedMetastore::try_new(Arc::new(mock_storage_ignoring_if_match()), None)
+            .await
+            .expect_err("a storage that ignores `If-Match` must not be shared");
+        let message = error.to_string();
+        assert!(
+            message.contains("If-Match"),
+            "the refusal has to name the precondition the endpoint ignored, got: {message}"
+        );
+
+        let metastore = FileBackedMetastore::try_new_with_options(
+            Arc::new(mock_storage_ignoring_if_match()),
+            None,
+            true,
+        )
+        .await?;
+        assert!(
+            !metastore.is_distributed(),
+            "with `allow_unsafe_storage` the metastore must fall back to single-writer mode"
+        );
+        Ok(())
+    }
+
+    /// Whether a path is the throwaway object of the startup conditional-write probe.
+    ///
+    /// The probe is not a metadata write: it commits once against a version it invalidated on
+    /// purpose. Tests that count or fail the metastore's own compare-and-swaps have to leave it
+    /// out, or the first real commit would be misnumbered.
+    fn is_conditional_write_probe(path: &std::path::Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        name.starts_with(".quickwit-conditional-write-probe-")
+    }
+
     /// A storage that cannot express a conditional write is a configuration mistake, not an unsafe
     /// endpoint. The escape hatch was written for the latter, so it must not cover this: turning it
     /// into a warning would start a node in single-writer mode on a prefix several nodes use.
@@ -6226,7 +6368,13 @@ mod tests {
         let conflicts_clone = conflicts.clone();
         mock_storage
             .expect_put_if_version_matches()
-            .returning(move |_path, _payload, _version| {
+            .returning(move |path, payload, version| {
+                // The startup probe commits once against a version it deliberately invalidated;
+                // that call is not one of the metastore's own races, so it is neither counted nor
+                // failed here.
+                if is_conditional_write_probe(path) {
+                    return block_on(ram_storage.put_if_version_matches(path, payload, version));
+                }
                 conflicts_clone.fetch_add(1, Ordering::SeqCst);
                 Err(StorageErrorKind::PreconditionFailed
                     .with_error(anyhow::anyhow!("injected conflict")))
@@ -6307,6 +6455,12 @@ mod tests {
         mock_storage
             .expect_put_if_version_matches()
             .returning(move |path, payload, version| {
+                // The startup probe runs before any metadata write and commits once against a
+                // version it invalidated on purpose. Counting it would shift every `fail_on_call`
+                // below, and failing it would refuse a storage that is fine.
+                if is_conditional_write_probe(path) {
+                    return block_on(ram.put_if_version_matches(path, payload, version));
+                }
                 let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if fail_on_call == Some(call) {
                     return Err(StorageErrorKind::PreconditionFailed

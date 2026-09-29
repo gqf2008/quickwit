@@ -72,7 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   together with its version and write it back with `If-Match`; a lost race is replayed within a bounded budget
   (16 attempts, the delay doubling from 10 ms to a 2 s cap) instead of overwriting the
   winner. The metastore probes the endpoint for conditional-write support at startup and refuses to run in
-  shared mode when the endpoint would silently ignore the preconditions
+  shared mode when the endpoint would silently ignore the preconditions — both of them, since a commit
+  uses `If-None-Match: *` for its first write and `If-Match` for every later one, and an endpoint that
+  enforces only the first would turn every compare-and-swap into an unconditional write
   (`QW_METASTORE_ALLOW_UNSAFE_STORAGE=true` opts into single-writer mode on such an endpoint). `file://`,
   `gs://` and `azure://` metastores keep the single-writer behaviour, and the startup probe that decides
   between the two modes is covered by the same thread. (walgit: `qw-dist-metastore-s3-r2`,
