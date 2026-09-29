@@ -33,7 +33,8 @@ services:
     # this endpoint refuses to start, and the sharing cases of the shared metastore suite return
     # early instead of running: the endpoint cannot witness the behaviour under test. Which release
     # turned enforcement on is not claimed here (we did not bisect); 4.14.0 is the version
-    # `.env.example` and the coverage workflow already pin, as the last free one.
+    # `.env.example` and the coverage workflow already pin, as the last free one. That workflow
+    # sets `QW_S3_ENDPOINT` to this same port itself, so the two agree on the endpoint as well.
     image: localstack/localstack:${LOCALSTACK_VERSION:-4.14.0}
     container_name: localstack
     ports:
