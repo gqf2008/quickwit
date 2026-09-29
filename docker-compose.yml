@@ -26,12 +26,14 @@ networks:
 
 services:
   localstack:
-    # 4.14.0 is the oldest version that enforces `If-None-Match`/`If-Match`, which the shared
-    # metastore needs to be able to compare-and-swap (measured: 3.5.0 accepts a second
-    # `If-None-Match: *` write with 200, 4.14.0 refuses both that and a stale `If-Match` with 412).
-    # On 3.5.0 a metastore pointed at this endpoint refuses to start, and the sharing cases of the
-    # shared metastore suite skip: the endpoint cannot witness the behaviour under test.
-    # `.env.example` already pinned 4.14.0 as the last free version; this only aligns the default.
+    # The tests take their S3 endpoint from here, and the shared metastore needs it to enforce
+    # `If-None-Match`/`If-Match` to be able to compare-and-swap. Measured on both ends: 3.5.0
+    # answers 200 to a second `If-None-Match: *` write and to a stale `If-Match`, 4.14.0 answers
+    # 412 to both. On 3.5.0 a metastore pointed at this endpoint refuses to start, and the sharing
+    # cases of the shared metastore suite return early instead of running: the endpoint cannot
+    # witness the behaviour under test. Which release turned enforcement on is not claimed here
+    # (we did not bisect); 4.14.0 is the version `.env.example` and the coverage workflow already
+    # pin, as the last free one.
     image: localstack/localstack:${LOCALSTACK_VERSION:-4.14.0}
     container_name: localstack
     ports:
