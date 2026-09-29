@@ -460,8 +460,18 @@ mod pulsar_broker_tests {
     use crate::source::{RawDocBatch, SourceActor, SuggestTruncate, quickwit_supported_sources};
 
     static PULSAR_URI: &str = "pulsar://localhost:6650";
-    static PULSAR_ADMIN_URI: &str = "http://localhost:8081";
     static CLIENT_NAME: &str = "quickwit-tester";
+
+    /// The Pulsar admin endpoint these tests drive: the port `docker-compose.yml` publishes by
+    /// default.
+    ///
+    /// `QW_TEST_PULSAR_ADMIN_URI` overrides it. Which host port the compose file publishes is a
+    /// detail of the machine running the suite, not of the test, and 8081 is only the default
+    /// because that is what the compose file maps today.
+    fn pulsar_admin_uri() -> String {
+        std::env::var("QW_TEST_PULSAR_ADMIN_URI")
+            .unwrap_or_else(|_| String::from("http://localhost:8081"))
+    }
 
     macro_rules! positions {
         ($($partition:expr => $position:expr $(,)?)*) => {{
@@ -623,7 +633,8 @@ mod pulsar_broker_tests {
         let client = reqwest::Client::new();
         let res = client
             .put(format!(
-                "{PULSAR_ADMIN_URI}/admin/v2/persistent/public/default/{topic}/partitions"
+                "{}/admin/v2/persistent/public/default/{topic}/partitions",
+                pulsar_admin_uri()
             ))
             .body(num_partitions.to_string())
             .header("content-type", b"application/json".as_ref())
