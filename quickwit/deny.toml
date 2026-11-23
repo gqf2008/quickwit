@@ -39,9 +39,7 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
-ignore = [
-    "RUSTSEC-2021-0153", # `encoding` is unmaintained, it's used in lindera
-]
+ignore = []
 
 # This section is considered when running `cargo deny check licenses`
 # More documentation for the licenses section can be found here:
